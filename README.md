@@ -1,6 +1,17 @@
 # nat-geo
 Species classification for deep sea footage. 
 
+## 🛠️ Setup Instructions
+
+#### Clone the repository:
+1. Open your laptop's terminal
+2. `cd` into the file directory you want to save this repository in
+3. Clone the repository:
+    ```
+    git clone <SSH url>
+    cd <repo-name>
+    ```
+
 ### Editing Code
 1. Pull the latest changes
 
