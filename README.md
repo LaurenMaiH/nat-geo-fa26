@@ -12,6 +12,20 @@ Species classification for deep sea footage.
     cd <repo-name>
     ```
 
+## 📁 Editing Code & Key Reminders
+
+### First time editing
+1. Create and activate a virtual environment
+    
+    Create a new virtual environment: `python3 -m venv venv`
+
+    Activate: `source venv/bin/activate`
+
+    To deactivate later: `deactivate`
+2. Install dependencies:
+
+    ```pip install -r requirements.txt```
+
 ### Editing Code
 1. Pull the latest changes
 
