@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import subprocess
 
 # Configure Streamlit to allow larger file uploads
 st.set_page_config(
@@ -10,6 +11,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+st.set_page_config(layout="wide")
+st.image("natgeobanner.png", use_container_width=True)
 
 def process_video(input_path):
     """
@@ -17,7 +20,16 @@ def process_video(input_path):
     Future: Add ML model processing here.
     """
     # For now, just return the input path (same video)
-    return input_path
+    output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    subprocess.run([
+        "ffmpeg", "-i", input_path,
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-c:a", "aac",
+        "-y", output_path
+    ], capture_output=True, check=True)
+
+    return output_path  
 
 st.title("Sea Animals Video Processor")
 
@@ -44,11 +56,15 @@ if uploaded_file is not None:
                     label="Processed Video Ready to Download! :)",
                     data=f.read(),
                     file_name="processed_video.mp4",
-                    mime="video/mp4"
+                    mime="video/mp4",
+                    use_container_width=True
                 )
-        
+            st.markdown("""
+                <style>
+                div.stDownloadButton > button 
+                {height: 100px; font-size: 50px;} </style>""",
+                 unsafe_allow_html=True)
+
         with col2:
             st.subheader("Video Preview")
             st.video(output_path)
-        
-        os.unlink(input_path)
