@@ -1,3 +1,6 @@
+seaanimals_proto/yolov8x-worldv2.pt
+yolov8x-worldv2.pt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
