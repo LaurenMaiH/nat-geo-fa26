@@ -1,3 +1,5 @@
+# Python.gitignore
+*.pt
 seaanimals_proto/yolov8x-worldv2.pt
 yolov8x-worldv2.pt
 
