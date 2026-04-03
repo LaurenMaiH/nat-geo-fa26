@@ -4,6 +4,7 @@ from pathlib import Path
 import shutil
 import tempfile
 import subprocess
+from model_pipeline import process_video_with_model
 
 # Configure Streamlit to allow larger file uploads
 st.set_page_config(
@@ -16,20 +17,25 @@ st.image("natgeobanner.png", use_container_width=True)
 
 def process_video(input_path):
     """
-    Process video file. Currently returns the same video.
-    Future: Add ML model processing here.
+    Process video file with ML model and convert to compatible format.
     """
+    temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+
+    #running YOLO model processing 
+    process_video_with_model(input_path, temp_output)
+
     # For now, just return the input path (same video)
-    output_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
+    final_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
     subprocess.run([
-        "ffmpeg", "-i", input_path,
+        "ffmpeg", "-i", temp_output,
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-c:a", "aac",
-        "-y", output_path
+        "-y", final_output
     ], capture_output=True, check=True)
 
-    return output_path  
+    os.unlink(temp_output) # clean temp file
+    return final_output 
 
 st.title("Sea Animals Video Processor")
 
