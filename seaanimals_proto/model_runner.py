@@ -12,19 +12,23 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-st.set_page_config(layout="wide")
 st.image("natgeobanner.png", use_container_width=True)
 
-def process_video(input_path):
+def process_video(input_path, progress_bar, status_text):
     """
     Process video file with ML model and convert to compatible format.
     """
     temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
 
-    #running YOLO model processing 
-    process_video_with_model(input_path, temp_output)
+    def update_ui(percent, text):
+        progress_bar.progress(percent)
+        status_text.text(text)
 
-    # For now, just return the input path (same video)
+    # running YOLO model processing with live UI updates
+    process_video_with_model(input_path, temp_output, progress_callback=update_ui)
+
+    update_ui(1.0, "Wrapping up final video formatting...")
+    
     final_output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
     subprocess.run([
         "ffmpeg", "-i", temp_output,
@@ -48,8 +52,15 @@ if uploaded_file is not None:
             tmp_input.write(uploaded_file.getbuffer())
             input_path = tmp_input.name
         
-        with st.spinner("Processing video..."):
-            output_path = process_video(input_path)
+        st.info("Initializing models and starting pipeline...")
+        progress_bar = st.progress(0.0)
+        status_text = st.empty()
+        
+        output_path = process_video(input_path, progress_bar, status_text)
+        
+        # Clean up the UI elements once processing finishes
+        status_text.empty()
+        progress_bar.empty()
         
         st.success("✓ Video processed!")
         
