@@ -1,32 +1,36 @@
 import os
 from pathlib import Path
-
-# Set global cache directory for YOLO models BEFORE any other imports 
-YOLO_CACHE_DIR = Path.home() / ".yolo"
-YOLO_CACHE_DIR.mkdir(exist_ok = True)
-os.environ["YOLO_HOME"] = str(YOLO_CACHE_DIR)
-
 import streamlit as st
 import ultralytics
-from ultralytics import YOLOWorld
+from ultralytics import YOLOWorld, settings
 import cv2
 import numpy as np
 import yaml
 import shutil
 
+# 1. Force Ultralytics to use a global weight/config directory
+YOLO_CACHE_DIR = Path.home() / ".config" / "ultralytics"
+YOLO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+settings.update({'weights_dir': str(YOLO_CACHE_DIR), 'runs_dir': str(YOLO_CACHE_DIR / "runs")})
 
 # Setup YOLO World model with bytetrack (initialize once and cache)
 @st.cache_resource
 def load_model_and_config():
     """Load model once and cache it"""
-    model = YOLOWorld('yolov8x-worldv2.pt')
+    # Define the absolute path where the model should live
+    model_path = YOLO_CACHE_DIR / "yolov8x-worldv2.pt"
+    
+    # Initialize using the full path. 
+    # If it's not there, Ultralytics will download it TO THIS PATH, not your project folder.
+    model = YOLOWorld(str(model_path)) 
+    
     custom_vocabulary = ["fish", "eel", "ray", "shark", "jellyfish", "animal", "shrimp", "crab", "lobster", "isopod", "octopus", "squid", "mollusk", "crustacean", "animal cluster"]
     model.set_classes(custom_vocabulary)
     
     yaml_path = os.path.join(os.path.dirname(ultralytics.__file__), "cfg", "trackers", "bytetrack.yaml")
     custom_yaml_path = YOLO_CACHE_DIR / "bytetrack_custom.yaml"
 
-    shutil.copy(yaml_path, custom_yaml_path.yaml)
+    shutil.copy(yaml_path, custom_yaml_path)
     with open(custom_yaml_path, "r") as f:
         config = yaml.safe_load(f)
     config["track_buffer"] = 120
@@ -127,7 +131,7 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
 
             if has_activity:
                 frames_inferred += 1
-                results = model.track(infer_frame, persist=True, tracker=customer_tracker_config, verbose=False, conf=confidence, iou=iou)
+                results = model.track(infer_frame, persist=True, tracker=custom_tracker_config, verbose=False, conf=confidence, iou=iou)
                 if results[0].boxes.id is not None:
                     annotated = results[0].plot()
                     frame_out = cv2.resize(annotated, (width, height))
