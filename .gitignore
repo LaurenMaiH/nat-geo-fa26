@@ -2,6 +2,8 @@
 *.pt
 seaanimals_proto/yolov8x-worldv2.pt
 yolov8x-worldv2.pt
+.yolo/
+bytetrack_custom.yaml
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

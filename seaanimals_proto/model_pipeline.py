@@ -1,25 +1,42 @@
+import os
+from pathlib import Path
+
+# Set global cache directory for YOLO models BEFORE any other imports 
+YOLO_CACHE_DIR = Path.home() / ".yolo"
+YOLO_CACHE_DIR.mkdir(exist_ok = True)
+os.environ["YOLO_HOME"] = str(YOLO_CACHE_DIR)
+
+import streamlit as st
 import ultralytics
 from ultralytics import YOLOWorld
 import cv2
 import numpy as np
-import os
 import yaml
 import shutil
 
-# Setup YOLO World model (initialize once)
-model = YOLOWorld('yolov8x-worldv2.pt')
-custom_vocabulary = ["fish", "eel", "ray", "shark", "jellyfish", "animal", "shrimp", "crab", "lobster", "isopod", "octopus", "squid", "mollusk", "crustacean", "animal cluster"]
-model.set_classes(custom_vocabulary)
 
-# Setup bytetrack config (initialize once)
-yaml_path = os.path.join(os.path.dirname(ultralytics.__file__), "cfg", "trackers", "bytetrack.yaml")
-shutil.copy(yaml_path, "bytetrack_custom.yaml")
-with open("bytetrack_custom.yaml", "r") as f:
-    config = yaml.safe_load(f)
-config["track_buffer"] = 120
-config["match_thresh"] = 0.85
-with open("bytetrack_custom.yaml", "w") as f:
-    yaml.dump(config, f)
+# Setup YOLO World model with bytetrack (initialize once and cache)
+@st.cache_resource
+def load_model_and_config():
+    """Load model once and cache it"""
+    model = YOLOWorld('yolov8x-worldv2.pt')
+    custom_vocabulary = ["fish", "eel", "ray", "shark", "jellyfish", "animal", "shrimp", "crab", "lobster", "isopod", "octopus", "squid", "mollusk", "crustacean", "animal cluster"]
+    model.set_classes(custom_vocabulary)
+    
+    yaml_path = os.path.join(os.path.dirname(ultralytics.__file__), "cfg", "trackers", "bytetrack.yaml")
+    custom_yaml_path = YOLO_CACHE_DIR / "bytetrack_custom.yaml"
+
+    shutil.copy(yaml_path, custom_yaml_path.yaml)
+    with open(custom_yaml_path, "r") as f:
+        config = yaml.safe_load(f)
+    config["track_buffer"] = 120
+    config["match_thresh"] = 0.85
+    with open(custom_yaml_path, "w") as f:
+        yaml.dump(config, f)
+    
+    return model, str(custom_yaml_path)
+
+model, custom_tracker_config = load_model_and_config()
 
 def skip_black_frames(cap, threshold=10, require_consecutive=3):
     consecutive_bright = 0
@@ -110,7 +127,7 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
 
             if has_activity:
                 frames_inferred += 1
-                results = model.track(infer_frame, persist=True, tracker="bytetrack_custom.yaml", verbose=False, conf=confidence, iou=iou)
+                results = model.track(infer_frame, persist=True, tracker=customer_tracker_config, verbose=False, conf=confidence, iou=iou)
                 if results[0].boxes.id is not None:
                     annotated = results[0].plot()
                     frame_out = cv2.resize(annotated, (width, height))
