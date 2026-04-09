@@ -28,6 +28,8 @@ if "final_zip_path" not in st.session_state:
     st.session_state.final_zip_path = None
 if "max_n" not in st.session_state:
     st.session_state.max_n = 0
+if "last_uploaded_key" not in st.session_state:
+    st.session_state.last_uploaded_key = None
 
 
 # ---------------------------------------------------------
@@ -91,6 +93,14 @@ st.title("Sea Animals Video Processor")
 uploaded_file = st.file_uploader("Upload a video file (.mov or .mp4)", type=["mov", "mp4"])
 
 if uploaded_file is not None:
+    current_upload_key = f"{uploaded_file.name}:{uploaded_file.size}"
+    if st.session_state.last_uploaded_key != current_upload_key:
+        st.session_state.last_uploaded_key = current_upload_key
+        st.session_state.is_processed = False
+        st.session_state.final_video_path = None
+        st.session_state.final_csv_path = None
+        st.session_state.final_zip_path = None
+        st.session_state.max_n = 0
 
     if st.button("Process Video"):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_input:
@@ -101,33 +111,42 @@ if uploaded_file is not None:
         progress_bar = st.progress(0.0)
         status_text = st.empty()
         
-        # Run processing and capture all 4 outputs
-        output_vid, output_csv, output_zip, max_n = process_video(input_path, progress_bar, status_text)
-        
-        # ==========================================
-        # SAVE RESULTS TO MEMORY
-        # ==========================================
-        st.session_state.final_video_path = output_vid
-        st.session_state.final_csv_path = output_csv
-        st.session_state.final_zip_path = output_zip
-        st.session_state.max_n = max_n
-        st.session_state.is_processed = True
-
-        # Clean up the UI elements once processing finishes
-        status_text.empty()
-        progress_bar.empty()
-        st.success("✓ Video processed!")
+        try:
+            # Run processing and capture all 4 outputs
+            output_vid, output_csv, output_zip, max_n = process_video(input_path, progress_bar, status_text)
+            
+            # ==========================================
+            # SAVE RESULTS TO MEMORY
+            # ==========================================
+            st.session_state.final_video_path = output_vid
+            st.session_state.final_csv_path = output_csv
+            st.session_state.final_zip_path = output_zip
+            st.session_state.max_n = max_n
+            st.session_state.is_processed = True
+            st.success("✓ Video processed!")
+        except Exception as e:
+            st.session_state.is_processed = False
+            st.error(f"Video processing failed: {e}")
+        finally:
+            # Clean up the UI elements once processing finishes
+            status_text.empty()
+            progress_bar.empty()
         
     # ==========================================
     # RENDER UI OUTSIDE THE BUTTON BLOCK
     # ==========================================
-    # NOTE THE INDENTATION HERE! It is aligned with `if st.button`, NOT inside it!
+    # INDENTATION HERE is aligned with `if st.button`, NOT inside it!
     if st.session_state.is_processed:
 
         output_vid = st.session_state.final_video_path
         output_csv = st.session_state.final_csv_path
         output_zip = st.session_state.final_zip_path
         max_n = st.session_state.max_n
+
+        if not output_vid or not os.path.exists(output_vid):
+            st.error("Processed video is no longer available. Please run processing again.")
+            st.session_state.is_processed = False
+            st.stop()
 
         # Display the MaxN Metric
         st.markdown("---")

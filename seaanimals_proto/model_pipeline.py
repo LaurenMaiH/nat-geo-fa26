@@ -181,6 +181,7 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
     N_BG_SAMPLES = 20
     MIN_BLOB_AREA = 500
     resized_path = None
+    sample_interval = max(1, int(frame_skip if frame_skip is not None else sample_interval))
 
     if preresize is not None:
         temp_dir = tempfile.gettempdir()
@@ -202,11 +203,14 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
     orig_fps = cap.get(cv2.CAP_PROP_FPS)
 
     first_real_frame = 0
-    if skip_black:
+    if trim_black and skip_black:
         black_thresh, require_consecutive = skip_black
         first_real_frame = skip_black_frames(cap, black_thresh, require_consecutive)
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) - first_real_frame
+    if total_frames <= 0:
+        cap.release()
+        raise RuntimeError("No frames available for inference after preprocessing.")
     sample_indices = sorted(set(np.linspace(0, total_frames - 1, N_BG_SAMPLES, dtype=int) + first_real_frame))
 
     bg_frames = []
@@ -223,7 +227,7 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
     median_bg = np.median(np.stack(bg_frames), axis=0).astype(np.uint8)
     median_bg = cv2.GaussianBlur(median_bg, (5, 5), 0)
 
-    output_fps = orig_fps / sample_interval
+    output_fps = max((orig_fps if orig_fps and orig_fps > 0 else 30.0) / sample_interval, 1)
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
 
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=tile_grid_size)
@@ -260,7 +264,7 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
             progress_callback(percent, f"Running YOLO Inference... ({frame_idx}/{total_frames} frames)")
 
         if frame_idx % sample_interval == 0:
-            processed_bgr = preprocess(frame, clahe)
+            processed_bgr = preprocess(frame, clahe) if apply_clahe else frame
             infer_frame = processed_bgr
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
