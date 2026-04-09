@@ -12,6 +12,8 @@ import cv2
 import numpy as np
 import yaml
 import shutil
+import csv
+import zipfile
 
 # --- GLOBAL CACHE SETUP ---
 # Force Ultralytics to use a global weight/config directory to prevent repo bloat
@@ -175,10 +177,11 @@ def resize_video(input_path, output_path, crf=23, encoder=None, hw_flags=None, f
     return True
 
 # --- MAIN INFERENCE PIPELINE ---
-def perform_inference(video_path, preprocess, output_path="output_video.mp4", skip_black=(10, 3), sample_interval=2, confidence=0.15, iou=0.7, bg_thresh=40, tile_grid_size=(32,32), preresize=None, progress_callback=None):
+def perform_inference(video_path, preprocess, output_path="output_video.mp4", skip_black=(10, 3), sample_interval=2, confidence=0.15, iou=0.7, bg_thresh=40, tile_grid_size=(32,32), preresize=None, progress_callback=None, apply_clahe=True, trim_black=True, frame_skip=2, csv_path=None, zip_path=None):
     N_BG_SAMPLES = 20
     MIN_BLOB_AREA = 500
     resized_path = None
+    sample_interval = max(1, int(frame_skip if frame_skip is not None else sample_interval))
 
     if preresize is not None:
         temp_dir = tempfile.gettempdir()
@@ -200,11 +203,14 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
     orig_fps = cap.get(cv2.CAP_PROP_FPS)
 
     first_real_frame = 0
-    if skip_black:
+    if trim_black and skip_black:
         black_thresh, require_consecutive = skip_black
         first_real_frame = skip_black_frames(cap, black_thresh, require_consecutive)
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) - first_real_frame
+    if total_frames <= 0:
+        cap.release()
+        raise RuntimeError("No frames available for inference after preprocessing.")
     sample_indices = sorted(set(np.linspace(0, total_frames - 1, N_BG_SAMPLES, dtype=int) + first_real_frame))
 
     bg_frames = []
@@ -221,7 +227,7 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
     median_bg = np.median(np.stack(bg_frames), axis=0).astype(np.uint8)
     median_bg = cv2.GaussianBlur(median_bg, (5, 5), 0)
 
-    output_fps = orig_fps / sample_interval
+    output_fps = max((orig_fps if orig_fps and orig_fps > 0 else 30.0) / sample_interval, 1)
     out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*"mp4v"), output_fps, (width, height))
 
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=tile_grid_size)
@@ -233,6 +239,21 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
     frames_skipped_by_gate = 0
     has_activity = False
 
+    # --- NEW: Setup CSV and ZIP Infrastructure ---
+    max_animals_counted = 0
+    csv_file = None
+    csv_writer = None
+    if csv_path:
+        csv_file = open(csv_path, mode='w', newline='')
+        csv_writer = csv.writer(csv_file)
+        # Write the CSV header
+        csv_writer.writerow(["video", "frame", "tracker_id", "class", "confidence", "x1", "y1", "x2", "y2"])
+
+    seen_track_ids = set()
+    temp_crop_dir = None
+    if zip_path:
+        temp_crop_dir = tempfile.mkdtemp() # Create a temporary folder for images
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
@@ -243,7 +264,7 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
             progress_callback(percent, f"Running YOLO Inference... ({frame_idx}/{total_frames} frames)")
 
         if frame_idx % sample_interval == 0:
-            processed_bgr = preprocess(frame, clahe)
+            processed_bgr = preprocess(frame, clahe) if apply_clahe else frame
             infer_frame = processed_bgr
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -265,7 +286,43 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
                     conf=confidence,
                     iou=iou,
                 )
+                
+                # --- NEW: Data Extraction Logic ---
                 if results[0].boxes.id is not None:
+                    # Get all tracking data for this frame
+                    boxes = results[0].boxes.xyxy.cpu().numpy()
+                    track_ids = results[0].boxes.id.int().cpu().tolist()
+                    class_ids = results[0].boxes.cls.int().cpu().tolist()
+                    confs = results[0].boxes.conf.cpu().numpy()
+                    
+                    # 1. Update MaxN
+                    current_animal_count = len(track_ids)
+                    if current_animal_count > max_animals_counted:
+                        max_animals_counted = current_animal_count
+                        
+                    # 2. Write CSV Data and Crop Images
+                    for box, track_id, cls_id, conf in zip(boxes, track_ids, class_ids, confs):
+                        x1, y1, x2, y2 = map(int, box)
+                        class_name = model.names[cls_id] # Look up the string name (e.g., 'fish')
+                        
+                        # Write to CSV
+                        if csv_writer:
+                            csv_writer.writerow(["current_video", frame_idx, track_id, class_name, f"{conf:.4f}", x1, y1, x2, y2])
+                            
+                        # Save Cropped Image (Only the first time we see this ID)
+                        if zip_path and temp_crop_dir and track_id not in seen_track_ids:
+                            seen_track_ids.add(track_id)
+                            
+                            # Ensure crop stays within image bounds
+                            y1_safe, y2_safe = max(0, y1), min(height, y2)
+                            x1_safe, x2_safe = max(0, x1), min(width, x2)
+                            crop_img = frame[y1_safe:y2_safe, x1_safe:x2_safe]
+                            
+                            if crop_img.size > 0:
+                                crop_filename = os.path.join(temp_crop_dir, f"id{track_id}_{class_name}_f{frame_idx}.jpg")
+                                cv2.imwrite(crop_filename, crop_img)
+
+                    # Draw the boxes for the output video
                     annotated = results[0].plot()
                     frame_out = cv2.resize(annotated, (width, height))
                 else:
@@ -281,6 +338,19 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
 
     cap.release()
     out.release()
+    
+    # --- NEW: Cleanup and Packaging ---
+    if csv_file:
+        csv_file.close()
+        
+    if zip_path and temp_crop_dir:
+        # Zip all the cropped images
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(temp_crop_dir):
+                for file in files:
+                    zf.write(os.path.join(root, file), file)
+        # Delete the temporary folder
+        shutil.rmtree(temp_crop_dir)
 
     if resized_path and Path(resized_path).exists():
         print(f"\nCleaning up temporary file: {resized_path}")
@@ -292,7 +362,27 @@ def perform_inference(video_path, preprocess, output_path="output_video.mp4", sk
     print(f"Frames inferred:         {frames_inferred}")
     print(f"Frames skipped by gate:  {frames_skipped_by_gate}")
     print(f"Gate skip rate:          {skip_rate:.1%}")
+    print(f"Max Animals (MaxN):      {max_animals_counted}")
 
-def process_video_with_model(input_path, output_path, progress_callback=None):
+    return max_animals_counted
+
+def process_video_with_model(input_path, output_path, progress_callback=None, confidence=0.15, iou=0.7, apply_clahe=True, trim_black=True, frame_skip=2, csv_path=None, zip_path=None):
     """Main wrapper function called by the Streamlit frontend"""
-    perform_inference(input_path, clahe_L_median, output_path=output_path, preresize=1080, progress_callback=progress_callback)
+    
+    # Pass all the caught variables directly into perform_inference
+    max_animals = perform_inference(
+        video_path=input_path, 
+        preprocess=clahe_L_median, 
+        output_path=output_path, 
+        preresize=1080, 
+        progress_callback=progress_callback,
+        confidence=confidence,           # Passed from UI
+        iou=iou,                         # Passed from UI
+        apply_clahe=apply_clahe,         # Passed from UI
+        trim_black=trim_black,           # Passed from UI
+        frame_skip=frame_skip,           # Passed from UI
+        csv_path=csv_path,               # Target for your Luis's CSV generator
+        zip_path=zip_path                # Target for your Luis's Zip generator
+    )
+    
+    return max_animals
