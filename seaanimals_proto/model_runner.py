@@ -38,7 +38,7 @@ st.sidebar.markdown("Adjust these parameters to fine-tune the YOLOv8-World model
 
 conf_threshold = st.sidebar.slider("Confidence Threshold", min_value=0.0, max_value=1.0, value=0.15, step=0.05)
 iou_threshold = st.sidebar.slider("IOU (Overlap) Threshold", min_value=0.0, max_value=1.0, value=0.70, step=0.05)
-apply_clahe = st.sidebar.checkbox("Apply CLAHE + White Balance", value=True)
+apply_clahe = st.sidebar.checkbox("Apply CLAHE", value=True)
 trim_black = st.sidebar.checkbox("Trim Black Frames", value=True)
 frame_skip = st.sidebar.number_input("Frame Skip (1 = every frame, 3 = skip 2)", min_value=1, max_value=10, value=2)
 
