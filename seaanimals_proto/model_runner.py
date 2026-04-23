@@ -16,7 +16,7 @@ st.set_page_config(
 st.image("natgeobanner.png", use_container_width=True)
 
 # ==========================================
-# INITIALIZE SESSION STATE (The Page Reload Bug Fix...)
+# INITIALIZE SESSION STATE 
 # ==========================================
 if "is_processed" not in st.session_state:
     st.session_state.is_processed = False
@@ -31,12 +31,18 @@ if "max_n" not in st.session_state:
 if "last_uploaded_key" not in st.session_state:
     st.session_state.last_uploaded_key = None
 
-
 # ---------------------------------------------------------
 # UI SIDEBAR FILTERS
 # ---------------------------------------------------------
 st.sidebar.header("Model Settings & Filters")
-st.sidebar.markdown("Adjust these parameters to fine-tune the YOLOv8-World model.")
+st.sidebar.markdown("Adjust these parameters to fine-tune the tracking pipeline.")
+
+# --- THE MODEL SELECTION BRIDGE ---
+selected_model = st.sidebar.radio(
+    "Choose AI Model:",
+    ("Default (YOLO-World)", "Fine-Tuned (Trained On JAMSTEC Dataset)")
+)
+st.sidebar.markdown("---")
 
 conf_threshold = st.sidebar.slider("Confidence Threshold", min_value=0.0, max_value=1.0, value=0.15, step=0.05)
 iou_threshold = st.sidebar.slider("IOU (Overlap) Threshold", min_value=0.0, max_value=1.0, value=0.70, step=0.05)
@@ -44,7 +50,7 @@ apply_clahe = st.sidebar.checkbox("Apply CLAHE", value=True)
 trim_black = st.sidebar.checkbox("Trim Black Frames", value=True)
 frame_skip = st.sidebar.number_input("Frame Skip (1 = every frame, 3 = skip 2)", min_value=1, max_value=10, value=2)
 
-def process_video(input_path, progress_bar, status_text):
+def process_video(input_path, progress_bar, status_text, model_choice, original_filename):
     """
     Process video file with ML model and convert to compatible format.
     """
@@ -56,10 +62,12 @@ def process_video(input_path, progress_bar, status_text):
         progress_bar.progress(percent)
         status_text.text(text)
 
-    # Running YOLO model processing with live UI updates and the new parameters
+    # Running YOLO model processing with live UI updates and the selected model
     max_animals_counted = process_video_with_model(
         input_path=input_path, 
         output_path=temp_output, 
+        model_choice=model_choice,
+        original_filename=original_filename, # <-- Passes the original filename to the backend
         progress_callback=update_ui,
         confidence=conf_threshold,
         iou=iou_threshold,
@@ -81,7 +89,7 @@ def process_video(input_path, progress_bar, status_text):
         "-y", final_output
     ], capture_output=True, check=True)
 
-    os.unlink(temp_output) # clean temp file
+    os.unlink(temp_output) 
     
     return final_output, temp_csv, temp_zip, max_animals_counted
 
@@ -103,21 +111,21 @@ if uploaded_file is not None:
         st.session_state.max_n = 0
 
     if st.button("Process Video"):
+        original_name = uploaded_file.name # <-- Grab the real name right here!
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_input:
             tmp_input.write(uploaded_file.getbuffer())
             input_path = tmp_input.name
         
-        st.info("Initializing models and starting pipeline...")
+        st.info(f"Initializing {selected_model} and starting pipeline...")
         progress_bar = st.progress(0.0)
         status_text = st.empty()
         
         try:
-            # Run processing and capture all 4 outputs
-            output_vid, output_csv, output_zip, max_n = process_video(input_path, progress_bar, status_text)
+            # Pass original_name into process_video
+            output_vid, output_csv, output_zip, max_n = process_video(input_path, progress_bar, status_text, selected_model, original_name)
             
-            # ==========================================
-            # SAVE RESULTS TO MEMORY
-            # ==========================================
+            # Save results to session state
             st.session_state.final_video_path = output_vid
             st.session_state.final_csv_path = output_csv
             st.session_state.final_zip_path = output_zip
@@ -135,7 +143,6 @@ if uploaded_file is not None:
     # ==========================================
     # RENDER UI OUTSIDE THE BUTTON BLOCK
     # ==========================================
-    # INDENTATION HERE is aligned with `if st.button`, NOT inside it!
     if st.session_state.is_processed:
 
         output_vid = st.session_state.final_video_path
@@ -160,10 +167,14 @@ if uploaded_file is not None:
             
             # Video Download
             with open(output_vid, "rb") as f:
+                # <-- Ensure downloaded video gets the original name + "_processed"
+                base_name = uploaded_file.name.rsplit('.', 1)[0]
+                export_name = f"{base_name}_processed.mp4"
+                
                 st.download_button(
                     label="🎥 Download Processed Video",
                     data=f.read(),
-                    file_name="processed_video.mp4",
+                    file_name=export_name,
                     mime="video/mp4",
                     use_container_width=True
                 )
@@ -190,11 +201,7 @@ if uploaded_file is not None:
                         use_container_width=True
                     )
 
-            st.markdown("""
-                <style>
-                div.stDownloadButton > button 
-                {height: 60px; font-size: 18px;} </style>""",
-                 unsafe_allow_html=True)
+            st.markdown("""<style>div.stDownloadButton > button {height: 60px; font-size: 18px;}</style>""", unsafe_allow_html=True)
 
         with col2:
             st.subheader("Video Preview")
@@ -247,7 +254,6 @@ if uploaded_file is not None:
                                     label = img_name.split('_')[1].capitalize()
                                 except:
                                     label = "Cropped Image"
-                                    
                                 cols[i].image(img_bytes, caption=label, use_container_width=True)
                     else:
                         st.info("No images were cropped in this run.")
