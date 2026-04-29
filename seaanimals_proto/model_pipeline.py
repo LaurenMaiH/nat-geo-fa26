@@ -155,6 +155,42 @@ def draw_boxes_no_labels(frame, boxes, track_ids=None, thickness=6):
         cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, thickness)
     return annotated
 
+# --- CROP SELECTION HELPER ---
+def select_three_crops(detections, window_pct=0.10):
+    """
+    Given a list of (frame_idx, conf, crop) tuples for one track,
+    return a dict with keys 'best', 'early', 'late', each being the
+    (frame_idx, conf, crop) tuple that wins its selection criterion.
+
+    Early target  = start + 25% of duration
+    Late target   = end   - 25% of duration
+    Window        = ±10% of duration around each target
+    Within each window, pick highest confidence detection.
+    Falls back to the nearest detection if the window is empty.
+    """
+    if not detections:
+        return {}
+
+    detections = sorted(detections, key=lambda x: x[0])  # sort by frame
+    frames = [d[0] for d in detections]
+    start, end = frames[0], frames[-1]
+    duration = max(end - start, 1)
+    window = max(int(duration * window_pct), 1)
+
+    best = max(detections, key=lambda x: x[1])
+
+    def best_in_window(target):
+        lo, hi = target - window, target + window
+        candidates = [d for d in detections if lo <= d[0] <= hi]
+        if candidates:
+            return max(candidates, key=lambda x: x[1])
+        return min(detections, key=lambda x: abs(x[0] - target))
+
+    early = best_in_window(start + int(duration * 0.25))
+    late  = best_in_window(end   - int(duration * 0.25))
+
+    return {"best": best, "early": early, "late": late}
+
 # --- MAIN INFERENCE PIPELINE ---
 def perform_inference(video_path, model, tracker_config, preprocess, output_path="output_video.mp4", original_filename=None, skip_black=(10, 3), sample_interval=2, confidence=0.15, iou=0.7, bg_thresh=40, tile_grid_size=(32,32), preresize=None, progress_callback=None, apply_clahe=True, trim_black=True, frame_skip=2, csv_path=None, zip_path=None):
     N_BG_SAMPLES = 20
@@ -211,7 +247,6 @@ def perform_inference(video_path, model, tracker_config, preprocess, output_path
     frames_inferred = 0
     frames_skipped_by_gate = 0
 
-    # --- NEW: Setup CSV and ZIP Infrastructure ---
     max_animals_counted = 0
     csv_file = None
     csv_writer = None
@@ -220,9 +255,8 @@ def perform_inference(video_path, model, tracker_config, preprocess, output_path
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow(["media_id", "frame", "x", "y", "width", "height"])
 
-    seen_track_ids = set()
-    temp_crop_dir = None
-    if zip_path: temp_crop_dir = tempfile.mkdtemp() 
+    # track_history: {track_id -> {"detections": [(frame_idx, conf, crop), ...], "class_name": str}}
+    track_history = {}
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -252,24 +286,33 @@ def perform_inference(video_path, model, tracker_config, preprocess, output_path
                     boxes = results[0].boxes.xyxy.cpu().numpy()
                     track_ids = results[0].boxes.id.int().cpu().tolist()
                     class_ids = results[0].boxes.cls.int().cpu().tolist()
+                    confs = results[0].boxes.conf.cpu().numpy()
                     
                     if len(track_ids) > max_animals_counted:
                         max_animals_counted = len(track_ids)
                         
-                    for box, track_id, cls_id in zip(boxes, track_ids, class_ids):
+                    for box, track_id, cls_id, conf in zip(boxes, track_ids, class_ids, confs):
                         x1, y1, x2, y2 = map(int, box)
                         class_name = model.names[cls_id] 
                         
                         if csv_writer:
-                            # --- USES THE ORIGINAL FILENAME HERE ---
                             media_id = original_filename if original_filename else Path(video_path).name
                             csv_writer.writerow([media_id, frame_idx, f"{x1 / width:.4f}", f"{y1 / height:.4f}", f"{(x2 - x1) / width:.4f}", f"{(y2 - y1) / height:.4f}"])
-                            
-                        if zip_path and temp_crop_dir and track_id not in seen_track_ids:
-                            seen_track_ids.add(track_id)
-                            crop_img = frame[max(0, y1):min(height, y2), max(0, x1):min(width, x2)]
-                            if crop_img.size > 0:
-                                cv2.imwrite(os.path.join(temp_crop_dir, f"id{track_id}_{class_name}_f{frame_idx}.jpg"), crop_img)
+
+                        # accumulate detection into track history
+                        if zip_path:
+                            y1s, y2s = max(0, y1), min(height, y2)
+                            x1s, x2s = max(0, x1), min(width,  x2)
+                            crop = frame[y1s:y2s, x1s:x2s]
+                            if crop.size > 0:
+                                if track_id not in track_history:
+                                    track_history[track_id] = {
+                                        "detections": [],
+                                        "class_name": class_name
+                                    }
+                                track_history[track_id]["detections"].append(
+                                    (frame_idx, float(conf), crop)
+                                )
 
                     annotated = draw_boxes_no_labels(processed_bgr, boxes, track_ids, thickness=6)
                     frame_out = cv2.resize(annotated, (width, height))
@@ -286,8 +329,16 @@ def perform_inference(video_path, model, tracker_config, preprocess, output_path
     out.release()
     
     if csv_file: csv_file.close()
-        
-    if zip_path and temp_crop_dir:
+
+    # --- select and write three crops per track ---
+    if zip_path and track_history:
+        temp_crop_dir = tempfile.mkdtemp()
+        for track_id, data in track_history.items():
+            chosen = select_three_crops(data["detections"], window_pct=0.10)
+            cls = data["class_name"]
+            for tag, (f_idx, conf, crop) in chosen.items():
+                fname = f"id{track_id}_{cls}_f{f_idx}_{tag}.jpg"
+                cv2.imwrite(os.path.join(temp_crop_dir, fname), crop)
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for root, _, files in os.walk(temp_crop_dir):
                 for file in files: zf.write(os.path.join(root, file), file)
