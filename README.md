@@ -34,11 +34,19 @@ Finetuned Yolo-World model (trained on JAMSTEC dataset on deep-sea animals): htt
 streamlit run model_runner.py
 
 #### IF RUNNING INTO SSL ERROR ####
-1. python3 -m pip install --upgrade certifi requests urllib3 /Applications/Python\ 3.12/install\ Certificates.command
+1. 
+``` 
+python3 -m pip install --upgrade certifi requests urllib3 /Applications/Python\ 3.12/install\ Certificates.command 
+```
 
-2. mkdir -p ~/.cache/clipcurl -L --fail -o ~/.cache/clip/ViT-B-32.pt "https://openaipublic.azureedge.net/clip/models/40d365715913c9-da98579312b702a82c18be219c-c2a73407c4526f58eba950af/ViT-B-32.pt"
+2. 
+``` 
+mkdir -p ~/.cache/clipcurl -L --fail -o ~/.cache/clip/ViT-B-32.pt "https://openaipublic.azureedge.net/clip/models/40d365715913c9-da98579312b702a82c18be219c-c2a73407c4526f58eba950af/ViT-B-32.pt" 
+```
 
-3. ls -lh ~/.cache/clip/ViT-B-32.ptpython3 -c "import clip; print('before'); model, preprocess = clip.load ('ViT-B/32'); print('after')"
+3. 
+``` ls -lh ~/.cache/clip/ViT-B-32.ptpython3 -c "import clip; print('before'); model, preprocess = clip.load ('ViT-B/32'); print('after')"
+```
 
 
 ## 📁 Editing Code & Key Reminders
