@@ -25,8 +25,10 @@ pip install -r requirements.txt
 brew install ffmpeg
 
 4. install default and finetuned model and place them into the seaanimals_proto folder
-Default Yolo-World model: https://drive.google.com/file/d/1hh576zOzpUqgWSjIdSkR4EwgYQ8kH406/view?usp=drive_link
-Finetuned Yolo-World model (trained on JAMSTEC dataset on deep-sea animals): https://drive.google.com/file/d/1rCyq4GZcG5UCqrl2SNNjmaHkLOZbWgyv/view?usp=drive_link
+    
+    Default Yolo-World model: https://drive.google.com/file/d/1hh576zOzpUqgWSjIdSkR4EwgYQ8kH406/view?usp=drive_link
+
+    Finetuned Yolo-World model (trained on JAMSTEC dataset on deep-sea animals): https://drive.google.com/file/d/1rCyq4GZcG5UCqrl2SNNjmaHkLOZbWgyv/view?usp=drive_link
 
 4. cd into seaanimals_proto
 
@@ -45,7 +47,8 @@ mkdir -p ~/.cache/clipcurl -L --fail -o ~/.cache/clip/ViT-B-32.pt "https://opena
 ```
 
 3. 
-``` ls -lh ~/.cache/clip/ViT-B-32.ptpython3 -c "import clip; print('before'); model, preprocess = clip.load ('ViT-B/32'); print('after')"
+``` 
+ls -lh ~/.cache/clip/ViT-B-32.ptpython3 -c "import clip; print('before'); model, preprocess = clip.load ('ViT-B/32'); print('after')"
 ```
 
 
