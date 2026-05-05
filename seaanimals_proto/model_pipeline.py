@@ -30,7 +30,7 @@ def load_model_and_config(model_choice):
             with st.spinner("Downloading YOLO-World Model... (This will only happen once)"):
                 print(f"Default model not found in cache. Downloading to {model_path}...")
                 url = 'https://drive.google.com/file/d/1hh576zOzpUqgWSjIdSkR4EwgYQ8kH406/view?usp=sharing'
-                gdown.download(url, str(model_path), quiet=False, fuzzy=True)
+                gdown.download(url, str(model_path), quiet=False)
                 st.success("Model downloaded successfully!")
         print(f"Loading Default Model from: {model_path}")
         model = YOLOWorld(str(model_path))
@@ -47,7 +47,7 @@ def load_model_and_config(model_choice):
             with st.spinner("Downloading 150MB Deep Sea Model... (This will only happen once)"):
                 print(f"Custom model not found in cache. Downloading to {model_path}...")
                 url = 'https://drive.google.com/file/d/1rCyq4GZcG5UCqrl2SNNjmaHkLOZbWgyv/view?usp=sharing'
-                gdown.download(url, str(model_path), quiet=False, fuzzy=True)
+                gdown.download(url, str(model_path), quiet=False)
                 st.success("Model downloaded successfully!")
         print(f"Loading Fine-Tuned Model from: {model_path}")
         model = YOLOWorld(str(model_path))
