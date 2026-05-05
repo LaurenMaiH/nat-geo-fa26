@@ -66,7 +66,11 @@ def load_model_and_config(model_choice):
     if model_choice == "Default (YOLO-World)":
         model_path = local_dir / "yolov8x-worldv2.pt"
         if not model_path.exists():
-            raise FileNotFoundError(f"Default model not found at {model_path}. Place yolov8x-worldv2.pt next to model_pipeline.py")
+            with st.spinner("Downloading YOLO-World Model... (This will only happen once)"):
+                print(f"Default model not found in cache. Downloading to {model_path}...")
+                url = 'https://drive.google.com/file/d/1hh576zOzpUqgWSjIdSkR4EwgYQ8kH406/view?usp=sharing'
+                gdown.download(url, str(model_path), quiet=False)
+                st.success("Model downloaded successfully!")
         print(f"Loading Default Model from: {model_path}")
         model = YOLOWorld(str(model_path))
         model.model.eval()
@@ -79,7 +83,11 @@ def load_model_and_config(model_choice):
     else:
         model_path = local_dir / "yolov8x-jamstec.pt"
         if not model_path.exists():
-            raise FileNotFoundError(f"Custom model not found at {model_path}. Place yolov8x-jamstec.pt next to model_pipeline.py")
+            with st.spinner("Downloading 150MB Deep Sea Model... (This will only happen once)"):
+                print(f"Custom model not found in cache. Downloading to {model_path}...")
+                url = 'https://drive.google.com/file/d/1rCyq4GZcG5UCqrl2SNNjmaHkLOZbWgyv/view?usp=sharing'
+                gdown.download(url, str(model_path), quiet=False)
+                st.success("Model downloaded successfully!")
         print(f"Loading Fine-Tuned Model from: {model_path}")
         model = YOLOWorld(str(model_path))
         model.model.eval()
