@@ -16,16 +16,55 @@ import csv
 import zipfile
 import gdown
 
-# --- GLOBAL CACHE SETUP ---
-YOLO_CACHE_DIR = Path.home() / ".config" / "ultralytics"
-YOLO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# # --- GLOBAL CACHE SETUP --- COMMENTED OUT FOR SIMPLICITY USE LOCAL MODEL SETUP INSTEAD 
+# YOLO_CACHE_DIR = Path.home() / ".config" / "ultralytics"
+# YOLO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# settings.update({'weights_dir': str(YOLO_CACHE_DIR), 'runs_dir': str(YOLO_CACHE_DIR / "runs")})
+
+# --- LOCAL MODEL SETUP ---
+# Use models located in the repo directory (next to this file).
+LOCAL_MODEL_DIR = Path(__file__).parent
+YOLO_CACHE_DIR = LOCAL_MODEL_DIR
 settings.update({'weights_dir': str(YOLO_CACHE_DIR), 'runs_dir': str(YOLO_CACHE_DIR / "runs")})
 
-# --- MODEL & CONFIG INITIALIZATION ---
+# # --- MODEL & CONFIG INITIALIZATION (GLOBAL CACHE SETUP: COMMENTED OUT FOR SIMPLICITY) ---
+# @st.cache_resource(show_spinner=False)
+# def load_model_and_config(model_choice):
+#     if model_choice == "Default (YOLO-World)":
+#         model_path = YOLO_CACHE_DIR / "yolov8x-worldv2.pt"
+#         if not model_path.exists():
+#             with st.spinner("Downloading YOLO-World Model... (This will only happen once)"):
+#                 print(f"Default model not found in cache. Downloading to {model_path}...")
+#                 url = 'https://drive.google.com/file/d/1hh576zOzpUqgWSjIdSkR4EwgYQ8kH406/view?usp=sharing'
+#                 gdown.download(url, str(model_path), quiet=False)
+#                 st.success("Model downloaded successfully!")
+#         print(f"Loading Default Model from: {model_path}")
+#         model = YOLOWorld(str(model_path))
+#         model.model.eval()
+#         custom_vocabulary = [
+#             "fish", "eel", "ray", "shark", "jellyfish", "animal", "shrimp", 
+#             "crab", "lobster", "isopod", "octopus", "squid", "mollusk", 
+#             "crustacean", "animal cluster"
+#         ]
+#         model.set_classes(custom_vocabulary)
+#     else:
+#         model_path = YOLO_CACHE_DIR / "yolov8x-jamstec.pt"
+#         if not model_path.exists():
+#             with st.spinner("Downloading 150MB Deep Sea Model... (This will only happen once)"):
+#                 print(f"Custom model not found in cache. Downloading to {model_path}...")
+#                 url = 'https://drive.google.com/file/d/1rCyq4GZcG5UCqrl2SNNjmaHkLOZbWgyv/view?usp=sharing'
+#                 gdown.download(url, str(model_path), quiet=False)
+#                 st.success("Model downloaded successfully!")
+#         print(f"Loading Fine-Tuned Model from: {model_path}")
+#         model = YOLOWorld(str(model_path))
+#         model.model.eval()
+
+# --- MODEL & CONFIG INITIALIZATION (LOCAL MODEL SETUP) --- 
 @st.cache_resource(show_spinner=False)
 def load_model_and_config(model_choice):
+    local_dir = Path(__file__).parent
     if model_choice == "Default (YOLO-World)":
-        model_path = YOLO_CACHE_DIR / "yolov8x-worldv2.pt"
+        model_path = local_dir / "yolov8x-worldv2.pt"
         if not model_path.exists():
             with st.spinner("Downloading YOLO-World Model... (This will only happen once)"):
                 print(f"Default model not found in cache. Downloading to {model_path}...")
@@ -42,7 +81,7 @@ def load_model_and_config(model_choice):
         ]
         model.set_classes(custom_vocabulary)
     else:
-        model_path = YOLO_CACHE_DIR / "yolov8x-jamstec.pt"
+        model_path = local_dir / "yolov8x-jamstec.pt"
         if not model_path.exists():
             with st.spinner("Downloading 150MB Deep Sea Model... (This will only happen once)"):
                 print(f"Custom model not found in cache. Downloading to {model_path}...")
