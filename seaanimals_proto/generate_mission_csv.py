@@ -16,6 +16,7 @@ import zipfile
 import tempfile
 import torch
 
+from model_pipeline import process_video_with_model
 
 
 ACCESS_TOKEN = ""
@@ -26,7 +27,7 @@ OUTPUT_CSV_PATH = Path.cwd() / "test.csv"
 YOLO_CACHE_DIR = Path.home() / ".config" / "ultralytics"
 YOLO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 settings.update({'weights_dir': str(YOLO_CACHE_DIR), 'runs_dir': str(YOLO_CACHE_DIR / "runs")})
-INFERENCE_DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+INFERENCE_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using inference device: {INFERENCE_DEVICE}")
 
 
@@ -173,8 +174,6 @@ def draw_boxes_no_labels(frame, boxes, track_ids=None, thickness=6):
 connect_to_dropbox()
 
 
-
-
 def perform_inference(
     video_path, 
     model, 
@@ -254,7 +253,6 @@ def perform_inference(
         if should_write_header:
             csv_writer.writerow(["media_id", "frame", "track_id", "x", "y", "width", "height", "confidence"])
 
-
     progress_desc = f"YOLO {original_filename or Path(video_path).name}"
     with tqdm(total=total_frames, desc=progress_desc, unit="frame", leave=True) as pbar:
         while frame_idx < total_frames:
@@ -287,10 +285,12 @@ def perform_inference(
                         track_ids = results[0].boxes.id.int().cpu().tolist()
                         class_ids = results[0].boxes.cls.int().cpu().tolist()
 
-                        for box, track_id, cls_id in zip(boxes, track_ids, class_ids):
+                        confs = results[0].boxes.conf.cpu().tolist()
+
+                        for box, track_id, cls_id, conf in zip(boxes, track_ids, class_ids, confs):
                             x1, y1, x2, y2 = map(int, box)
                             if csv_writer:
-                                csv_writer.writerow([original_filename, frame_idx, track_id, f"{x1 / width:.4f}", f"{y1 / height:.4f}", f"{(x2 - x1) / width:.4f}", f"{(y2 - y1) / height:.4f}", confidence])
+                                csv_writer.writerow([original_filename, frame_idx, track_id, f"{x1 / width:.4f}", f"{y1 / height:.4f}", f"{(x2 - x1) / width:.4f}", f"{(y2 - y1) / height:.4f}", f"{conf:.4f}"])
                                 csv_file.flush()
                 else:
                     frames_skipped_by_gate += 1
@@ -304,7 +304,31 @@ def perform_inference(
     if csv_file:
         csv_file.close()
 
+def clean_csv(csv_path: Path):
+    """Remove sentinel -1 rows written for videos with no detections."""
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return
+    with open(csv_path, newline='') as f:
+        rows = list(csv.reader(f))
+    header, data = rows[0], rows[1:]
+    cleaned = [r for r in data if r and r[1] != '-1']
+    with open(csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(cleaned)
+    removed = len(data) - len(cleaned)
+    print(f"Removed {removed} sentinel row(s) from {csv_path}")
 
+
+def get_last_processed(csv_path: Path) -> str | None:
+    """Return the media_id of the last row written to the CSV, or None."""
+    if not csv_path.exists() or csv_path.stat().st_size == 0:
+        return None
+    with open(csv_path, newline='') as f:
+        rows = [r for r in csv.reader(f) if r]
+    if len(rows) < 2:
+        return None
+    return rows[-1][0] 
 
 
 def main():
@@ -312,23 +336,57 @@ def main():
     preprocess = clahe_L_median
     print(f"Appending detections to {OUTPUT_CSV_PATH}")
 
+    last_processed = get_last_processed(OUTPUT_CSV_PATH)
+    if last_processed:
+        print(f"Resuming after: {last_processed}")
+    else:
+        print("Starting from the beginning")
+
+    entries = sorted(
+        [e for e in dbx.files_list_folder(MISSION_PATH).entries if e.name.endswith('.mp4')],
+        key=lambda e: e.name
+    )
+
+    # Skip everything up to and including last_processed
+    if last_processed and last_processed in [e.name for e in entries]:
+        idx = next(i for i, e in enumerate(entries) if e.name == last_processed)
+        remaining = entries[idx + 1:]
+        print(f"Skipping {idx + 1} video(s), {len(remaining)} remaining\n")
+    else:
+        remaining = entries
+        print(f"Found {len(entries)} videos total, processing all\n")
+
     counter = 0
     with tempfile.TemporaryDirectory(prefix="natgeo_videos_") as tmpdir:
         tmpdir = Path(tmpdir)
-        for entry in dbx.files_list_folder(MISSION_PATH).entries:
-            if entry.name.endswith('.mp4'):
-                dropbox_video_path = MISSION_PATH + "/" + entry.name
-                local_video_path = tmpdir / entry.name
-                print(f"Downloading {entry.name}")
-                dbx.files_download_to_file(str(local_video_path), dropbox_video_path)
+        for entry in remaining:
+            dropbox_video_path = MISSION_PATH + "/" + entry.name
+            local_video_path = tmpdir / entry.name
 
-                print(f"Processing {entry.name}")
-                perform_inference(str(local_video_path), model, tracker_config, preprocess, original_filename=entry.name, skip_black=(10, 3), confidence=0.15, iou=0.7, bg_thresh=40, tile_grid_size=(32,32), preresize=None, progress_callback=None, apply_clahe=True, trim_black=True, csv_path=OUTPUT_CSV_PATH, zip_path=None)
+            print(f"Downloading {entry.name}")
+            dbx.files_download_to_file(str(local_video_path), dropbox_video_path)
+
+            print(f"Processing {entry.name}")
+            try:
+                perform_inference(
+                    str(local_video_path), model, tracker_config, preprocess,
+                    original_filename=entry.name,
+                    skip_black=(10, 3), confidence=0.15, iou=0.7,
+                    bg_thresh=40, tile_grid_size=(32, 32), preresize=1080,
+                    progress_callback=None, apply_clahe=True, trim_black=True,
+                    csv_path=OUTPUT_CSV_PATH, zip_path=None
+                )
+                # Write a sentinel row so videos with no detections are still recorded
+                with open(OUTPUT_CSV_PATH, 'a', newline='') as f:
+                    csv.writer(f).writerow([entry.name, -1, None, None, None, None, None, None])
                 counter += 1
+                print(f"✓ {entry.name} done")
+            except Exception as e:
+                print(f"✗ {entry.name} failed: {e}")
+            finally:
+                local_video_path.unlink(missing_ok=True)
 
-            if counter == 3:
-                break
-    print(f"Processed {counter} videos")
+    print(f"\nProcessed {counter} videos this session")
 
 
-main()
+# main()
