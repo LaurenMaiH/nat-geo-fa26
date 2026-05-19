@@ -4,10 +4,9 @@ Embed crops with BioClip 2, average per track, cluster with HDBSCAN, visualize w
 Expected input structure:
     pipeline_output/
         <video_name>/
-            crops/
-                id3_fish_f0042_best.jpg
-                id3_fish_f0042_early.jpg
-                ...
+            id3_fish_f0042_best.jpg
+            id3_fish_f0042_early.jpg
+            ...
 
 Install:
     pip install open_clip_torch torch torchvision umap-learn hdbscan scikit-learn seaborn tqdm
@@ -16,6 +15,7 @@ Install:
 import numpy as np
 import torch
 import open_clip
+import cv2
 from PIL import Image
 from pathlib import Path
 from collections import defaultdict
@@ -33,11 +33,17 @@ from sklearn.metrics import silhouette_score
 # CONFIG
 # ============================================================
 
-PIPELINE_OUTPUT = Path("segmented_three_crop_output")
+PIPELINE_OUTPUT = Path("three_crop_output")
 MODEL_NAME      = "hf-hub:imageomics/bioclip-2"
 CHECKPOINT_PATH = "checkpoints/best.pt"  # set to None to use pretrained weights
 BATCH_SIZE      = 64
 DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
+
+# CLAHE — applied to each crop before embedding
+# Set APPLY_CLAHE = False to disable
+APPLY_CLAHE       = True
+CLAHE_CLIP_LIMIT  = 3.0
+CLAHE_TILE_SIZE   = (8, 8)   # smaller tiles than inference = more local contrast
 
 # HDBSCAN
 HDBSCAN_MIN_CLUSTER_SIZE = 12
@@ -71,11 +77,29 @@ def parse_track_id(path: Path) -> str:
 # ============================================================
 
 def collect_crop_paths(pipeline_output: Path) -> list[Path]:
-    """Gather all .jpg crops from pipeline_output/<video>/crops/"""
+    """Gather all .jpg crops from pipeline_output/<video>/"""
     paths = sorted(pipeline_output.glob("*/*.jpg"))
     print(f"Found {len(paths)} crop images across "
-          f"{len(set(p.parent.parent.name for p in paths))} video(s)")
+          f"{len(set(p.parent.name for p in paths))} video(s)")
     return paths
+
+
+# ============================================================
+# CLAHE PREPROCESSING
+# ============================================================
+
+def apply_clahe(pil_img: Image.Image) -> Image.Image:
+    """
+    Apply CLAHE on the L channel of LAB colorspace to enhance
+    local contrast without blowing out colors.
+    """
+    clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_SIZE)
+    bgr   = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    lab   = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    lab   = cv2.merge([clahe.apply(l), a, b])
+    bgr   = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+    return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
 
 # ============================================================
@@ -109,6 +133,14 @@ def pad_to_square(img: Image.Image) -> Image.Image:
     return padded
 
 
+def load_crop(path: Path) -> Image.Image:
+    """Load a crop, optionally applying CLAHE."""
+    img = Image.open(path).convert("RGB")
+    if APPLY_CLAHE:
+        img = apply_clahe(img)
+    return img
+
+
 def extract_embeddings(
     paths: list[Path],
     model,
@@ -121,7 +153,7 @@ def extract_embeddings(
         batch = []
         for p in paths[i:i + batch_size]:
             try:
-                batch.append(preprocess(pad_to_square(Image.open(p).convert("RGB"))))
+                batch.append(preprocess(pad_to_square(load_crop(p))))
             except Exception as e:
                 print(f"  Skipping {p.name}: {e}")
         if not batch:
@@ -317,11 +349,12 @@ def main():
     if not crop_paths:
         raise RuntimeError(f"No crops found under {PIPELINE_OUTPUT}")
 
+    print(f"CLAHE preprocessing: {'ON' if APPLY_CLAHE else 'OFF'}")
     model, preprocess = load_bioclip(MODEL_NAME, DEVICE, CHECKPOINT_PATH)
 
-    per_crop_embs          = extract_embeddings(crop_paths, model, preprocess, DEVICE, BATCH_SIZE)
-    track_ids, track_embs  = average_per_track(crop_paths, per_crop_embs)
-    labels                 = cluster_hdbscan(track_embs)
+    per_crop_embs         = extract_embeddings(crop_paths, model, preprocess, DEVICE, BATCH_SIZE)
+    track_ids, track_embs = average_per_track(crop_paths, per_crop_embs)
+    labels                = cluster_hdbscan(track_embs)
 
     plot_clusters(labels, track_ids, PIPELINE_OUTPUT)
 

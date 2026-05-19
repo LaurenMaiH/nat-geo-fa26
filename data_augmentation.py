@@ -101,5 +101,5 @@ for species_dir in sorted(CROPS_DIR.iterdir()):
         augment_images(
             input_dir=species_dir,
             output_dir=CROPS_AUGMENTED_DIR / species_dir.name,
-            augmentations_per_image=5,
+            augmentations_per_image=10,
         )
