@@ -25,10 +25,13 @@ from tqdm import tqdm
 # CONFIG — update these to match your setup
 # ============================================================
 
-ACCESS_TOKEN  = "sl.u.AGeE-YE2b2Pai822S1aqhAceLXRdWbSw4q_QVC5sXSnlWcBn7tRv_ST5A2NSLgenwebXna5kvomwbQT_GLwu-ET_9JYKAzsbd8-sikZGhXtLl3jY63xORWdWxsW9oS22utXy_7eXXqGMd2SjLvEjtl7o_6jpze5CM7tLbabvi-YLaAaaNhPk6k_ADSoHb4NkNsS2znV9V24AjVW6nUgyozHHVFj6twmbRoneCKwRy6t7V-a8xhrNBDaQHFPMASbwWJvxmW9yoQM_waF_r4mSr-lPY2C4U-S5pLXkAdkIaSOmq4SJg6eIW463_LThJ8f8hUSjoKJTCAo76vm9qusp_Oi6_Kk_NqTqW_FdEvhU7RiS3js7-htuKFtTf0HmE2FjRUVobNXjvMXl0111W5fFpUAdxLZjRWiDPhvcJp6SjxbpAxmLO3WzPFT--pmWpKw1rlMkfbfoQ5Lq9FbC2Tbz_gJHa7XVeIfzdYo3xq1x20AaxSQKfweX3JHPGZV1kcacKqaszp0Urv8Uhb2lGc_hQMcpxQf-JMV_ABwX9fuQESchqyzrPc4rFe8x80wyxZK85Ezw-1kxgMfVGNdt0bn0Mp58ZfYYiwmSatVFnQolRB41GwLN9tnDqjGN1l65hRPpLOwCakO8unAGEY7J6SG2J5BafFmhsXCX3osT3ZJ_JRPB8sn2svKAtc-ZR0FLlky_x24VYV3vm6fMi7gK9_znM0wulBjEXQ6CcNK_xmR9wDg_4616KyyVtbPIP9MEi2w9s-sL_b9ul5GZhihgdn9FZtg0MdFHDMTdyylKa48m0yG4afbAESU0fsTuLFqRZvokY5BncwpNO3fomDBhj4Dhh15IIgyDuF1-jELrN5qtpVw7fDs4N7zXEsjf89XpXiRFE4ApOPwe0dE8W8Osh-QtYHqU6RfSjur7sGLo5_nc5D2mOi7FooF-oAkNjp3yohLK6i6sogkHZeWtwffDb-MWJYN3_vVMSTA06Xp2XRH_cF5ByC9mlVMwxgeE3UDdv22RUIAl3pKfsAFLsKtv31VuzgQ5PaldIFfjOBwQvNdzWwkBLQSkdAUlhm3mVjpNdZUQNKgn81rRx8ImvEch364FkenUjNSvCE9hOiICvWbM1dwjt9raeXcZT37CXtHFHhjvDUh2vA5ZQJHjmOile8hdoaHdS1a4ZkwFVUb3PG3uazyO7SSdFMiBnmGLITb2j8Chwv8EfpfePB081LPcNmLXl2mfy00GRdU1zenGoxJhhp3G-gda6-afza_w8_-HrbrWogv18N3KP9O8mSlV5GZq6hLxsjw_zaWoM0PtZ1SzzwqWmzPFpsYGfFitgb-6uKiX_I1WO3Z_XXwPaMI_T_XkrVHdqTiA-0tK01djYHvJcag32HGrFKbemzXHngvbEC4hThk2H_yOc4CsWRH30tLGnZOsT4qwNwjjwetuZk4JBfQ31gs3mpwmGtvqwTMC7IwPBM4"
-MISSION_ROOT  = "/DOEX0096_Palau/PLW_dscm_09/Video"   # Dropbox folder containing the .mp4s
-CSV_PATH      = Path("annotated_detections.csv")
+ACCESS_TOKEN  = "sl.u.AGe4QPkAbD7xHcc5VQ4qHVl28JzcRGTTMpdgGMRSG02iBZWxdqEO110HIh_AzVnL18bQROZkKqYMTeU5yDGGuRxTt-6Sh9ApGI9XgjojvdBtyvjRMxbRF6K3uRab9-W1RPSLhb-Vw7p7-Dji15MOjE-WsMVmNAukFqMfAv7_Evy71pA4AQPKFMb68KV-NNNRzYE6m4eR2KOqPWPzoz96dIl0lFJbKW5_Mc9j6-hkyz0_Kh5uvSlwtpCJE5FC9mj8lTUvd-oKKf89O7ZLFT5JUy3BYJ-IsvXlXok13qUOVdNk_7zG77WM7eb313eEyMytu2-GHBy21X159NhiKZC8rrsOE_MeTud5Bzk2U0_pKE65owD3D6CHKMSZT1ATjlq8cGnwBTKpPnq62E1sQgvjrYAzPsQsURbvSZElt27pje7UrUIR0GgnWfGR-SDyKlBTo9zwld0NyEZHGphzqs8y-BGEUS_Xl_NALt9Qt1wHhkWqWZdlA8PL1wE1T2i8-a8-ExX_nkJTnYk82YzOcXR3mrh7v8TRYG1I0fcDYzpBB3X643ebjZDFiK6gwXHN7ZaHJH3f5QWPxZAlMtkG7HI1wmy54lwi02xr2g-VDxKGIMFbv0PtWmbbe2JYQ0OVwVA8JgLo8Y4oMz1ammK6GGzqqHVccCjO4_MmpiQQpSqRFMIUymTQmLD2iV_OVcyzcmIFTXpEpxR5FfFofsemRhJOf-EpdiIA2HcdYKiva2Tuo9mmUHqsELK000ym6RlM38y5QTqhaKtQ_Upvur4iin_N-7E1SvgR34Gh-7eH_ie0GxpJWSjijy9GKcDo0GA21VQE2HZe0dm178ka1GJGns66i5wJieUwnO89dnLf2UTlEstVBLAZZNTgt1QAUhqfbII3H6ChY54g9Mol9HXMHNYLPqxwP2S6dp4P2GGtXlquKs3TV7GHIayHFJV6olUr8j2S6jQkuhlFo9WGiWcdLF4GRIwprd7zCsNhb1OPjaMTW6RCo6d6ngCJdiIwOTKvYB__qKozWju7laf01gMoLGkIMHU5vetMsRashVEuBj6H-QMga-FVU_8M2S29ElHkHAp7MBJsQSuX9UiBl7n0Cyk12voPGcd0bdvpEpOGyq8KBQKC66DlOp-MyD5yP_4Mt17FaYGkCLMM62BnGCs5FUS1jP72Hi2s8BF-YENaLT4tA0MCzCg8kbGFoidsDbJQ086GqxT6CpeoPEXw75EdD19f2fz9WLyOhDG7Lb7NogQTCZ7JTuz_ko1ck0LYYVldg3BKgt7qqyxVVDzQg8AmRF3pR8v1KeQjII_tJofpx6-63oF2HGlhj0zdSAC6sG1Wuw23CIMqwLrJmljq5YquLrxN23HokjBB9gALOc-tv2EJ3eD5tJ4ftYG34hFx-BYR3KCO3izNZ32T3CXFPPzlGF9JVEUtm_J8NkOaSDYlzKI0NkzIa_39VTL21Cwzdjcn0GGjxoiVTiB8-C5XCm_rjbyMAlcU"
+MISSION_ROOT  = "/DOEX0096_Palau/PLW_dscm_05/Video"   # Dropbox folder containing the .mp4s
+CSV_PATH      = Path("mission05_crabs.csv")
 CROPS_DIR     = Path("crops")
+
+
+FORCE_SPECIES = "Chaceon micronesicus" # set to None to use scientific name if provided in csv
 
 PADDING       = 0.05    # fractional padding added around each crop (0.05 = 5% of frame)
 MIN_CROP_PX   = 32      # discard crops smaller than this in either dimension
@@ -43,19 +46,19 @@ def load_detections(csv_path: Path) -> dict[str, list[dict]]:
     by_video = defaultdict(list)
     with open(csv_path, newline="") as f:
         for row in csv.DictReader(f):
-            media = row["media"].strip()
+            # support both column naming conventions
+            media = (row.get("media") or row.get("media_id") or "").strip()
             by_video[media].append({
                 "frame":   int(row["frame"]),
                 "x":       float(row["x"]),
                 "y":       float(row["y"]),
                 "w":       float(row["width"]),
                 "h":       float(row["height"]),
-                "species": row["Scientific Name"].strip(),
+                "species": FORCE_SPECIES or row.get("Scientific Name", "").strip(),
             })
     for dets in by_video.values():
         dets.sort(key=lambda d: d["frame"])
     return by_video
-
 
 # ============================================================
 # CROP EXTRACTION
