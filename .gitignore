@@ -3,6 +3,8 @@
 seaanimals_proto/yolov8x-worldv2.pt
 yolov8x-worldv2.pt
 .yolo/
+yolov8x-worldv2.pt.yaml
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -211,3 +213,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+.DS_Store
