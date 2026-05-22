@@ -20,7 +20,7 @@ from model_pipeline import process_video_with_model
 
 
 ACCESS_TOKEN = ""
-MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_57/Video"
+MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_57/Video" 
 OUTPUT_CSV_PATH = Path.cwd() / "test.csv"
 
 
