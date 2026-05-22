@@ -6,3 +6,10 @@ gdown
 pandas
 PyYAML
 tqdm
+open-clip-torch
+hdbscan
+umap-learn
+matplotlib
+seaborn
+scikit-learn
+scikit-image

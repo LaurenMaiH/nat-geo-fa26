@@ -19,8 +19,13 @@ import torch
 from model_pipeline import process_video_with_model
 
 
-ACCESS_TOKEN = ""
-MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_57/Video" 
+# none processes all vids from a folder
+SELECTED_VIDEOS = ["PLW_dscm_05_c058.mp4", "PLW_dscm_05_c117.mp4","PLW_dscm_05_c120.mp4", "PLW_dscm_05_c137.mp4", "PLW_dscm_05_c183.mp4", "PLW_dscm_05_c186.mp4"]
+# SELECTED_VIDEOS = None
+
+
+ACCESS_TOKEN = "sl.u.AGe4QPkAbD7xHcc5VQ4qHVl28JzcRGTTMpdgGMRSG02iBZWxdqEO110HIh_AzVnL18bQROZkKqYMTeU5yDGGuRxTt-6Sh9ApGI9XgjojvdBtyvjRMxbRF6K3uRab9-W1RPSLhb-Vw7p7-Dji15MOjE-WsMVmNAukFqMfAv7_Evy71pA4AQPKFMb68KV-NNNRzYE6m4eR2KOqPWPzoz96dIl0lFJbKW5_Mc9j6-hkyz0_Kh5uvSlwtpCJE5FC9mj8lTUvd-oKKf89O7ZLFT5JUy3BYJ-IsvXlXok13qUOVdNk_7zG77WM7eb313eEyMytu2-GHBy21X159NhiKZC8rrsOE_MeTud5Bzk2U0_pKE65owD3D6CHKMSZT1ATjlq8cGnwBTKpPnq62E1sQgvjrYAzPsQsURbvSZElt27pje7UrUIR0GgnWfGR-SDyKlBTo9zwld0NyEZHGphzqs8y-BGEUS_Xl_NALt9Qt1wHhkWqWZdlA8PL1wE1T2i8-a8-ExX_nkJTnYk82YzOcXR3mrh7v8TRYG1I0fcDYzpBB3X643ebjZDFiK6gwXHN7ZaHJH3f5QWPxZAlMtkG7HI1wmy54lwi02xr2g-VDxKGIMFbv0PtWmbbe2JYQ0OVwVA8JgLo8Y4oMz1ammK6GGzqqHVccCjO4_MmpiQQpSqRFMIUymTQmLD2iV_OVcyzcmIFTXpEpxR5FfFofsemRhJOf-EpdiIA2HcdYKiva2Tuo9mmUHqsELK000ym6RlM38y5QTqhaKtQ_Upvur4iin_N-7E1SvgR34Gh-7eH_ie0GxpJWSjijy9GKcDo0GA21VQE2HZe0dm178ka1GJGns66i5wJieUwnO89dnLf2UTlEstVBLAZZNTgt1QAUhqfbII3H6ChY54g9Mol9HXMHNYLPqxwP2S6dp4P2GGtXlquKs3TV7GHIayHFJV6olUr8j2S6jQkuhlFo9WGiWcdLF4GRIwprd7zCsNhb1OPjaMTW6RCo6d6ngCJdiIwOTKvYB__qKozWju7laf01gMoLGkIMHU5vetMsRashVEuBj6H-QMga-FVU_8M2S29ElHkHAp7MBJsQSuX9UiBl7n0Cyk12voPGcd0bdvpEpOGyq8KBQKC66DlOp-MyD5yP_4Mt17FaYGkCLMM62BnGCs5FUS1jP72Hi2s8BF-YENaLT4tA0MCzCg8kbGFoidsDbJQ086GqxT6CpeoPEXw75EdD19f2fz9WLyOhDG7Lb7NogQTCZ7JTuz_ko1ck0LYYVldg3BKgt7qqyxVVDzQg8AmRF3pR8v1KeQjII_tJofpx6-63oF2HGlhj0zdSAC6sG1Wuw23CIMqwLrJmljq5YquLrxN23HokjBB9gALOc-tv2EJ3eD5tJ4ftYG34hFx-BYR3KCO3izNZ32T3CXFPPzlGF9JVEUtm_J8NkOaSDYlzKI0NkzIa_39VTL21Cwzdjcn0GGjxoiVTiB8-C5XCm_rjbyMAlcU"
+MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_05/Video"
 OUTPUT_CSV_PATH = Path.cwd() / "test.csv"
 
 
@@ -342,19 +347,31 @@ def main():
     else:
         print("Starting from the beginning")
 
-    entries = sorted(
+    all_entries = sorted(
         [e for e in dbx.files_list_folder(MISSION_PATH).entries if e.name.endswith('.mp4')],
         key=lambda e: e.name
     )
 
-    # Skip everything up to and including last_processed
-    if last_processed and last_processed in [e.name for e in entries]:
+    # Filter to selected videos if specified
+    if SELECTED_VIDEOS is not None:
+        selected_set = set(SELECTED_VIDEOS)
+        entries = [e for e in all_entries if e.name in selected_set]
+        missing = selected_set - {e.name for e in entries}
+        if missing:
+            print(f"Warning: these selected videos were not found in Dropbox: {missing}")
+        print(f"Selected {len(entries)} video(s) from {len(all_entries)} in mission")
+    else:
+        entries = all_entries
+        print(f"Processing all {len(entries)} video(s) in mission")
+
+    # Resume: skip up to and including last_processed within the filtered list
+    if last_processed and last_processed in {e.name for e in entries}:
         idx = next(i for i, e in enumerate(entries) if e.name == last_processed)
         remaining = entries[idx + 1:]
         print(f"Skipping {idx + 1} video(s), {len(remaining)} remaining\n")
     else:
         remaining = entries
-        print(f"Found {len(entries)} videos total, processing all\n")
+        print(f"{len(remaining)} video(s) to process\n")
 
     counter = 0
     with tempfile.TemporaryDirectory(prefix="natgeo_videos_") as tmpdir:
@@ -376,9 +393,11 @@ def main():
                     progress_callback=None, apply_clahe=True, trim_black=True,
                     csv_path=OUTPUT_CSV_PATH, zip_path=None
                 )
-                # Write a sentinel row so videos with no detections are still recorded
-                with open(OUTPUT_CSV_PATH, 'a', newline='') as f:
-                    csv.writer(f).writerow([entry.name, -1, None, None, None, None, None, None])
+                # Write sentinel so videos with no detections are still recorded
+                last = get_last_processed(OUTPUT_CSV_PATH)
+                if last != entry.name:
+                    with open(OUTPUT_CSV_PATH, 'a', newline='') as f:
+                        csv.writer(f).writerow([entry.name, -1, None, None, None, None, None, None])
                 counter += 1
                 print(f"✓ {entry.name} done")
             except Exception as e:
@@ -389,4 +408,5 @@ def main():
     print(f"\nProcessed {counter} videos this session")
 
 
-# main()
+main()
+clean_csv(OUTPUT_CSV_PATH)

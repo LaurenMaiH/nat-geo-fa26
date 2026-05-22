@@ -13,7 +13,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-st.image("natgeobanner.png", use_container_width=True)
+st.image(Path(__file__).parent / "natgeobanner.png", use_container_width=True)
 
 # ==========================================
 # INITIALIZE SESSION STATE 

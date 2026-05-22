@@ -3,6 +3,8 @@
 seaanimals_proto/yolov8x-worldv2.pt
 yolov8x-worldv2.pt
 .yolo/
+yolov8x-worldv2.pt.yaml
+
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -211,3 +213,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+
+.DS_Store
+three_crop_output_processed/plw_dscm_11_c031/id18_fish_f662_best.jpg
+three_crop_output_processed/plw_dscm_11_c031/id32_fish_f1220_early.jpg
+bg_removal_debug.png
+three_crop_output_processed/plw_dscm_11_c031/id18_fish_f666_early.jpg
+three_crop_output_processed/plw_dscm_11_c031/id18_fish_f670_late.jpg
+.gitignore
+three_crop_output_processed/plw_dscm_11_c031/id32_fish_f1304_late.jpg
