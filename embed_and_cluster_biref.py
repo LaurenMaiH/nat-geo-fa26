@@ -39,11 +39,12 @@ from rembg import remove, new_session
 # CONFIG
 # ============================================================
 
-PIPELINE_OUTPUT = Path("three_crop_output")
-MODEL_NAME      = "hf-hub:imageomics/bioclip-2"
-CHECKPOINT_PATH = None            #"checkpoints/best.pt"  # set to None to use pretrained weights
-BATCH_SIZE      = 64
-DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
+PIPELINE_OUTPUT   = Path("three_crop_output")
+PROCESSED_OUTPUT  = Path("three_crop_output_processed")  # bg-removed crops saved here
+MODEL_NAME        = "hf-hub:imageomics/bioclip-2"
+CHECKPOINT_PATH   = None            #"checkpoints/best.pt"  # set to None to use pretrained weights
+BATCH_SIZE        = 64
+DEVICE            = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Background removal — applied BEFORE CLAHE
 # Set APPLY_BG_REMOVAL = False to disable
@@ -119,6 +120,43 @@ def composite_on_color(rgba: Image.Image, bg_color=(0, 0, 0)) -> Image.Image:
 
 
 # ============================================================
+# PREPROCESSING — save processed crops to disk
+# ============================================================
+
+def preprocess_and_save_crops(paths: list[Path]) -> list[Path]:
+    """
+    For each raw crop: run BG removal + CLAHE, save to PROCESSED_OUTPUT
+    mirroring the original directory structure.  Already-processed files
+    are skipped so reruns are fast.
+    Returns the list of saved (processed) paths in the same order as input.
+    """
+    saved = []
+    skipped = 0
+    for p in tqdm(paths, desc="Preprocessing crops"):
+        rel = p.relative_to(PIPELINE_OUTPUT)
+        out = PROCESSED_OUTPUT / rel
+        if out.exists():
+            saved.append(out)
+            skipped += 1
+            continue
+        out.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            img = Image.open(p).convert("RGB")
+            if APPLY_BG_REMOVAL:
+                rgba = remove_background(img)
+                img  = composite_on_color(rgba, BG_COMPOSITE_COLOR)
+            if APPLY_CLAHE:
+                img = apply_clahe(img)
+            img.save(out)
+            saved.append(out)
+        except Exception as e:
+            print(f"  Skipping {p.name}: {e}")
+    print(f"Preprocessed {len(saved)}/{len(paths)} crops → {PROCESSED_OUTPUT}"
+          + (f"  ({skipped} already cached)" if skipped else ""))
+    return saved
+
+
+# ============================================================
 # TRACK ID PARSING
 # If your filename convention changes, only edit this function.
 # e.g. for "PLW_c001_frame00042_det00.jpg" you might do:
@@ -161,18 +199,12 @@ def apply_clahe(pil_img: Image.Image) -> Image.Image:
 
 
 # ============================================================
-# CROP LOADING (bg removal → composite → CLAHE)
+# CROP LOADING
 # ============================================================
 
 def load_crop(path: Path) -> Image.Image:
-    """Load a crop, optionally removing background then applying CLAHE."""
-    img = Image.open(path).convert("RGB")
-    if APPLY_BG_REMOVAL:
-        rgba = remove_background(img)
-        img  = composite_on_color(rgba, BG_COMPOSITE_COLOR)
-    if APPLY_CLAHE:
-        img = apply_clahe(img)
-    return img
+    """Load a preprocessed crop (already BG-removed + CLAHE)."""
+    return Image.open(path).convert("RGB")
 
 
 # ============================================================
@@ -332,7 +364,7 @@ def plot_clusters(
                 path = best_crop_for_track(tid, pipeline_output)
                 if path:
                     try:
-                        ax.imshow(Image.open(path).convert("RGB"))
+                        ax.imshow(load_crop(path))
                     except Exception:
                         pass
             if col == 0:
@@ -366,7 +398,7 @@ def plot_all_in_cluster(
         path = best_crop_for_track(tid, pipeline_output)
         if path:
             try:
-                ax.imshow(Image.open(path).convert("RGB"))
+                ax.imshow(load_crop(path))
                 ax.set_title(tid, fontsize=5, pad=2)
             except Exception:
                 pass
@@ -416,23 +448,29 @@ def main():
 
     print(f"Background removal: {'ON' if APPLY_BG_REMOVAL else 'OFF'}")
     print(f"CLAHE preprocessing: {'ON' if APPLY_CLAHE else 'OFF'}")
+
+    # Preprocess all crops once and save to disk; embed from saved files
+    processed_paths = preprocess_and_save_crops(crop_paths)
+    if not processed_paths:
+        raise RuntimeError("No crops survived preprocessing.")
+
     model, preprocess = load_bioclip(MODEL_NAME, DEVICE, CHECKPOINT_PATH)
 
-    per_crop_embs         = extract_embeddings(crop_paths, model, preprocess, DEVICE, BATCH_SIZE)
-    track_ids, track_embs = average_per_track(crop_paths, per_crop_embs)
+    per_crop_embs         = extract_embeddings(processed_paths, model, preprocess, DEVICE, BATCH_SIZE)
+    track_ids, track_embs = average_per_track(processed_paths, per_crop_embs)
     labels                = cluster_hdbscan(track_embs)
 
-    plot_clusters(labels, track_ids, PIPELINE_OUTPUT)
+    plot_clusters(labels, track_ids, PROCESSED_OUTPUT)
 
     # inspect noise cluster
     if -1 in labels:
-        plot_all_in_cluster(-1, labels, track_ids, PIPELINE_OUTPUT)
+        plot_all_in_cluster(-1, labels, track_ids, PROCESSED_OUTPUT)
 
     # inspect any cluster with more than 100 tracks
     unique, counts = np.unique(labels, return_counts=True)
     for lbl, count in zip(unique, counts):
         if lbl != -1 and count > 100:
-            plot_all_in_cluster(lbl, labels, track_ids, PIPELINE_OUTPUT)
+            plot_all_in_cluster(lbl, labels, track_ids, PROCESSED_OUTPUT)
 
     plot_umap(track_embs, labels)
 
