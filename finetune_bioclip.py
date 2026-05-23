@@ -27,28 +27,30 @@ import open_clip
 import random
 import numpy as np
 import csv
+from datetime import datetime
 
 from taxonomy import SPECIES_TO_GROUP, GROUP_TO_METAGROUP, get_similarity  # your file
 
 
 # ============================================================
-# CONFIG
+# CONFIG (defaults — override by passing args to train())
 # ============================================================
 
-CROPS_DIR       = Path("crops")
+CROPS_DIR       = Path("crops_augmented")
 CHECKPOINT_DIR  = Path("checkpoints")
-CHECKPOINT_DIR.mkdir(exist_ok=True)
+LOG_DIR         = Path("final_train_log")
 
 MODEL_NAME      = "hf-hub:imageomics/bioclip-2"
 EMBED_DIM       = 768        # BioClip 2 vision embedding size
 PROJ_DIM        = 128        # contrastive projection head output dim
 
-BATCH_SIZE      = 32         # pairs are built inside the loss, not the loader
+BATCH_SIZE      = 32
 EPOCHS          = 20
-LR              = 2e-5       # low LR — we're finetuning, not training from scratch
+LR              = 5e-5
 WEIGHT_DECAY    = 1e-4
-TEMPERATURE     = 0.07       # contrastive temperature
+TEMPERATURE     = 0.05
 WARMUP_EPOCHS   = 2
+USE_TRANSFORMS  = False
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {DEVICE}")
@@ -175,55 +177,97 @@ def get_transform(model_transform):
     ])
 
 
-def train():
+def train(
+    lr             = LR,
+    temperature    = TEMPERATURE,
+    batch_size     = BATCH_SIZE,
+    proj_dim       = PROJ_DIM,
+    epochs         = EPOCHS,
+    weight_decay   = WEIGHT_DECAY,
+    warmup_epochs  = WARMUP_EPOCHS,
+    crops_dir      = CROPS_DIR,
+    use_transforms = USE_TRANSFORMS,
+    log_name       = None,       # if None, auto-generate a timestamped name
+):
+    """
+    Run one finetuning session. All hyperparameters have defaults matching
+    the module-level constants, so calling train() with no args is identical
+    to the original hardcoded behaviour.
+
+    Args:
+        crops_dir:      Path to the directory of species-labelled crop folders.
+        use_transforms: If True, apply random augmentation on top of the base
+                        preprocess transform. Set to False when using a
+                        pre-augmented dataset to keep the experiment controlled.
+    """
+    CHECKPOINT_DIR.mkdir(exist_ok=True)
+    LOG_DIR.mkdir(exist_ok=True)
+
+    crops_dir = Path(crops_dir)
+
     # --- load model ---
     print(f"Loading {MODEL_NAME}...")
     model, _, preprocess = open_clip.create_model_and_transforms(MODEL_NAME)
     model = model.visual          # vision encoder only
     model = model.to(DEVICE)
 
-    train_transform = get_transform(preprocess)
-    dataset = CropDataset(CROPS_DIR, train_transform)
-    loader  = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+    # use augmentation transforms or just the bare preprocess
+    if use_transforms:
+        transform = get_transform(preprocess)
+        print("Transforms: enabled (random augmentation + preprocess)")
+    else:
+        transform = preprocess
+        print("Transforms: disabled (preprocess only)")
+
+    dataset = CropDataset(crops_dir, transform)
+    loader  = DataLoader(dataset, batch_size=batch_size, shuffle=True,
                          num_workers=4, pin_memory=True, drop_last=True)
 
     print(f"Dataset: {len(dataset)} images, {len(dataset.species_list)} species")
+    print(f"Crops dir: {crops_dir}")
 
-    proj_head = ProjectionHead(EMBED_DIM, PROJ_DIM).to(DEVICE)
+    proj_head = ProjectionHead(EMBED_DIM, proj_dim).to(DEVICE)
 
     params = list(model.parameters()) + list(proj_head.parameters())
-    optimizer = torch.optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
-    total_steps = EPOCHS * len(loader)
-    warmup_steps = WARMUP_EPOCHS * len(loader)
+    total_steps  = epochs * len(loader)
+    warmup_steps = warmup_epochs * len(loader)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=LR, total_steps=total_steps,
+        optimizer, max_lr=lr, total_steps=total_steps,
         pct_start=warmup_steps / total_steps,
     )
 
     scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE == "cuda"))
 
     ckpt = None  # guard against unbound on first epoch
-    log_path = CHECKPOINT_DIR / "train_log.csv"
+
+    # --- log file ---
+    if log_name is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_name = f"train_log_{timestamp}"
+    log_path = LOG_DIR / f"{log_name}.csv"
     with open(log_path, "w", newline="") as f:
-        csv.writer(f).writerow(["epoch", "loss", "lr"])
+        writer = csv.writer(f)
+        writer.writerow(["epoch", "loss", "lr"])
+    print(f"Logging to {log_path}")
 
     best_loss = float("inf")
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(1, epochs + 1):
         model.train()
         proj_head.train()
         epoch_loss = 0.0
 
-        with tqdm(loader, desc=f"Epoch {epoch}/{EPOCHS}", unit="batch") as pbar:
+        with tqdm(loader, desc=f"Epoch {epoch}/{epochs}", unit="batch") as pbar:
             for imgs, labels in pbar:
                 imgs = imgs.to(DEVICE)
 
                 with torch.amp.autocast('cuda', enabled=(DEVICE == "cuda")):
                     feats = model(imgs)                        # (N, EMBED_DIM)
                     feats = F.normalize(feats, dim=-1)
-                    z = proj_head(feats)                       # (N, PROJ_DIM)
-                    loss = hierarchical_supcon_loss(z, list(labels), TEMPERATURE)
+                    z = proj_head(feats)                       # (N, proj_dim)
+                    loss = hierarchical_supcon_loss(z, list(labels), temperature)
 
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
@@ -263,6 +307,9 @@ def train():
 
     print(f"\nDone. Best loss: {best_loss:.4f}")
     print(f"Checkpoints saved to {CHECKPOINT_DIR}")
+    print(f"Training log saved to {log_path}")
+
+    return best_loss
 
 
 if __name__ == "__main__":
