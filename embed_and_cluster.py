@@ -35,8 +35,8 @@ from sklearn.metrics import silhouette_score
 
 PIPELINE_OUTPUT = Path("three_crop_output")
 MODEL_NAME      = "hf-hub:imageomics/bioclip-2"
-#CHECKPOINT_PATH = "checkpoints/best.pt"  # set to None to use pretrained weights
-CHECKPOINT_PATH = None
+CHECKPOINT_PATH = "checkpoints/best.pt"  # set to None to use pretrained weights
+# CHECKPOINT_PATH = None
 BATCH_SIZE      = 64
 DEVICE          = "cuda" if torch.cuda.is_available() else "cpu"
 

@@ -1,0 +1,5 @@
+rank,best_loss,log_name,lr,temperature,batch_size,proj_dim
+1,1.840081,lr5e-05_temp0.05_bs32_proj128,5e-05,0.05,32,128
+2,1.850580,lr2e-05_temp0.07_bs32_proj128,2e-05,0.07,32,128
+3,1.860959,lr5e-05_temp0.07_bs32_proj128,5e-05,0.07,32,128
+4,1.880347,lr2e-05_temp0.05_bs32_proj128,2e-05,0.05,32,128
