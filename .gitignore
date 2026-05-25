@@ -223,3 +223,5 @@ three_crop_output_processed/plw_dscm_11_c031/id18_fish_f666_early.jpg
 three_crop_output_processed/plw_dscm_11_c031/id18_fish_f670_late.jpg
 .gitignore
 three_crop_output_processed/plw_dscm_11_c031/id32_fish_f1304_late.jpg
+
+/three_crop_output_processed
