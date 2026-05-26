@@ -16,6 +16,7 @@ Install:
     pip install "rembg[gpu]"
 """
 
+import json
 import numpy as np
 import torch
 import open_clip
@@ -41,6 +42,7 @@ from rembg import remove, new_session
 
 PIPELINE_OUTPUT   = Path("three_crop_output")
 PROCESSED_OUTPUT  = Path("three_crop_output_processed")  # bg-removed crops saved here
+EMBEDDINGS_PATH   = Path("embeddings.json")              # key: "video/track_id", value: vector
 MODEL_NAME        = "hf-hub:imageomics/bioclip-2"
 CHECKPOINT_PATH   = None            #"checkpoints/best.pt"  # set to None to use pretrained weights
 BATCH_SIZE        = 64
@@ -192,8 +194,8 @@ def apply_clahe(pil_img: Image.Image) -> Image.Image:
     clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_SIZE)
     bgr   = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
     lab   = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    lab   = cv2.merge([clahe.apply(l), a, b])
+    l_ch, a, b = cv2.split(lab)
+    lab   = cv2.merge([clahe.apply(l_ch), a, b])
     bgr   = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
     return Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
@@ -211,7 +213,7 @@ def load_crop(path: Path) -> Image.Image:
 # EMBEDDING
 # ============================================================
 
-def load_bioclip(model_name: str, device: str, checkpoint_path: str = None):
+def load_bioclip(model_name: str, device: str, checkpoint_path=None):
     print(f"Loading {model_name}...")
     model, _, preprocess = open_clip.create_model_and_transforms(model_name)
 
@@ -261,6 +263,43 @@ def extract_embeddings(
             feats = feats / feats.norm(dim=-1, keepdim=True)
         all_emb.append(feats.cpu().float().numpy())
     return np.vstack(all_emb)
+
+
+# ============================================================
+# EMBEDDING DataBase  (JSON: "video/track_id" → vector dictionary database)
+# ============================================================
+
+def save_embeddings(track_ids: list, embeddings: np.ndarray, processed_paths: list[Path],
+                    out: Path = EMBEDDINGS_PATH):
+    """
+    Persist per-track embeddings to JSON.
+    Key format: "<video>/<track_id>"  — unique across videos.
+    Value: embedding vector as a float list.
+    """
+    track_to_video = {parse_track_id(p): p.parent.name for p in processed_paths}
+    data = {
+        f"{track_to_video.get(tid, 'unknown')}/{tid}": emb.tolist()
+        for tid, emb in zip(track_ids, embeddings)
+    }
+    with open(out, "w") as f:
+        json.dump(data, f)
+    print(f"Saved {len(data)} embeddings → {out}")
+
+
+def load_embeddings(path: Path = EMBEDDINGS_PATH):
+    """
+    Load embeddings saved by save_embeddings().
+    Returns (track_ids, embeddings) where track_ids are the full "video/track_id" keys.
+    Returns (None, None) if the file does not exist.
+    """
+    if not path.exists():
+        return None, None
+    with open(path) as f:
+        data = json.load(f)
+    track_ids  = list(data.keys())
+    embeddings = np.array(list(data.values()), dtype=np.float32)
+    print(f"Loaded {len(track_ids)} embeddings from {path}")
+    return track_ids, embeddings
 
 
 # ============================================================
@@ -327,12 +366,13 @@ def cluster_hdbscan(
 # VISUALIZATION
 # ============================================================
 
-def best_crop_for_track(tid: str, pipeline_output: Path) -> Path | None:
+def best_crop_for_track(tid, pipeline_output):
     """Return the 'best' crop image for a track ID, falling back to any crop."""
-    matches = sorted(pipeline_output.glob(f"*/{tid}_*_best.jpg"))
+    bare = tid.split("/")[-1]  # handle "video/track_id" keys from load_embeddings
+    matches = sorted(pipeline_output.glob(f"*/{bare}_*_best.jpg"))
     if matches:
         return matches[0]
-    matches = sorted(pipeline_output.glob(f"*/{tid}_*.jpg"))
+    matches = sorted(pipeline_output.glob(f"*/{bare}_*.jpg"))
     return matches[0] if matches else None
 
 
@@ -344,9 +384,9 @@ def plot_clusters(
     max_clusters: int = MAX_CLUSTERS_TO_SHOW,
 ):
     unique = np.unique(labels)
-    show   = [l for l in sorted(unique) if l != -1][:max_clusters]
+    show   = [lbl for lbl in sorted(unique) if lbl != -1][:max_clusters]
 
-    fig, axes = plt.subplots(
+    _, axes = plt.subplots(
         len(show), samples_per_cluster,
         figsize=(samples_per_cluster * 1.8, len(show) * 2.2)
     )
@@ -388,7 +428,7 @@ def plot_all_in_cluster(
     print(f"{tag}: {len(idxs)} tracks")
 
     rows = (len(idxs) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 1.8, rows * 2.2))
+    _, axes = plt.subplots(rows, cols, figsize=(cols * 1.8, rows * 2.2))
     axes = np.array(axes).reshape(-1, cols)
 
     for i, idx in enumerate(idxs):
@@ -422,13 +462,13 @@ def plot_umap(embeddings: np.ndarray, labels: np.ndarray):
     unique  = np.unique(labels)
     palette = sns.color_palette("tab20", n_colors=len(unique))
     cmap    = {lbl: palette[i] for i, lbl in enumerate(sorted(unique))}
-    colors  = [cmap[l] for l in labels]
+    colors  = [cmap[lbl] for lbl in labels]
 
     plt.figure(figsize=(12, 8))
     plt.scatter(coords[:, 0], coords[:, 1], c=colors, s=8, alpha=0.7, linewidths=0)
-    patches = [mpatches.Patch(color=cmap[l],
-                               label=f"Cluster {l}" + (" (noise)" if l == -1 else ""))
-               for l in sorted(unique)]
+    patches = [mpatches.Patch(color=cmap[lbl],
+                               label=f"Cluster {lbl}" + (" (noise)" if lbl == -1 else ""))
+               for lbl in sorted(unique)]
     plt.legend(handles=patches, bbox_to_anchor=(1.01, 1), loc="upper left", fontsize=8)
     plt.title(f"BioClip 2 — UMAP  (HDBSCAN, "
               f"{len([u for u in unique if u != -1])} clusters)", fontsize=13)
@@ -454,10 +494,14 @@ def main():
     if not processed_paths:
         raise RuntimeError("No crops survived preprocessing.")
 
-    model, preprocess = load_bioclip(MODEL_NAME, DEVICE, CHECKPOINT_PATH)
-
-    per_crop_embs         = extract_embeddings(processed_paths, model, preprocess, DEVICE, BATCH_SIZE)
-    track_ids, track_embs = average_per_track(processed_paths, per_crop_embs)
+    track_ids, track_embs = load_embeddings()
+    if track_ids is None:
+        model, preprocess = load_bioclip(MODEL_NAME, DEVICE, CHECKPOINT_PATH)
+        per_crop_embs         = extract_embeddings(processed_paths, model, preprocess, DEVICE, BATCH_SIZE)
+        track_ids, track_embs = average_per_track(processed_paths, per_crop_embs)
+        save_embeddings(track_ids, track_embs, processed_paths)
+    else:
+        print("Skipping embedding — loaded from cache. Delete embeddings.json to re-embed.")
     labels                = cluster_hdbscan(track_embs)
 
     plot_clusters(labels, track_ids, PROCESSED_OUTPUT)
