@@ -33,7 +33,9 @@ from tqdm import tqdm
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 # Set DROPBOX_TOKEN env var or paste token directly here
-DROPBOX_TOKEN   = "ADD_YOUR_DROPBOX_TOKEN_HERE"  
+APP_KEY        = ""
+APP_SECRET     = ""
+REFRESH_TOKEN  = ""
 
         # ADJUST MISSION PATH
 MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_11/Video"
@@ -44,6 +46,9 @@ SELECTED_VIDEOS = [
     "PLW_dscm_11_c019.mp4", "PLW_dscm_11_c020.mp4",
     
 ]
+
+
+CHECKPOINT_PATH = Path("checkpoints/best.pt")  # set to None to use pretrained weights
 
 OUTPUT_CSV_PATH   = Path.cwd() / "overnight_detections.csv"
 OUTPUT_CROPS_DIR  = Path.cwd() / "overnight_crops"      # subfolders per video
@@ -168,22 +173,33 @@ def resize_video(input_path: Path, output_path: Path, target_height: int = 1080)
 
 # ──────── EMBEDDING MODEL ────────────────────────────────────────────────────────────
 def load_embedding_model():
-    """
-    Tries to load BioCLIP via open_clip. Falls back to a random-vector placeholder.
-    Swap this out for any other embedding model as needed.
-    """
     try:
         import open_clip
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            "hf-hub:imageomics/bioclip", device=INFERENCE_DEVICE
-        )
-        model.eval()
-        print("BioCLIP embedding model loaded.")
-        return ("bioclip", model, preprocess)
-    except Exception:
-        print("BioCLIP not available -- using placeholder embeddings (random vectors).")
-        return ("placeholder", None, None)
 
+        if CHECKPOINT_PATH and not Path(CHECKPOINT_PATH).exists():
+            print(f"Finetuned weights not found at {CHECKPOINT_PATH}, downloading...")
+            gdown.download(
+                "https://drive.google.com/file/d/1Qec1Gzxl8zAazuLof8a2LUSrbOR7GmtT/view?usp=drive_link",
+                str(CHECKPOINT_PATH), quiet=False, fuzzy=True,
+            )
+
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            "hf-hub:imageomics/bioclip-2", device=INFERENCE_DEVICE
+        )
+
+        if CHECKPOINT_PATH and Path(CHECKPOINT_PATH).exists():
+            print(f"Loading finetuned weights from {CHECKPOINT_PATH}...")
+            ckpt = torch.load(CHECKPOINT_PATH, map_location=INFERENCE_DEVICE)
+            model.visual.load_state_dict(ckpt["model_state"])
+            print("Finetuned weights loaded ✓")
+        else:
+            print("Using pretrained BioCLIP-2 weights")
+
+        model.eval()
+        return ("bioclip", model, preprocess)
+    except Exception as e:
+        print(f"BioCLIP not available ({e}) -- using placeholder embeddings.")
+        return ("placeholder", None, None)
 
 def get_embedding(embed_info, image_bgr: np.ndarray) -> list:
     kind, model, preprocess = embed_info
@@ -424,7 +440,11 @@ def process_video(
 
 # ──────── DROPBOX ────────────────────────────────────────────────────────────────────
 def connect_dropbox():
-    dbx = dropbox.Dropbox(DROPBOX_TOKEN)
+    dbx = dropbox.Dropbox(
+        app_key=APP_KEY,
+        app_secret=APP_SECRET,
+        oauth2_refresh_token=REFRESH_TOKEN,
+    )
     try:
         dbx.files_list_folder("")
         print("Dropbox connection OK")
