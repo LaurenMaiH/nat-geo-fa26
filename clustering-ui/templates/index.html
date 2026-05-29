@@ -544,7 +544,9 @@
         const dropped = Array.isArray(trackKeyOrKeys) ? trackKeyOrKeys : [trackKeyOrKeys];
         const keys = [...new Set([...dropped, ...selectedKeys])];
         setTracks(prev => prev.map(t => keys.includes(t.track_key) ? {...t, cluster_id: targetClusterId} : t));
-        setAppState(await post('/api/reassign', {track_keys: keys, target_cluster_id: targetClusterId}));
+        const state = await post('/api/reassign', {track_keys: keys, target_cluster_id: targetClusterId});
+        setAppState(state);
+        setVideos(await get('/api/videos')); 
         setSelectedKeys(new Set());
       };
 
@@ -641,6 +643,7 @@
           state = await post('/api/reassign', {track_keys: keys.slice(1), target_cluster_id: newCid});
         }
         setAppState(state);
+        setVideos(await get('/api/videos'));
         setTracks(prev => prev.map(t =>
           keys.includes(t.track_key) ? {...t, cluster_id: state.track_assignments[t.track_key]} : t
         ));
