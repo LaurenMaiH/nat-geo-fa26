@@ -4,6 +4,11 @@ from collections import defaultdict
 import json
 import numpy as np
 import hdbscan as hdbscan_lib
+import dropbox
+import threading
+import subprocess
+import tempfile
+from dotenv import load_dotenv
 
 app = Flask(__name__)
 
@@ -11,6 +16,16 @@ BASE_DIR = Path(__file__).parent.parent  # nat-geo/ (clustering-ui lives inside 
 CROPS_DIR = BASE_DIR / "processed_missions" / "mission_11" /"three_crop_output"
 EMBEDDINGS_PATH = BASE_DIR / "processed_missions" / "mission_11" / "embeddings.json"
 STATE_PATH = Path(__file__).parent / "state.json"
+
+load_dotenv(BASE_DIR / ".env")
+
+DROPBOX_MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_11/Video"
+PROXY_DIR = BASE_DIR / "processed_missions" / "mission_11" / "proxy_videos"
+PROXY_DIR.mkdir(exist_ok=True)
+
+_dbx_instance = None
+_proxy_status: dict[str, str] = {}  # video_name → "generating" | "ready" | "error"
+_proxy_lock = threading.Lock()
 
 
 COLORS = [
@@ -211,6 +226,57 @@ def _assign_track(state, track_key, target_cid, affected_cids):
         state["clusters"][target_cid]["track_keys"].append(track_key)
     state["track_assignments"][track_key] = target_cid
     affected_cids.add(target_cid)
+
+
+# ── Video proxy helpers ───────────────────────────────────────────────────────
+
+def get_dbx():
+    global _dbx_instance
+    if _dbx_instance is None:
+        import os
+        _dbx_instance = dropbox.Dropbox(
+            app_key=os.environ["DROPBOX_APP_KEY"],
+            app_secret=os.environ["DROPBOX_APP_SECRET"],
+            oauth2_refresh_token=os.environ["DROPBOX_REFRESH_TOKEN"],
+        )
+    return _dbx_instance
+
+
+def _generate_proxy(video_name: str):
+    proxy_path = PROXY_DIR / f"{video_name}_proxy.mp4"
+    if proxy_path.exists():
+        with _proxy_lock:
+            _proxy_status[video_name] = "ready"
+        return
+    # plw_dscm_11_c034 → PLW_dscm_11_c034.mp4
+    parts = video_name.split("_")
+    filename = parts[0].upper() + "_" + "_".join(parts[1:]) + ".mp4"
+    dropbox_path = f"{DROPBOX_MISSION_PATH}/{filename}"
+    ffmpeg_tmp = PROXY_DIR / f"{video_name}_proxy.tmp.mp4"
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        get_dbx().files_download_to_file(str(tmp_path), dropbox_path)
+        subprocess.run(
+            [
+                "ffmpeg", "-i", str(tmp_path),
+                "-vf", "scale=-2:480",
+                "-c:v", "libx264", "-crf", "30", "-preset", "ultrafast",
+                "-movflags", "+faststart",
+                "-y", str(ffmpeg_tmp),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        ffmpeg_tmp.rename(proxy_path)
+        with _proxy_lock:
+            _proxy_status[video_name] = "ready"
+    except Exception:
+        with _proxy_lock:
+            _proxy_status[video_name] = "error"
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        ffmpeg_tmp.unlink(missing_ok=True)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -651,6 +717,34 @@ def api_crop(video, track_id):
     if not path:
         return "Not found", 404
     return send_file(path, mimetype="image/jpeg")
+
+
+@app.route("/api/video/<video_name>/proxy-status")
+def api_proxy_status(video_name):
+    if (PROXY_DIR / f"{video_name}_proxy.mp4").exists():
+        return jsonify({"status": "ready"})
+    with _proxy_lock:
+        return jsonify({"status": _proxy_status.get(video_name, "missing")})
+
+
+@app.route("/api/video/<video_name>/proxy/start", methods=["POST"])
+def api_proxy_start(video_name):
+    if (PROXY_DIR / f"{video_name}_proxy.mp4").exists():
+        return jsonify({"status": "ready"})
+    with _proxy_lock:
+        if _proxy_status.get(video_name) in ("generating", "ready"):
+            return jsonify({"status": _proxy_status[video_name]})
+        _proxy_status[video_name] = "generating"
+    threading.Thread(target=_generate_proxy, args=(video_name,), daemon=True).start()
+    return jsonify({"status": "generating"})
+
+
+@app.route("/api/video/<video_name>/proxy")
+def api_proxy_serve(video_name):
+    proxy_path = PROXY_DIR / f"{video_name}_proxy.mp4"
+    if not proxy_path.exists():
+        return "Proxy not ready", 404
+    return send_file(proxy_path, mimetype="video/mp4", conditional=True)
 
 
 if __name__ == "__main__":

@@ -109,6 +109,52 @@
       );
     }
 
+    // ── VideoPlayer ───────────────────────────────────────────────────────────
+
+    function VideoPlayer({ video, height }) {
+      const [status, setStatus] = useState('missing');
+
+      useEffect(() => {
+        if (!video) return;
+        setStatus('missing');
+        fetch(`/api/video/${video}/proxy/start`, { method: 'POST' })
+          .then(r => r.json()).then(d => setStatus(d.status));
+        const iv = setInterval(() => {
+          fetch(`/api/video/${video}/proxy-status`)
+            .then(r => r.json())
+            .then(d => {
+              setStatus(d.status);
+              if (d.status === 'ready' || d.status === 'error') clearInterval(iv);
+            });
+        }, 3000);
+        return () => clearInterval(iv);
+      }, [video]);
+
+      return (
+        <div className="flex-shrink-0 flex items-center justify-center border-b"
+          style={{height, backgroundColor: '#010e1e', borderColor: C.border}}>
+          {status === 'ready' ? (
+            <video key={video} src={`/api/video/${video}/proxy`}
+              controls muted
+              style={{height: '100%', maxWidth: '100%', objectFit: 'contain'}} />
+          ) : (
+            <div className="flex flex-col items-center gap-2" style={{color: '#475569'}}>
+              {status === 'error'
+                ? <span className="text-xs">Failed to load video</span>
+                : <>
+                    <svg className="animate-spin" style={{width:16,height:16,color:C.accent}} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle style={{opacity:0.25}} cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                      <path style={{opacity:0.75}} fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                    </svg>
+                    <span className="text-xs">{status === 'generating' ? 'Generating proxy…' : 'Loading…'}</span>
+                  </>
+              }
+            </div>
+          )}
+        </div>
+      );
+    }
+
     // ── ContextMenu ───────────────────────────────────────────────────────────
 
     function ContextMenu({ trackKey, x, y, currentClusterId, clusters, onSelect, onNewCluster, onView, onClose }) {
@@ -521,7 +567,7 @@
       const [loading, setLoading]     = useState(false);
       const [contextMenu, setContextMenu] = useState(null);
       const [cropViewer, setCropViewer]   = useState(null);
-      const [stripHeight, setStripHeight] = useState(() => Math.round(window.innerHeight / 1.7));
+      const [stripHeight, setStripHeight] = useState(() => Math.round(window.innerHeight / 2.5));
       const [selectedKeys, setSelectedKeys] = useState(new Set());
 
       const handleSelect = useCallback(trackKey => {
@@ -532,17 +578,30 @@
         });
       }, []);
       const clearSelection = useCallback(() => setSelectedKeys(new Set()), []);
-      const dragging   = useRef(false);
-      const dragStartY = useRef(0);
-      const dragStartH = useRef(0);
+      const [videoHeight, setVideoHeight] = useState(300);
+      const dragging        = useRef(false);
+      const dragStartY      = useRef(0);
+      const dragStartH      = useRef(0);
+      const draggingVideo   = useRef(false);
+      const dragStartVideoY = useRef(0);
+      const dragStartVideoH = useRef(0);
 
       useEffect(() => {
         const onMove = e => {
-          if (!dragging.current) return;
-          const delta = e.clientY - dragStartY.current;
-          setStripHeight(Math.max(80, Math.min(dragStartH.current + delta, window.innerHeight - 220)));
+          if (dragging.current) {
+            const delta = e.clientY - dragStartY.current;
+            setStripHeight(Math.max(80, Math.min(dragStartH.current + delta, window.innerHeight - 220)));
+          }
+          if (draggingVideo.current) {
+            const delta = e.clientY - dragStartVideoY.current;
+            setVideoHeight(Math.max(300, Math.min(dragStartVideoH.current + delta, window.innerHeight - 220)));
+          }
         };
-        const onUp = () => { dragging.current = false; document.body.style.cursor = ''; };
+        const onUp = () => {
+          dragging.current = false;
+          draggingVideo.current = false;
+          document.body.style.cursor = '';
+        };
         window.addEventListener('mousemove', onMove);
         window.addEventListener('mouseup', onUp);
         return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
@@ -776,6 +835,27 @@
                 </button>
               </div>
 
+              {/* Scrollable body */}
+              <div className="flex-1 overflow-y-auto flex flex-col">
+
+              {/* Video player */}
+              {video && <>
+                <VideoPlayer video={video} height={videoHeight} />
+                <div
+                  onMouseDown={e => {
+                    draggingVideo.current = true;
+                    dragStartVideoY.current = e.clientY;
+                    dragStartVideoH.current = videoHeight;
+                    document.body.style.cursor = 'row-resize';
+                    e.preventDefault();
+                  }}
+                  className="flex-shrink-0 flex items-center justify-center transition-colors hover:bg-slate-700"
+                  style={{height: 8, cursor: 'row-resize', backgroundColor: C.border, borderTop: `1px solid #0d2a45`, borderBottom: `1px solid #0d2a45`}}
+                >
+                  <div style={{width: 32, height: 2, borderRadius: 1, backgroundColor: '#334155'}} />
+                </div>
+              </>}
+
               {/* Crop strip */}
               <div className="flex-shrink-0" style={{backgroundColor: C.card, height: stripHeight, overflowY: 'auto'}}>
                 {loading
@@ -824,7 +904,7 @@
               </div>
 
               {/* Cluster grid */}
-              <div className="flex-1 overflow-y-auto p-4">
+              <div className="p-4">
                 <div className="grid gap-3" style={{gridTemplateColumns: 'repeat(auto-fill, minmax(148px, 1fr))'}}>
                   {clusters.map(cluster => (
                     <ClusterCard
@@ -837,6 +917,8 @@
                   ))}
                 </div>
               </div>
+
+              </div>{/* end scrollable body */}
 
               {/* Action bar */}
               <div className="flex items-center gap-4 px-4 py-2.5 flex-shrink-0 border-t" style={{backgroundColor: C.card, borderColor: C.border}}>
