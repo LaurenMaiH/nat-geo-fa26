@@ -614,6 +614,24 @@
         setAppState(await post('/api/rename', {cluster_id: clusterId, name}));
       };
 
+      const handleVideoSelect = useCallback(async (videoName) => {
+        const vidObj = videos.find(v => v.name === videoName);
+        if (vidObj?.status === 'pending') {
+          setLoading(true);
+          setTracks([]);
+          setVideo(videoName);
+          try {
+            const nextState = await post('/api/process-video', { video_name: videoName, threshold });
+            setAppState(nextState);
+            setVideos(await get('/api/videos'));
+          } finally {
+            setLoading(false);
+          }
+        } else {
+          setVideo(videoName);
+        }
+      }, [videos, threshold]);
+
       const handleReset = async () => {
         if (!window.confirm('Reset all clustering? This cannot be undone.')) return;
         const state = await post('/api/reset', {});
@@ -661,7 +679,7 @@
 
       return (
         <div className="flex h-screen" style={{backgroundColor: C.bg}} onClick={clearSelection}>
-          <VideoList videos={videos} selected={video} onSelect={setVideo} />
+          <VideoList videos={videos} selected={video} onSelect={handleVideoSelect} />
 
           <div className="flex flex-col flex-1 min-w-0">
             {!appState.initialized ? (
