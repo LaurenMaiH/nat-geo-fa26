@@ -380,15 +380,16 @@
 
     function InitPanel({ videos, onInitialize }) {
       const [seedVideo, setSeed] = useState('');
-      const [minClusterSize, setMCS] = useState(12);
-      const [minSamples, setMS] = useState(3);
+      const [minClusterSize, setMCS] = useState(2);
+      const [minSamples, setMS] = useState(1);
+      const [cosineThreshold, setCT] = useState(0.25);
       const [loading, setLoading] = useState(false);
 
       const inputStyle = {backgroundColor: C.border, border: `1px solid ${C.hover}`, color: '#f1f5f9', borderRadius: 6, padding: '6px 10px', width: '100%'};
 
       const submit = async () => {
         setLoading(true);
-        try { await onInitialize({seed_video: seedVideo, min_cluster_size: minClusterSize, min_samples: minSamples}); }
+        try { await onInitialize({seed_video: seedVideo, min_cluster_size: minClusterSize, min_samples: minSamples, cosine_threshold: cosineThreshold}); }
         finally { setLoading(false); }
       };
 
@@ -398,7 +399,7 @@
             <h2 className="text-lg font-semibold">Initialize Clustering</h2>
 
             <div>
-              <label className="block text-xs mb-1" style={{color: '#94a3b8'}}>Seed video (HDBSCAN runs on videos up to this clip)</label>
+              <label className="block text-xs mb-1" style={{color: '#94a3b8'}}>Seed video (HDBSCAN runs on this video only to establish initial clusters)</label>
               <select style={inputStyle} value={seedVideo} onChange={e => setSeed(e.target.value)}>
                 <option value="">Select seed video...</option>
                 {videos.map(v => <option key={v.name} value={v.name}>{v.name} ({v.track_count} tracks)</option>)}
@@ -414,6 +415,16 @@
                 <label className="block text-xs mb-1" style={{color: '#94a3b8'}}>Min samples</label>
                 <input type="number" min="1" style={inputStyle} value={minSamples} onChange={e => setMS(+e.target.value)} />
               </div>
+            </div>
+
+            <div>
+              <label className="flex justify-between text-xs mb-1" style={{color: '#94a3b8'}}>
+                <span>Cosine threshold</span>
+                <span className="font-mono" style={{color: C.accent}}>{cosineThreshold.toFixed(2)}</span>
+              </label>
+              <input type="range" min="0.05" max="0.5" step="0.01"
+                value={cosineThreshold} onChange={e => setCT(+e.target.value)}
+                style={{width: '100%'}} />
             </div>
 
             <button
@@ -437,7 +448,7 @@
       const [video, setVideo]         = useState(null);
       const [tracks, setTracks]       = useState([]);
       const [openCluster, setOpen]    = useState(null);
-      const [threshold, setThreshold] = useState(0.15);
+      const [threshold, setThreshold] = useState(0.25);
       const [loading, setLoading]     = useState(false);
       const [contextMenu, setContextMenu] = useState(null);
       const [cropViewer, setCropViewer]   = useState(null);
@@ -519,8 +530,11 @@
         setVideos(await get('/api/videos'));
         const nextVideo = state.current_video;
         if (nextVideo) {
-          setVideo(nextVideo);
+          // Set loading BEFORE switching video so the strip shows a spinner
+          // rather than the next video's tracks all appearing as Unassigned
           setLoading(true);
+          setTracks([]);
+          setVideo(nextVideo);
           try {
             const nextState = await post('/api/process-video', {video_name: nextVideo, threshold});
             setAppState(nextState);
@@ -611,7 +625,15 @@
 
               {/* Crop strip */}
               <div className="flex-shrink-0" style={{backgroundColor: C.card, height: stripHeight, overflowY: 'auto'}}>
-                {tracks.length === 0
+                {loading
+                  ? <div className="flex items-center justify-center h-full gap-2">
+                      <svg className="animate-spin" style={{width:16,height:16,color:C.accent}} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle style={{opacity:0.25}} cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                        <path style={{opacity:0.75}} fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                      </svg>
+                      <span className="text-sm" style={{color: '#475569'}}>Processing video...</span>
+                    </div>
+                  : tracks.length === 0
                   ? <div className="flex items-center justify-center h-full">
                       <span className="text-sm" style={{color: '#475569'}}>No tracks for this video</span>
                     </div>
