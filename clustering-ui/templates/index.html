@@ -37,7 +37,7 @@
     }).then(r => r.json());
 
     const cropUrl = trackKey => {
-      const [video, tid] = trackKey.split('/');
+      const [video, tid] = trackKey.split('__');
       return `/api/crop/${video}/${tid}`;
     };
 
@@ -157,7 +157,7 @@
 
     // ── ContextMenu ───────────────────────────────────────────────────────────
 
-    function ContextMenu({ trackKey, x, y, currentClusterId, clusters, onSelect, onNewCluster, onView, onClose }) {
+    function ContextMenu({ trackKey, x, y, currentClusterId, clusters, onSelect, onNewCluster, onView, onTrash, onClose }) {
       useEffect(() => {
         const onMouseDown = () => onClose();
         const onKeyDown = e => { if (e.key === 'Escape') onClose(); };
@@ -170,7 +170,7 @@
       }, [onClose]);
 
       const menuW = 196, itemH = 32, headerH = 34;
-      const totalH = itemH + 9 + headerH + clusters.length * itemH + 9 + itemH + 8;
+      const totalH = itemH + 9 + itemH + 9 + headerH + clusters.length * itemH + 9 + itemH + 8;
       const left = Math.min(x, window.innerWidth  - menuW - 8);
       const top  = Math.min(y, window.innerHeight - totalH - 8);
 
@@ -187,6 +187,14 @@
           >
             <span>🔍</span>
             <span>View crop</span>
+          </button>
+          <button
+            onClick={() => { onTrash(trackKey); onClose(); }}
+            className="w-full flex items-center gap-2 px-3 text-xs text-left transition-colors hover:bg-red-900"
+            style={{height: itemH, color: '#ef4444'}}
+          >
+            <span>🗑</span>
+            <span>Move to trash</span>
           </button>
           <div style={{borderTop: `1px solid ${C.border}`, margin: '4px 0'}} />
           <div className="px-3 py-1.5 text-xs font-semibold" style={{color: '#64748b'}}>
@@ -255,7 +263,7 @@
           />
           {!compact && (
             <div className="px-1 py-0.5 text-xs truncate" style={{backgroundColor: C.border, color: '#94a3b8'}}>
-              {trackKey.split('/')[1]}
+              {trackKey.split('__')[1]}
             </div>
           )}
         </div>
@@ -360,6 +368,44 @@
       );
     }
 
+    // ── TrashCard ─────────────────────────────────────────────────────────────
+
+    function TrashCard({ trash, onClick }) {
+      const { track_keys = [] } = trash;
+      const count = track_keys.length;
+      const preview = count > 0 ? track_keys[track_keys.length - 1] : null;
+
+      return (
+        <div
+          onClick={onClick}
+          className="rounded-lg p-3 cursor-pointer transition-all"
+          style={{
+            backgroundColor: C.card,
+            border: `2px solid ${count > 0 ? '#7f1d1d' : C.border}`,
+          }}
+        >
+          <div className="flex items-center gap-2 mb-2">
+            <span className="text-sm leading-none">🗑</span>
+            <span className="text-sm font-medium truncate" style={{color: '#e2e8f0'}}>Trash</span>
+            <span className="ml-auto text-xs flex-shrink-0" style={{color: count > 0 ? '#ef4444' : '#64748b'}}>{count}</span>
+          </div>
+          {preview ? (
+            <img
+              src={cropUrl(preview)}
+              alt="trash preview"
+              className="w-full rounded"
+              style={{height: 72, objectFit: 'cover', opacity: 0.5}}
+              onError={e => { e.target.style.display = 'none'; }}
+            />
+          ) : (
+            <div className="w-full rounded flex items-center justify-center" style={{height: 72, backgroundColor: C.bg}}>
+              <span className="text-2xl" style={{opacity: 0.15}}>🗑</span>
+            </div>
+          )}
+        </div>
+      );
+    }
+
     // ── ClusterCard ───────────────────────────────────────────────────────────
 
     function ClusterCard({ cluster, onClick, onDrop, onRename }) {
@@ -437,7 +483,7 @@
 
       const byVideo = {};
       cluster.track_keys.forEach(key => {
-        const vid = key.split('/')[0];
+        const vid = key.split('__')[0];
         (byVideo[vid] = byVideo[vid] || []).push(key);
       });
       const videoNames = Object.keys(byVideo).sort();
@@ -486,6 +532,152 @@
                 </div>
               </div>
             ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ── TrashModal ────────────────────────────────────────────────────────────
+
+    function TrashModal({ trash, onClose, onRestore, onDelete }) {
+      const { track_keys = [], metadata = {} } = trash;
+      const [selected, setSelected] = useState(new Set());
+
+      const toggleSelect = key => {
+        setSelected(prev => {
+          const next = new Set(prev);
+          if (next.has(key)) next.delete(key); else next.add(key);
+          return next;
+        });
+      };
+
+      const byCluster = {};
+      track_keys.forEach(key => {
+        const meta = metadata[key] || {};
+        const label = meta.source_cluster_name || meta.source_cluster_id || 'Unknown';
+        (byCluster[label] = byCluster[label] || []).push(key);
+      });
+      const clusterLabels = Object.keys(byCluster).sort();
+
+      const selCount = selected.size;
+      const targets = selCount > 0 ? [...selected] : [];
+
+      const handleRestore = () => {
+        onRestore(targets);
+        setSelected(new Set());
+      };
+
+      const handleDelete = () => {
+        if (!window.confirm(`Permanently delete ${selCount} crop(s)? This cannot be undone.`)) return;
+        onDelete(targets);
+        setSelected(new Set());
+      };
+
+      const allSelected = track_keys.length > 0 && selected.size === track_keys.length;
+
+      const handleSelectAll = () => {
+        setSelected(allSelected ? new Set() : new Set(track_keys));
+      };
+
+      return (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center"
+          style={{backgroundColor: 'rgba(0,0,0,0.75)'}}
+          onClick={onClose}
+        >
+          <div
+            className="rounded-xl p-5 mx-6 overflow-y-auto relative"
+            style={{backgroundColor: C.card, border: '2px solid #7f1d1d', maxWidth: 820, width: '100%', maxHeight: '85vh'}}
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-3 mb-3">
+              <span className="text-lg">🗑</span>
+              <span className="text-lg font-semibold" style={{color: '#f1f5f9'}}>Trash</span>
+              <span className="text-sm" style={{color: '#64748b'}}>({track_keys.length} item{track_keys.length !== 1 ? 's' : ''})</span>
+              <div className="ml-auto flex items-center gap-2">
+                {track_keys.length > 0 && (
+                  <button
+                    onClick={handleSelectAll}
+                    className="px-3 py-1 rounded text-xs font-medium transition-colors hover:bg-slate-700"
+                    style={{color: '#94a3b8', border: `1px solid ${C.border}`}}
+                  >
+                    {allSelected ? 'Deselect All' : 'Select All'}
+                  </button>
+                )}
+                <button onClick={onClose} className="text-xl ml-2" style={{color: '#94a3b8'}}>✕</button>
+              </div>
+            </div>
+
+            {track_keys.length > 0 && (
+              <div className="flex items-center gap-2 mb-4 px-1 py-2 rounded" style={{backgroundColor: C.bg}}>
+                <span className="text-xs" style={{color: '#64748b'}}>
+                  {selCount === 0 ? 'Click crops to select' : `${selCount} selected`}
+                </span>
+                <div className="ml-auto flex gap-2">
+                  <button
+                    onClick={handleRestore}
+                    disabled={selCount === 0}
+                    className="px-3 py-1 rounded text-xs font-medium transition-colors hover:bg-slate-600 disabled:opacity-30"
+                    style={{backgroundColor: '#1e3a5f', color: C.accent}}
+                  >
+                    Restore
+                  </button>
+                  <button
+                    onClick={handleDelete}
+                    disabled={selCount === 0}
+                    className="px-3 py-1 rounded text-xs font-medium transition-colors hover:bg-red-900 disabled:opacity-30"
+                    style={{backgroundColor: '#450a0a', color: '#ef4444'}}
+                  >
+                    Delete Forever
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {track_keys.length === 0 ? (
+              <div className="flex items-center justify-center py-16" style={{color: '#334155'}}>
+                <span className="text-sm">Trash is empty</span>
+              </div>
+            ) : (
+              clusterLabels.map(label => (
+                <div key={label} className="mb-6">
+                  <div className="text-xs font-semibold mb-2 pb-1 border-b" style={{color: '#64748b', borderColor: C.border}}>
+                    From: {label}
+                    <span className="ml-2 font-normal" style={{color: '#334155'}}>{byCluster[label].length}</span>
+                  </div>
+                  <div className="flex flex-wrap gap-3">
+                    {byCluster[label].map(key => {
+                      const isSel = selected.has(key);
+                      return (
+                      <div
+                        key={key}
+                        onClick={() => toggleSelect(key)}
+                        className="rounded overflow-hidden"
+                        style={{
+                          border: `2px solid ${isSel ? '#fff' : '#7f1d1d'}`,
+                          boxShadow: isSel ? '0 0 0 2px #ef4444' : 'none',
+                          width: 96,
+                          cursor: 'pointer',
+                        }}
+                        title={key}
+                      >
+                        <img
+                          src={cropUrl(key)}
+                          alt={key}
+                          draggable={false}
+                          style={{width: '100%', height: 76, objectFit: 'cover', display: 'block'}}
+                          onError={e => { e.target.style.background = '#0A2540'; e.target.style.height = '76px'; }}
+                        />
+                        <div className="px-1 py-0.5 text-xs truncate" style={{backgroundColor: C.border, color: '#94a3b8'}}>
+                          {key.split('__')[1]}
+                        </div>
+                      </div>
+                    );
+                    })}
+                  </div>
+                </div>
+              ))
+            )}
           </div>
         </div>
       );
@@ -567,6 +759,7 @@
       const [loading, setLoading]     = useState(false);
       const [contextMenu, setContextMenu] = useState(null);
       const [cropViewer, setCropViewer]   = useState(null);
+      const [trashOpen, setTrashOpen]     = useState(false);
       const [stripHeight, setStripHeight] = useState(() => Math.round(window.innerHeight / 2.5));
       const [selectedKeys, setSelectedKeys] = useState(new Set());
 
@@ -770,6 +963,32 @@
         setOpen(null);
       };
 
+      const handleTrashAdd = async (trackKeyOrKeys) => {
+        const keys = Array.isArray(trackKeyOrKeys) ? trackKeyOrKeys : [trackKeyOrKeys];
+        const allKeys = [...new Set([...keys, ...(selectedKeys.has(keys[0]) ? [...selectedKeys] : [])])];
+        const state = await post('/api/trash/add', { track_keys: allKeys });
+        setAppState(state);
+        setVideos(await get('/api/videos'));
+        setTracks(prev => prev.filter(t => !allKeys.includes(t.track_key)));
+        setSelectedKeys(new Set());
+      };
+
+      const handleTrashRestore = async (trackKeys) => {
+        const state = await post('/api/trash/restore', { track_keys: trackKeys });
+        setAppState(state);
+        setVideos(await get('/api/videos'));
+        if (video) {
+          const updatedTracks = await get(`/api/video/${video}/tracks`);
+          setTracks(updatedTracks);
+        }
+      };
+
+      const handleTrashDelete = async (trackKeys) => {
+        const state = await post('/api/trash/delete', { track_keys: trackKeys });
+        setAppState(state);
+        setVideos(await get('/api/videos'));
+      };
+
       const openContextMenu = useCallback((trackKey, x, y, currentClusterId) => {
         setContextMenu({ trackKey, x, y, currentClusterId });
       }, []);
@@ -906,7 +1125,10 @@
               {/* Cluster grid */}
               <div className="p-4">
                 <div className="grid gap-3" style={{gridTemplateColumns: 'repeat(auto-fill, minmax(148px, 1fr))'}}>
-                  {clusters.map(cluster => (
+                  {[
+                    ...clusters.filter(c => c.id !== 'noise').sort((a, b) => a.id.localeCompare(b.id)),
+                    ...clusters.filter(c => c.id === 'noise'),
+                  ].map(cluster => (
                     <ClusterCard
                       key={cluster.id}
                       cluster={cluster}
@@ -915,6 +1137,10 @@
                       onRename={handleRename}
                     />
                   ))}
+                  <TrashCard
+                    trash={appState.trash || { track_keys: [] }}
+                    onClick={() => setTrashOpen(true)}
+                  />
                 </div>
               </div>
 
@@ -967,6 +1193,14 @@
             />
           )}
           {cropViewer && <CropViewer trackKey={cropViewer} onClose={() => setCropViewer(null)} />}
+          {trashOpen && (
+            <TrashModal
+              trash={appState.trash || { track_keys: [], metadata: {} }}
+              onClose={() => setTrashOpen(false)}
+              onRestore={handleTrashRestore}
+              onDelete={handleTrashDelete}
+            />
+          )}
           {contextMenu && (
             <ContextMenu
               {...contextMenu}
@@ -974,6 +1208,7 @@
               onSelect={handleContextMenuSelect}
               onNewCluster={handleNewCluster}
               onView={setCropViewer}
+              onTrash={handleTrashAdd}
               onClose={() => setContextMenu(null)}
             />
           )}
