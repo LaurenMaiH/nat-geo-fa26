@@ -37,9 +37,15 @@ COLORS = [
 
 # ── State ──────────────────────────────────────────────────────────────────────
 
+_DEFAULT_TRASH = lambda: {"track_keys": [], "metadata": {}}
+
+
 def load_state():
     if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
+        state = json.loads(STATE_PATH.read_text())
+        if "trash" not in state:
+            state["trash"] = _DEFAULT_TRASH()
+        return state
     return {
         "initialized": False,
         "seed_video": None,
@@ -54,6 +60,7 @@ def load_state():
         },
         "track_assignments": {},
         "current_video": None,
+        "trash": _DEFAULT_TRASH(),
     }
 
 
@@ -321,6 +328,7 @@ def api_videos():
 def api_video_tracks(video_name):
     state = load_state()
     emb = load_embeddings()
+    trash_keys = set(state.get("trash", {}).get("track_keys", []))
     track_ids = sorted(
         [k.split("/")[1] for k in emb if k.split("/")[0] == video_name],
         key=track_sort_key,
@@ -332,6 +340,7 @@ def api_video_tracks(video_name):
             "cluster_id": state["track_assignments"].get(f"{video_name}/{tid}", "noise"),
         }
         for tid in track_ids
+        if f"{video_name}/{tid}" not in trash_keys
     ])
 
 
@@ -700,6 +709,107 @@ def api_new_cluster():
         state["videos"][video_name]["status"] = "processed"
 
     prune_empty_clusters(state)
+    save_state(state)
+    return jsonify(state)
+
+
+@app.route("/api/trash/add", methods=["POST"])
+def api_trash_add():
+    body = request.get_json()
+    track_keys = body["track_keys"]
+    state = load_state()
+    emb_dict = load_embeddings()
+
+    affected = set()
+    for key in track_keys:
+        if key in state["trash"]["track_keys"]:
+            continue
+        old_cid = state["track_assignments"].get(key, "noise")
+        old_cluster = state["clusters"].get(old_cid, {})
+        state["trash"]["metadata"][key] = {
+            "source_cluster_id": old_cid,
+            "source_cluster_name": old_cluster.get("name", old_cid),
+        }
+        old_keys = old_cluster.get("track_keys", [])
+        if key in old_keys:
+            old_keys.remove(key)
+        state["track_assignments"].pop(key, None)
+        state["trash"]["track_keys"].append(key)
+        affected.add(old_cid)
+
+    for cid in affected:
+        if cid == "noise" or cid not in state["clusters"]:
+            continue
+        cluster = state["clusters"][cid]
+        cluster["centroid"] = compute_centroid(cluster["track_keys"], emb_dict)
+        cluster["representative"] = find_representative(
+            cluster["track_keys"], cluster["centroid"], emb_dict
+        )
+
+    prune_empty_clusters(state)
+    save_state(state)
+    return jsonify(state)
+
+
+@app.route("/api/trash/restore", methods=["POST"])
+def api_trash_restore():
+    body = request.get_json()
+    track_keys = body["track_keys"]
+    state = load_state()
+    emb_dict = load_embeddings()
+
+    affected = set()
+    for key in track_keys:
+        if key not in state["trash"]["track_keys"]:
+            continue
+        meta = state["trash"]["metadata"].get(key, {})
+        src_cid = meta.get("source_cluster_id", "noise")
+        if src_cid not in state["clusters"]:
+            src_cid = "noise"
+        cluster = state["clusters"][src_cid]
+        if key not in cluster["track_keys"]:
+            cluster["track_keys"].append(key)
+        state["track_assignments"][key] = src_cid
+        state["trash"]["track_keys"].remove(key)
+        state["trash"]["metadata"].pop(key, None)
+        affected.add(src_cid)
+
+    for cid in affected:
+        if cid == "noise" or cid not in state["clusters"]:
+            continue
+        cluster = state["clusters"][cid]
+        cluster["centroid"] = compute_centroid(cluster["track_keys"], emb_dict)
+        cluster["representative"] = find_representative(
+            cluster["track_keys"], cluster["centroid"], emb_dict
+        )
+
+    save_state(state)
+    return jsonify(state)
+
+
+@app.route("/api/trash/delete", methods=["POST"])
+def api_trash_delete():
+    body = request.get_json()
+    track_keys = body["track_keys"]
+    state = load_state()
+    emb_dict = load_embeddings()
+
+    modified_emb = False
+    for key in track_keys:
+        state["trash"]["track_keys"] = [k for k in state["trash"]["track_keys"] if k != key]
+        state["trash"]["metadata"].pop(key, None)
+        if key in emb_dict:
+            del emb_dict[key]
+            modified_emb = True
+        video, track_id = key.split("/", 1)
+        video_dir = CROPS_DIR / video
+        if video_dir.exists():
+            for f in video_dir.glob(f"{track_id}_*.jpg"):
+                f.unlink(missing_ok=True)
+
+    if modified_emb:
+        EMBEDDINGS_PATH.write_text(json.dumps(emb_dict))
+
     save_state(state)
     return jsonify(state)
 
