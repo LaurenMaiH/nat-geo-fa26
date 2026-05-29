@@ -220,6 +220,16 @@
 
     function ClusterRow({ cluster, tracks, onContextMenu, onDrop, selectedKeys, onSelect }) {
       const [over, setOver] = useState(false);
+      const [expanded, setExpanded] = useState(false);
+      const initialized = useRef(false);
+
+      useEffect(() => {
+        if (!initialized.current && tracks.length > 0) {
+          initialized.current = true;
+          setExpanded(true);
+        }
+      }, [tracks]);
+
       return (
         <div
           className="flex-shrink-0 border-b"
@@ -232,29 +242,41 @@
             if (keys.length) onDrop(keys, cluster.id);
           }}
         >
-          <div className="flex items-center gap-2 px-3 pt-1.5 pb-0.5">
+          <div
+            className="flex items-center gap-2 px-3 py-1.5 cursor-pointer select-none"
+            style={{
+              borderLeft: `3px solid ${over ? cluster.color : 'transparent'}`,
+              backgroundColor: over ? `${cluster.color}10` : 'transparent',
+              transition: 'background-color 0.15s, border-color 0.15s',
+            }}
+            onClick={() => setExpanded(e => !e)}
+          >
+            <span style={{
+              color: '#475569', fontSize: 9,
+              display: 'inline-block',
+              transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
+              transition: 'transform 0.15s',
+              lineHeight: 1,
+            }}>▶</span>
             <div className="w-2 h-2 rounded-full flex-shrink-0" style={{backgroundColor: cluster.color}} />
             <span className="text-xs font-semibold" style={{color: '#94a3b8'}}>{cluster.name}</span>
             <span className="text-xs" style={{color: '#475569'}}>{tracks.length}</span>
           </div>
-          <div
-            className="flex flex-wrap gap-2 px-3 pb-2"
-            style={{
-              minHeight: 64,
-              backgroundColor: over ? `${cluster.color}12` : 'transparent',
-              borderLeft: `3px solid ${over ? cluster.color : 'transparent'}`,
-              transition: 'background-color 0.15s, border-color 0.15s',
-            }}
-          >
-            {tracks.length === 0
-              ? <span className="text-xs self-center" style={{color: '#334155'}}>Drop tracks here</span>
-              : tracks.map(t => (
-                  <CropCard key={t.track_key} trackKey={t.track_key} clusterId={cluster.id} color={cluster.color} compact={true}
-                    selected={selectedKeys?.has(t.track_key)} onSelect={onSelect} selectedKeys={selectedKeys}
-                    onContextMenu={(key, x, y) => onContextMenu(key, x, y, cluster.id)} onDrop={onDrop} />
-                ))
-            }
-          </div>
+          {expanded && (
+            <div
+              className="flex flex-wrap gap-2 px-3 pb-2"
+              style={{minHeight: 64}}
+            >
+              {tracks.length === 0
+                ? <span className="text-xs self-center" style={{color: '#334155'}}>Drop tracks here</span>
+                : tracks.map(t => (
+                    <CropCard key={t.track_key} trackKey={t.track_key} clusterId={cluster.id} color={cluster.color} compact={true}
+                      selected={selectedKeys?.has(t.track_key)} onSelect={onSelect} selectedKeys={selectedKeys}
+                      onContextMenu={(key, x, y) => onContextMenu(key, x, y, cluster.id)} onDrop={onDrop} />
+                  ))
+              }
+            </div>
+          )}
         </div>
       );
     }
@@ -294,12 +316,23 @@
 
     // ── ClusterCard ───────────────────────────────────────────────────────────
 
-    function ClusterCard({ cluster, onClick, onDrop }) {
+    function ClusterCard({ cluster, onClick, onDrop, onRename }) {
       const [over, setOver] = useState(false);
+      const [editing, setEditing] = useState(false);
+      const [name, setName] = useState(cluster.name);
+
+      useEffect(() => { setName(cluster.name); }, [cluster.name]);
+
+      const submitRename = () => {
+        setEditing(false);
+        const trimmed = name.trim();
+        if (trimmed && trimmed !== cluster.name) onRename(cluster.id, trimmed);
+        else setName(cluster.name);
+      };
 
       return (
         <div
-          onClick={() => onClick(cluster.id)}
+          onClick={() => !editing && onClick(cluster.id)}
           onDragOver={e => { e.preventDefault(); setOver(true); }}
           onDragLeave={() => setOver(false)}
           onDrop={e => { e.preventDefault(); setOver(false); const keys = JSON.parse(e.dataTransfer.getData('trackKeys') || '[]'); if (keys.length) onDrop(keys, cluster.id); }}
@@ -312,7 +345,28 @@
         >
           <div className="flex items-center gap-2 mb-2">
             <div className="w-3 h-3 rounded-full flex-shrink-0" style={{backgroundColor: cluster.color}} />
-            <span className="text-sm font-medium truncate" style={{color: '#e2e8f0'}}>{cluster.name}</span>
+            {editing ? (
+              <input
+                autoFocus
+                className="bg-transparent text-sm font-medium outline-none border-b flex-1 min-w-0"
+                style={{color: '#e2e8f0', borderColor: '#334155'}}
+                value={name}
+                onChange={e => setName(e.target.value)}
+                onBlur={submitRename}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') submitRename();
+                  if (e.key === 'Escape') { setName(cluster.name); setEditing(false); }
+                }}
+                onClick={e => e.stopPropagation()}
+              />
+            ) : (
+              <span
+                className="text-sm font-medium truncate"
+                style={{color: '#e2e8f0'}}
+                onDoubleClick={e => { e.stopPropagation(); setEditing(true); }}
+                title="Double-click to rename"
+              >{cluster.name}</span>
+            )}
             <span className="ml-auto text-xs flex-shrink-0" style={{color: '#64748b'}}>{cluster.track_keys.length}</span>
           </div>
           {cluster.representative && (
@@ -725,7 +779,7 @@
                       const real = clusters.filter(c => c.id !== 'noise').sort((a, b) => a.id.localeCompare(b.id));
                       const noise = clusters.find(c => c.id === 'noise');
                       const row = c => (
-                        <ClusterRow key={c.id} cluster={c}
+                        <ClusterRow key={`${video}-${c.id}`} cluster={c}
                           tracks={tracks.filter(t => t.cluster_id === c.id)}
                           onContextMenu={openContextMenu} onDrop={handleReassign}
                           selectedKeys={selectedKeys} onSelect={handleSelect} />
@@ -763,6 +817,7 @@
                       cluster={cluster}
                       onClick={setOpen}
                       onDrop={handleReassign}
+                      onRename={handleRename}
                     />
                   ))}
                 </div>
