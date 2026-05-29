@@ -389,6 +389,13 @@
 
       const submitRename = () => { if (name !== cluster.name) onRename(cluster.id, name); };
 
+      const byVideo = {};
+      cluster.track_keys.forEach(key => {
+        const vid = key.split('/')[0];
+        (byVideo[vid] = byVideo[vid] || []).push(key);
+      });
+      const videoNames = Object.keys(byVideo).sort();
+
       return (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center"
@@ -418,13 +425,21 @@
               <span className="text-sm" style={{color: '#64748b'}}>({cluster.track_keys.length} tracks)</span>
               <button onClick={onClose} className="ml-2 text-xl" style={{color: '#94a3b8'}}>✕</button>
             </div>
-            <div className="flex flex-wrap gap-2">
-              {cluster.track_keys.map(key => (
-                <CropCard key={key} trackKey={key} clusterId={cluster.id} color={cluster.color} compact={false}
-                  selected={selectedKeys?.has(key)} onSelect={onSelect} selectedKeys={selectedKeys}
-                  onContextMenu={(k, x, y) => onContextMenu(k, x, y, cluster.id)} onDrop={onDrop} />
-              ))}
-            </div>
+            {videoNames.map(videoName => (
+              <div key={videoName} className="mb-5">
+                <div className="text-xs font-semibold mb-2 pb-1 border-b truncate" style={{color: '#64748b', borderColor: C.border}}>
+                  {videoName}
+                  <span className="ml-2 font-normal" style={{color: '#334155'}}>{byVideo[videoName].length}</span>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {byVideo[videoName].map(key => (
+                    <CropCard key={key} trackKey={key} clusterId={cluster.id} color={cluster.color} compact={false}
+                      selected={selectedKeys?.has(key)} onSelect={onSelect} selectedKeys={selectedKeys}
+                      onContextMenu={(k, x, y) => onContextMenu(k, x, y, cluster.id)} onDrop={onDrop} />
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       );
@@ -506,7 +521,7 @@
       const [loading, setLoading]     = useState(false);
       const [contextMenu, setContextMenu] = useState(null);
       const [cropViewer, setCropViewer]   = useState(null);
-      const [stripHeight, setStripHeight] = useState(200);
+      const [stripHeight, setStripHeight] = useState(() => Math.round(window.innerHeight / 1.7));
       const [selectedKeys, setSelectedKeys] = useState(new Set());
 
       const handleSelect = useCallback(trackKey => {
