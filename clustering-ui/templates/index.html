@@ -493,7 +493,7 @@
       }, []);
 
       useEffect(() => {
-        refresh().then(s => { if (s.current_video) setVideo(s.current_video); });
+        refresh().then(s => { if (s.initialized && s.current_video) handleResume(s); });
       }, []);
 
       useEffect(() => {
@@ -502,11 +502,43 @@
       }, [video, appState]);
 
       const handleInitialize = async params => {
-        const state = await post('/api/initialize', params);
-        setAppState(state);
-        setVideos(await get('/api/videos'));
-        if (state.current_video) setVideo(state.current_video);
+        setLoading(true);
+        try {
+          const state = await post('/api/initialize', params);
+          setAppState(state);
+          setVideos(await get('/api/videos'));
+          // Show the seed video (now approved) not current_video (first pending)
+          // so the user sees their clusters immediately after init
+          setVideo(params.seed_video);
+        } finally {
+          setLoading(false);
+        }
       };
+
+      // On startup, if we resume into a pending/unprocessed video, run
+      // process-video automatically so tracks don't appear as Unassigned
+      const handleResume = useCallback(async (state) => {
+        const cv = state.current_video;
+        if (!cv) return;
+        const videoStatus = state.videos?.[cv]?.status;
+        if (videoStatus === 'pending') {
+          setLoading(true);
+          setTracks([]);
+          setVideo(cv);
+          try {
+            const nextState = await post('/api/process-video', {
+              video_name: cv,
+              threshold: state.cosine_threshold ?? 0.25,
+            });
+            setAppState(nextState);
+            setVideos(await get('/api/videos'));
+          } finally {
+            setLoading(false);
+          }
+        } else {
+          setVideo(cv);
+        }
+      }, []);
 
       const handleReassign = async (trackKeyOrKeys, targetClusterId) => {
         const dropped = Array.isArray(trackKeyOrKeys) ? trackKeyOrKeys : [trackKeyOrKeys];
