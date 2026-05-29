@@ -535,6 +535,16 @@
         setAppState(await post('/api/rename', {cluster_id: clusterId, name}));
       };
 
+      const handleReset = async () => {
+        if (!window.confirm('Reset all clustering? This cannot be undone.')) return;
+        const state = await post('/api/reset', {});
+        setAppState(state);
+        setVideos(await get('/api/videos'));
+        setVideo(null);
+        setTracks([]);
+        setOpen(null);
+      };
+
       const openContextMenu = useCallback((trackKey, x, y, currentClusterId) => {
         setContextMenu({ trackKey, x, y, currentClusterId });
       }, []);
@@ -590,6 +600,13 @@
                   </span>
                 )}
                 <span className="ml-auto text-xs" style={{color: '#64748b'}}>{tracks.length} tracks</span>
+                <button
+                  onClick={handleReset}
+                  className="text-xs px-2 py-1 rounded transition-colors hover:bg-red-900"
+                  style={{color: '#ef4444', border: '1px solid #7f1d1d'}}
+                >
+                  Restart
+                </button>
               </div>
 
               {/* Crop strip */}

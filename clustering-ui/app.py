@@ -12,6 +12,7 @@ CROPS_DIR = BASE_DIR / "three_crop_output"
 EMBEDDINGS_PATH = BASE_DIR / "embeddings.json"
 STATE_PATH = Path(__file__).parent / "state.json"
 
+
 COLORS = [
     "#3B82F6", "#10B981", "#F59E0B", "#EF4444", "#8B5CF6",
     "#EC4899", "#14B8A6", "#F97316", "#84CC16", "#06B6D4",
@@ -409,6 +410,13 @@ def api_new_cluster():
     prune_empty_clusters(state)
     save_state(state)
     return jsonify(state)
+
+
+@app.route("/api/reset", methods=["POST"])
+def api_reset():
+    if STATE_PATH.exists():
+        STATE_PATH.unlink()
+    return jsonify(load_state())
 
 
 @app.route("/api/crop/<video>/<track_id>")
