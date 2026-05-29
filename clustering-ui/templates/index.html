@@ -173,20 +173,28 @@
 
     // ── CropCard ──────────────────────────────────────────────────────────────
 
-    function CropCard({ trackKey, color, compact, onContextMenu, selected, onSelect, selectedKeys }) {
+    function CropCard({ trackKey, clusterId, color, compact, onContextMenu, selected, onSelect, selectedKeys, onDrop }) {
+      const [dragOver, setDragOver] = React.useState(false);
       return (
         <div
           draggable
           onDragStart={e => {
-            const keys = selectedKeys?.has(trackKey) ? [...selectedKeys] : [trackKey];
-            e.dataTransfer.setData('trackKeys', JSON.stringify(keys));
+            e.dataTransfer.setData('trackKeys', JSON.stringify([trackKey]));
+          }}
+          onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={e => {
+            e.preventDefault(); e.stopPropagation(); setDragOver(false);
+            if (!onDrop || !clusterId) return;
+            const keys = JSON.parse(e.dataTransfer.getData('trackKeys') || '[]');
+            if (keys.length) onDrop(keys, clusterId);
           }}
           onClick={e => { e.stopPropagation(); onSelect && onSelect(trackKey); }}
           onContextMenu={e => { e.preventDefault(); if (onContextMenu) onContextMenu(trackKey, e.clientX, e.clientY); }}
           className="flex-shrink-0 rounded overflow-hidden"
           style={{
-            border: `2px solid ${selected ? '#fff' : (color || '#475569')}`,
-            boxShadow: selected ? `0 0 0 2px ${color || C.accent}` : 'none',
+            border: `2px solid ${dragOver ? (color || C.accent) : (selected ? '#fff' : (color || '#475569'))}`,
+            boxShadow: dragOver ? `0 0 0 3px ${color || C.accent}` : (selected ? `0 0 0 2px ${color || C.accent}` : 'none'),
             width: compact ? 90 : 96,
             cursor: 'grab',
           }}
@@ -195,6 +203,7 @@
           <img
             src={cropUrl(trackKey)}
             alt={trackKey}
+            draggable={false}
             style={{width: '100%', height: compact ? 69 : 76, objectFit: 'cover', display: 'block'}}
             onError={e => { e.target.style.background = '#0A2540'; e.target.style.height = compact ? '69px' : '76px'; }}
           />
@@ -240,9 +249,9 @@
             {tracks.length === 0
               ? <span className="text-xs self-center" style={{color: '#334155'}}>Drop tracks here</span>
               : tracks.map(t => (
-                  <CropCard key={t.track_key} trackKey={t.track_key} color={cluster.color} compact={true}
+                  <CropCard key={t.track_key} trackKey={t.track_key} clusterId={cluster.id} color={cluster.color} compact={true}
                     selected={selectedKeys?.has(t.track_key)} onSelect={onSelect} selectedKeys={selectedKeys}
-                    onContextMenu={(key, x, y) => onContextMenu(key, x, y, cluster.id)} />
+                    onContextMenu={(key, x, y) => onContextMenu(key, x, y, cluster.id)} onDrop={onDrop} />
                 ))
             }
           </div>
@@ -357,9 +366,9 @@
             </div>
             <div className="flex flex-wrap gap-2">
               {cluster.track_keys.map(key => (
-                <CropCard key={key} trackKey={key} color={cluster.color} compact={false}
+                <CropCard key={key} trackKey={key} clusterId={cluster.id} color={cluster.color} compact={false}
                   selected={selectedKeys?.has(key)} onSelect={onSelect} selectedKeys={selectedKeys}
-                  onContextMenu={(k, x, y) => onContextMenu(k, x, y, cluster.id)} />
+                  onContextMenu={(k, x, y) => onContextMenu(k, x, y, cluster.id)} onDrop={onDrop} />
               ))}
             </div>
           </div>
@@ -489,7 +498,8 @@
       };
 
       const handleReassign = async (trackKeyOrKeys, targetClusterId) => {
-        const keys = Array.isArray(trackKeyOrKeys) ? trackKeyOrKeys : [trackKeyOrKeys];
+        const dropped = Array.isArray(trackKeyOrKeys) ? trackKeyOrKeys : [trackKeyOrKeys];
+        const keys = [...new Set([...dropped, ...selectedKeys])];
         setTracks(prev => prev.map(t => keys.includes(t.track_key) ? {...t, cluster_id: targetClusterId} : t));
         setAppState(await post('/api/reassign', {track_keys: keys, target_cluster_id: targetClusterId}));
         setSelectedKeys(new Set());
@@ -531,7 +541,8 @@
 
       const handleContextMenuSelect = async (trackKey, clusterId) => {
         setContextMenu(null);
-        await handleReassign(trackKey, clusterId);
+        const keys = selectedKeys.has(trackKey) ? [...selectedKeys] : [trackKey];
+        await handleReassign(keys, clusterId);
       };
 
       const handleNewCluster = async trackKeyOrKeys => {
