@@ -16,3 +16,4 @@ scikit-learn
 scikit-image
 Pillow
 flask
+python-dotenv

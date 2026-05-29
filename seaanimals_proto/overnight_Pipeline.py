@@ -30,12 +30,14 @@ import dropbox
 import ultralytics
 from ultralytics import YOLOWorld, settings
 from tqdm import tqdm
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-# Set DROPBOX_TOKEN env var or paste token directly here
-APP_KEY        = ""
-APP_SECRET     = ""
-REFRESH_TOKEN  = ""
+APP_KEY        = os.environ["DROPBOX_APP_KEY"]
+APP_SECRET     = os.environ["DROPBOX_APP_SECRET"]
+REFRESH_TOKEN  = os.environ["DROPBOX_REFRESH_TOKEN"]
 
         # ADJUST MISSION PATH
 MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_11/Video"
