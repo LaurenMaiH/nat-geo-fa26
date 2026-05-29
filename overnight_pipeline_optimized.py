@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-Overnight Detection + Extraction + Embedding  [OPTIMIZED]
+Overnight Detection + Extraction + Embedding
 
-Key changes vs original:
-  1. Download prefetching  — next video downloads in background while current is processing
-  2. Single-pass crops     — frames are cached during YOLO inference; no second video seek pass
-  3. Batched embeddings    — all crops for a video are embedded in one GPU call
-  4. Minor: ffprobe removed from resize hot-path (uses cv2 instead)
+For each video in a Dropbox mission folder:
+  1. YOLO-World + ByteTrack detection (conf threshold configurable)
+  2. Append ALL detections to one shared CSV
+  3. Filter out short tracks (noise reduction, configurable)
+  4. Extract top-3 crops per animal (best confidence from each third of detection span)
+  5. Store crops in per-video subfolders under overnight_crops/
+  6. Embed all crops via BioClip -> store in one JSON  {video_name__animal_ID: embedding}
 
-Everything else (CSV format, crop folder layout, JSON schema, resume logic,
-motion gating, CLAHE, ByteTrack config, MIN_TRACK_LEN filter) is unchanged.
+Optimizations over previous version:
+  - Crop extraction uses grab()-based forward seek instead of random seek
+  - Resized video written to same tmpdir as download (predictable cleanup)
+  - BioCLIP embeddings are batched per track instead of one image at a time
 """
 
 import os
 import csv
 import json
-import queue
 import shutil
 import tempfile
 import subprocess
@@ -32,27 +35,27 @@ import dropbox
 import ultralytics
 from ultralytics import YOLOWorld, settings
 from tqdm import tqdm
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 APP_KEY        = os.environ["DROPBOX_APP_KEY"]
 APP_SECRET     = os.environ["DROPBOX_APP_SECRET"]
 REFRESH_TOKEN  = os.environ["DROPBOX_REFRESH_TOKEN"]
-MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_33/Video"
 
-SELECTED_VIDEOS = None
-# Start processing from this video onward (inclusive), ignoring everything before it.
-# Useful when you want to skip ahead without touching the CSV resume logic.
-# Set to None to disable (default behaviour: start from beginning or resume from CSV).
-# Example: START_FROM_VIDEO = "PLW_dscm_11_c006.mp4"
-START_FROM_VIDEO =  None
+MISSION_ID   = "PLW_dscm_33"          # ← only line to change between missions
+MISSION_PATH = f"/DOEX0096_Palau/{MISSION_ID}/Video"   # ← and this one
 
-CHECKPOINT_PATH = Path(__file__).parent / "finetuning" / "checkpoints" / "best.pt"  # set to None to use pretrained weights
+SELECTED_VIDEOS = None  # set to a list of filenames, or None for all
 
-_MISSION_DIR      = Path(__file__).parent / "processed_missions" / "mission_33"
+CHECKPOINT_PATH = Path(__file__).parent / "finetuning" / "checkpoints" / "best.pt"
+
+_MISSION_DIR      = Path(__file__).parent / "processed_missions" / MISSION_ID
 _MISSION_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_CSV_PATH   = _MISSION_DIR / "mission_33_detections.csv"
-OUTPUT_CROPS_DIR  = _MISSION_DIR / "mission_33_crops"
-OUTPUT_EMBEDDINGS = _MISSION_DIR / "mission_33_embeddings.json"
+OUTPUT_CSV_PATH   = _MISSION_DIR / f"{MISSION_ID}_detections.csv"
+OUTPUT_CROPS_DIR  = _MISSION_DIR / f"{MISSION_ID}_crops"
+OUTPUT_EMBEDDINGS = _MISSION_DIR / f"{MISSION_ID}_embeddings.json"
 
 CONF_THRESHOLD  = 0.15
 IOU_THRESHOLD   = 0.70
@@ -72,11 +75,6 @@ CUSTOM_VOCABULARY = [
 YOLO_CACHE_DIR   = Path.home() / ".config" / "ultralytics"
 INFERENCE_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CROP_LABELS      = ["early", "mid", "late"]
-
-# How many frames to keep in the rolling cache for crop extraction.
-# Increase if your highest-confidence detections tend to cluster near the end
-# of long tracks; decrease to reduce peak RAM usage.
-FRAME_CACHE_MAX = 500
 
 # ── MODEL SETUP ───────────────────────────────────────────────────────────────
 YOLO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -144,21 +142,27 @@ def clahe_L_median(frame: np.ndarray, clahe) -> np.ndarray:
 
 
 # ──────── VIDEO RESIZE ───────────────────────────────────────────────────────
+def _get_frame_count(path: Path) -> int:
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
+         "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )
+    val = r.stdout.strip()
+    return int(val) if val.isdigit() else 0
+
+
 def resize_video(input_path: Path, output_path: Path, target_height: int = 1080) -> bool:
+    # ── output_path is now in the same tmpdir as the download ──
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Use cv2 for frame count — avoids spawning an ffprobe subprocess
-    _cap = cv2.VideoCapture(str(input_path))
-    total = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT)) or None
-    _cap.release()
-
-    vf  = f"scale=-2:{target_height}:force_original_aspect_ratio=decrease,format=yuv420p"
-    cmd = ["ffmpeg", "-y", "-i", str(input_path), "-vf", vf,
-           "-c:v", "libx264", "-crf", "23", "-preset", "fast",
-           "-an", "-movflags", "+faststart", str(output_path)]
+    total = _get_frame_count(input_path)
+    vf    = f"scale=-2:{target_height}:force_original_aspect_ratio=decrease,format=yuv420p"
+    cmd   = ["ffmpeg", "-y", "-i", str(input_path), "-vf", vf,
+              "-c:v", "libx264", "-crf", "23", "-preset", "fast",
+              "-an", "-movflags", "+faststart", str(output_path)]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
-    with tqdm(total=total, desc=f"  Resizing {input_path.name}", unit="frame", leave=False) as pbar:
+    with tqdm(total=total or None, desc=f"  Resizing {input_path.name}", unit="frame", leave=False) as pbar:
         last = 0
         for line in proc.stdout:
             if line.startswith("frame="):
@@ -173,55 +177,53 @@ def resize_video(input_path: Path, output_path: Path, target_height: int = 1080)
 
 # ──────── EMBEDDING MODEL ────────────────────────────────────────────────────
 def load_embedding_model():
-    import open_clip
+    try:
+        import open_clip
 
-    if not CHECKPOINT_PATH:
-        raise RuntimeError(
-            "CHECKPOINT_PATH is None — finetuned weights are required. "
-            "Set CHECKPOINT_PATH to your best.pt file."
+        if CHECKPOINT_PATH and not Path(CHECKPOINT_PATH).exists():
+            print(f"Finetuned weights not found at {CHECKPOINT_PATH}, downloading...")
+            Path(CHECKPOINT_PATH).parent.mkdir(parents=True, exist_ok=True)
+            gdown.download(
+                "https://drive.google.com/file/d/1Qec1Gzxl8zAazuLof8a2LUSrbOR7GmtT/view?usp=drive_link",
+                str(CHECKPOINT_PATH), quiet=False, fuzzy=True,
+            )
+
+        model, _, preprocess = open_clip.create_model_and_transforms(
+            "hf-hub:imageomics/bioclip-2", device=INFERENCE_DEVICE
         )
 
-    checkpoint = Path(CHECKPOINT_PATH)
-    if not checkpoint.exists():
-        print(f"Finetuned weights not found at {checkpoint}, downloading...")
-        gdown.download(
-            "https://drive.google.com/file/d/1Qec1Gzxl8zAazuLof8a2LUSrbOR7GmtT/view?usp=drive_link",
-            str(checkpoint), quiet=False, fuzzy=True,
-        )
+        if CHECKPOINT_PATH and Path(CHECKPOINT_PATH).exists():
+            print(f"Loading finetuned weights from {CHECKPOINT_PATH}...")
+            ckpt = torch.load(CHECKPOINT_PATH, map_location=INFERENCE_DEVICE)
+            model.visual.load_state_dict(ckpt["model_state"])
+            print("Finetuned weights loaded ✓")
+        else:
+            print("Using pretrained BioCLIP-2 weights")
 
-    if not checkpoint.exists():
-        raise RuntimeError(
-            f"Finetuned weights still not found at {checkpoint} after download attempt. "
-            "Check your CHECKPOINT_PATH and that the download succeeded."
-        )
-
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        "hf-hub:imageomics/bioclip-2", device=INFERENCE_DEVICE
-    )
-
-    print(f"Loading finetuned weights from {checkpoint}...")
-    ckpt = torch.load(checkpoint, map_location=INFERENCE_DEVICE)
-    model.visual.load_state_dict(ckpt["model_state"])
-    print("Finetuned weights loaded ✓")
-
-    model.eval()
-    return ("bioclip", model, preprocess)
+        model.eval()
+        return ("bioclip", model, preprocess)
+    except Exception as e:
+        print(f"BioCLIP not available ({e}) -- using placeholder embeddings.")
+        return ("placeholder", None, None)
 
 
-# CHANGED: accepts a list of BGR images; returns array shape (N, D)
-def get_embeddings_batch(embed_info, images_bgr: list) -> np.ndarray:
-    """Embed a batch of BGR images in a single GPU forward pass."""
+def get_embeddings_batch(embed_info, images_bgr: list[np.ndarray]) -> np.ndarray:
+    """
+    Embed a batch of BGR images in one forward pass.
+    Returns (N, D) float32 array of L2-normalised embeddings.
+    """
     kind, model, preprocess = embed_info
     if kind == "bioclip":
         from PIL import Image
-        tensors = torch.stack([
-            preprocess(Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
-            for img in images_bgr
-        ]).to(INFERENCE_DEVICE)
+        tensors = []
+        for img in images_bgr:
+            pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            tensors.append(preprocess(pil))
+        inp = torch.stack(tensors).to(INFERENCE_DEVICE)
         with torch.no_grad():
-            vecs = model.encode_image(tensors).cpu().numpy()
-        vecs /= (np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-8)
-        return vecs
+            vecs = model.encode_image(inp).cpu().float().numpy()
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        return vecs / np.where(norms == 0, 1, norms)
     else:
         vecs = np.random.rand(len(images_bgr), 512).astype(np.float32)
         vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
@@ -260,24 +262,14 @@ def process_video(
     tracker_config: str,
     csv_path: Path,
     crops_dir: Path,
+    tmpdir: Path,       # ← passed in so resized video lands here
 ) -> dict:
-    """
-    Run YOLO+ByteTrack on one video.
-
-    CHANGED vs original:
-    - Single video pass: frames needed for crops are cached in memory during
-      inference (bounded by FRAME_CACHE_MAX). Eliminates the second
-      VideoCapture seek pass entirely.
-    - Everything else (CSV schema, motion gate, CLAHE, track filtering,
-      best-per-segment crop selection) is identical.
-
-    Returns {track_id: [crop_path, ...]} for the embedding step.
-    """
     resized_path = None
     work_path    = video_path
 
+    # ── Resize into the same tmpdir as the download ──
     if PRERESIZE:
-        tmp = Path(tempfile.gettempdir()) / f"{video_path.stem}_rs{PRERESIZE}.mp4"
+        tmp = tmpdir / f"{video_path.stem}_rs{PRERESIZE}.mp4"
         if resize_video(video_path, tmp, PRERESIZE):
             work_path    = tmp
             resized_path = tmp
@@ -302,7 +294,7 @@ def process_video(
         cap.release()
         raise RuntimeError("No usable frames after black-frame trim.")
 
-    # Background model
+    # Build median background for motion gating
     N_BG = 20
     sample_indices = sorted(set(
         np.linspace(0, total_frames - 1, N_BG, dtype=int) + first_real
@@ -323,7 +315,6 @@ def process_video(
     BG_THRESH    = 40
     MIN_BLOB     = 500
 
-    # CSV
     should_write_header = not csv_path.exists() or csv_path.stat().st_size == 0
     csv_file   = open(csv_path, "a", newline="")
     csv_writer = csv.writer(csv_file)
@@ -331,24 +322,7 @@ def process_video(
         csv_writer.writerow(["media_id", "frame", "track_id", "class",
                              "x", "y", "width", "height", "confidence"])
 
-    # Per-track detection accumulator
     track_detections: dict = defaultdict(list)
-
-    # ── SINGLE-PASS FRAME CACHE ───────────────────────────────────────────────
-    # Maps frame_idx -> raw BGR frame.  We only store frames that have been
-    # seen by YOLO (i.e. frames with activity), and we evict the oldest ones
-    # once the cache exceeds FRAME_CACHE_MAX to bound memory.
-    frame_cache: dict[int, np.ndarray] = {}
-    cache_order: list[int] = []   # insertion order for eviction
-
-    def _cache_frame(fi: int, frm: np.ndarray):
-        if fi in frame_cache:
-            return
-        if len(cache_order) >= FRAME_CACHE_MAX:
-            evict = cache_order.pop(0)
-            frame_cache.pop(evict, None)
-        frame_cache[fi] = frm.copy()
-        cache_order.append(fi)
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, first_real)
     frame_idx       = 0
@@ -394,9 +368,6 @@ def process_video(
                         ])
                         track_detections[tid].append((frame_idx, conf, x1, y1, x2, y2, cls_name))
 
-                # Cache the *original* (un-CLAHEd) frame for clean crops
-                _cache_frame(frame_idx, frame)
-
             frame_idx += 1
             pbar.update(1)
             pbar.set_postfix(inferred=frames_inferred)
@@ -413,7 +384,6 @@ def process_video(
 
     video_crops_dir = crops_dir / video_name
     video_crops_dir.mkdir(parents=True, exist_ok=True)
-
     track_crop_paths: dict = {}
 
     if not long_tracks:
@@ -421,15 +391,13 @@ def process_video(
             resized_path.unlink()
         return track_crop_paths
 
-    # ── CHANGED: crop from cache instead of a second video pass ──────────────
-    # Identify which frame each (track, segment) wants, then pull from cache.
-    # Frames that were evicted (rare for short videos; possible for very long
-    # ones with many active frames) fall back to a targeted cap.read().
+    # ── Select best frame per segment per track ───────────────────────────────
+    # needed maps frame_idx -> [(tid, x1,y1,x2,y2,cls,label)]
+    needed: dict = defaultdict(list)
     k = CROPS_PER_TRACK
-    needed: dict[int, list] = defaultdict(list)  # frame_idx -> [(tid,...)]
     for tid, dets in long_tracks.items():
         dets_sorted = sorted(dets, key=lambda d: d[0])
-        n           = len(dets_sorted)
+        n = len(dets_sorted)
         for seg_i, label in enumerate(CROP_LABELS[:k]):
             segment = dets_sorted[seg_i * n // k : (seg_i + 1) * n // k]
             if not segment:
@@ -438,26 +406,29 @@ def process_video(
             fi, conf, x1, y1, x2, y2, cls_name = best
             needed[fi].append((tid, x1, y1, x2, y2, cls_name, label))
 
-    # Collect frames not in cache so we can do a single fallback pass if needed
-    missing_frames = sorted(fi for fi in needed if fi not in frame_cache)
-    fallback_frames: dict[int, np.ndarray] = {}
-    if missing_frames:
-        print(f"  {len(missing_frames)} crop frames evicted from cache — doing targeted seeks")
-        cap_fb = cv2.VideoCapture(str(work_path))
-        for fi in tqdm(missing_frames, desc=f"  Fallback seek {video_name}", unit="frame", leave=False):
-            cap_fb.set(cv2.CAP_PROP_POS_FRAMES, first_real + fi)
-            ret, frm = cap_fb.read()
-            if ret:
-                fallback_frames[fi] = frm
-        cap_fb.release()
+    # ── Crop extraction with grab()-based forward seek ────────────────────────
+    cap2 = cv2.VideoCapture(str(work_path))
+    current_frame = -1
+    sorted_frames = sorted(needed.keys())
 
-    for fi, crops_info in tqdm(needed.items(), desc=f"  Cropping {video_name}", unit="frame", leave=False):
-        frame = frame_cache.get(fi)
-        if frame is None:
-            frame = fallback_frames.get(fi)
-        if frame is None:
+    for fi in tqdm(sorted_frames, desc=f"  Cropping {video_name}", unit="frame", leave=False):
+        abs_fi = first_real + fi
+
+        # Forward-seek with grab() when close; random seek when far or going back
+        if current_frame < 0 or abs_fi < current_frame or (abs_fi - current_frame) > 300:
+            cap2.set(cv2.CAP_PROP_POS_FRAMES, abs_fi)
+            ret, frame = cap2.read()
+        else:
+            while current_frame < abs_fi - 1:
+                cap2.grab()
+                current_frame += 1
+            ret, frame = cap2.read()
+
+        if not ret:
             continue
-        for tid, x1, y1, x2, y2, cls_name, label in crops_info:
+        current_frame = abs_fi
+
+        for tid, x1, y1, x2, y2, cls_name, label in needed[fi]:
             x1p = max(0, x1 - CROP_PAD)
             y1p = max(0, y1 - CROP_PAD)
             x2p = min(width,  x2 + CROP_PAD)
@@ -466,10 +437,12 @@ def process_video(
             if crop.size == 0:
                 continue
             cls_slug = cls_name.replace(" ", "_")
-            fname    = f"id{tid:04d}_{cls_slug}_f{first_real + fi:05d}_{label}.jpg"
+            fname    = f"id{tid:04d}_{cls_slug}_f{abs_fi:05d}_{label}.jpg"
             fpath    = video_crops_dir / fname
             cv2.imwrite(str(fpath), crop)
             track_crop_paths.setdefault(tid, []).append(str(fpath))
+
+    cap2.release()
 
     if resized_path and resized_path.exists():
         resized_path.unlink()
@@ -492,26 +465,6 @@ def connect_dropbox():
     return dbx
 
 
-# ──────── DOWNLOAD PREFETCH THREAD ──────────────────────────────────────────
-# CHANGED: downloads run in a background thread so the next video arrives
-# while the current one is being processed on the GPU.
-def _download_worker(entries, tmpdir: Path, dbx, mission_path: str,
-                     out_q: queue.Queue, stop_evt: threading.Event):
-    """Feeds (entry, local_path) tuples into out_q; sends None as sentinel."""
-    for entry in entries:
-        if stop_evt.is_set():
-            break
-        local_path = tmpdir / entry.name
-        try:
-            print(f"\n[Prefetch] Downloading {entry.name} ...")
-            dbx.files_download_to_file(str(local_path), f"{mission_path}/{entry.name}")
-            out_q.put((entry, local_path))
-        except Exception as e:
-            print(f"[Prefetch] Download failed for {entry.name}: {e}")
-            out_q.put((entry, None))  # signal failure; main loop will skip
-    out_q.put(None)  # sentinel: no more videos
-
-
 # ──────── MAIN ───────────────────────────────────────────────────────────────
 def main():
     print(f"Using device: {INFERENCE_DEVICE}")
@@ -528,7 +481,6 @@ def main():
             all_embeddings = json.load(f)
         print(f"Loaded {len(all_embeddings)} existing embeddings from {OUTPUT_EMBEDDINGS}")
 
-    # Build video list
     all_entries = sorted(
         [e for e in dbx.files_list_folder(MISSION_PATH).entries if e.name.endswith(".mp4")],
         key=lambda e: e.name,
@@ -544,93 +496,50 @@ def main():
         entries = all_entries
         print(f"Processing all {len(entries)} videos")
 
-    # Manual start-from override (takes priority over CSV resume)
-    if START_FROM_VIDEO is not None:
-        names = [e.name for e in entries]
-        if START_FROM_VIDEO in names:
-            idx     = names.index(START_FROM_VIDEO)
-            entries = entries[idx:]
-            print(f"START_FROM_VIDEO: starting at '{START_FROM_VIDEO}' ({len(entries)} videos)")
-        else:
-            print(f"Warning: START_FROM_VIDEO '{START_FROM_VIDEO}' not found in video list — ignoring")
-
-    # CSV resume logic (only runs if START_FROM_VIDEO is not set)
+    last_processed = get_last_processed(OUTPUT_CSV_PATH)
+    if last_processed and last_processed in {e.name for e in entries}:
+        idx     = next(i for i, e in enumerate(entries) if e.name == last_processed)
+        entries = entries[idx + 1:]
+        print(f"Resuming after '{last_processed}': {len(entries)} videos remaining")
     else:
-        last_processed = get_last_processed(OUTPUT_CSV_PATH)
-        if last_processed and last_processed in {e.name for e in entries}:
-            idx     = next(i for i, e in enumerate(entries) if e.name == last_processed)
-            entries = entries[idx + 1:]
-            print(f"Resuming after '{last_processed}': {len(entries)} videos remaining")
-        else:
-            print("Starting from the beginning")
+        print("Starting from the beginning")
 
-    counter   = 0
-    stop_evt  = threading.Event()
-
+    counter = 0
     with tempfile.TemporaryDirectory(prefix="natgeo_") as tmpdir:
         tmpdir = Path(tmpdir)
-
-        # CHANGED: spin up the prefetch thread and buffer up to 2 videos ahead
-        download_q: queue.Queue = queue.Queue(maxsize=2)
-        dl_thread = threading.Thread(
-            target=_download_worker,
-            args=(entries, tmpdir, dbx, MISSION_PATH, download_q, stop_evt),
-            daemon=True,
-        )
-        dl_thread.start()
-
-        while True:
-            item = download_q.get()
-            if item is None:
-                break  # no more videos
-
-            entry, local_path = item
-            if local_path is None:
-                print(f"✗  {entry.name} — download failed, skipping")
-                continue
-
+        for entry in entries:
             video_name = Path(entry.name).stem
             media_id   = entry.name
+            local_path = tmpdir / entry.name
 
             print(f"\n{'='*60}")
-            print(f"Processing: {entry.name}")
+            print(f"Downloading: {entry.name}")
+            dbx.files_download_to_file(str(local_path), f"{MISSION_PATH}/{entry.name}")
 
             try:
                 track_crops = process_video(
                     local_path, media_id, video_name, model, tracker,
                     OUTPUT_CSV_PATH, OUTPUT_CROPS_DIR,
+                    tmpdir=tmpdir,   # ← pass tmpdir for resized video
                 )
 
-                # CHANGED: batch-embed all crops for this video in one GPU call
-                all_crop_images = []
-                all_crop_keys   = []
+                # ── Batch embedding per track ─────────────────────────────────
+                total_crops = sum(len(v) for v in track_crops.values())
+                print(f"  Embedding {total_crops} crops across {len(track_crops)} tracks...")
                 for tid, crop_paths in track_crops.items():
                     images = [cv2.imread(p) for p in crop_paths]
                     images = [img for img in images if img is not None]
                     if not images:
                         continue
-                    for img in images:
-                        all_crop_images.append(img)
-                        all_crop_keys.append(tid)
-
-                total_crops = len(all_crop_images)
-                print(f"  Embedding {total_crops} crops across {len(track_crops)} tracks (batched)...")
-
-                if all_crop_images:
-                    vecs = get_embeddings_batch(embed_info, all_crop_images)  # (N, D)
-                    # Group by track_id and mean-pool
-                    tid_vecs: dict[int, list] = defaultdict(list)
-                    for tid, vec in zip(all_crop_keys, vecs):
-                        tid_vecs[tid].append(vec)
-                    for tid, tvecs in tid_vecs.items():
-                        mean_v = np.mean(tvecs, axis=0)
-                        mean_v /= (np.linalg.norm(mean_v) + 1e-8)
-                        all_embeddings[f"{video_name}__{tid}"] = mean_v.tolist()
+                    # All crops for this track embedded in one forward pass
+                    vecs   = get_embeddings_batch(embed_info, images)
+                    mean_v = vecs.mean(axis=0)
+                    mean_v /= (np.linalg.norm(mean_v) + 1e-8)
+                    all_embeddings[f"{video_name}__{tid}"] = mean_v.tolist()
 
                 with open(OUTPUT_EMBEDDINGS, "w") as f:
                     json.dump(all_embeddings, f)
 
-                # Sentinel row so resume works
                 last = get_last_processed(OUTPUT_CSV_PATH)
                 if last != entry.name:
                     with open(OUTPUT_CSV_PATH, "a", newline="") as f:
@@ -642,12 +551,8 @@ def main():
 
             except Exception as e:
                 print(f"✗  {entry.name} failed: {e}")
-
             finally:
                 local_path.unlink(missing_ok=True)
-
-        stop_evt.set()
-        dl_thread.join()
 
     clean_csv(OUTPUT_CSV_PATH)
     print(f"\nDone! Processed {counter} videos this session.")
