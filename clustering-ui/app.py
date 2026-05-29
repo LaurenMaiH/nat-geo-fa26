@@ -8,7 +8,7 @@ import hdbscan as hdbscan_lib
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).parent.parent  # nat-geo/ (clustering-ui lives inside nat-geo/)
-CROPS_DIR = BASE_DIR / "three_crop_output"
+CROPS_DIR = BASE_DIR / "processed_missions" / "mission_11" /"three_crop_output"
 EMBEDDINGS_PATH = BASE_DIR / "processed_missions" / "mission_11" / "embeddings.json"
 STATE_PATH = Path(__file__).parent / "state.json"
 
