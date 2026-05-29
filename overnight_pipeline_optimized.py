@@ -44,14 +44,15 @@ SELECTED_VIDEOS = None
 # Useful when you want to skip ahead without touching the CSV resume logic.
 # Set to None to disable (default behaviour: start from beginning or resume from CSV).
 # Example: START_FROM_VIDEO = "PLW_dscm_11_c006.mp4"
-START_FROM_VIDEO = "PLW_dscm_33_c013.mp4"
+START_FROM_VIDEO =  None
 
 CHECKPOINT_PATH = Path(__file__).parent / "finetuning" / "checkpoints" / "best.pt"  # set to None to use pretrained weights
 
 _MISSION_DIR      = Path(__file__).parent / "processed_missions" / "mission_33"
-OUTPUT_CSV_PATH   = _MISSION_DIR / "overnight_detections.csv"
-OUTPUT_CROPS_DIR  = _MISSION_DIR / "overnight_crops"
-OUTPUT_EMBEDDINGS = _MISSION_DIR / "overnight_embeddings.json"
+_MISSION_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_CSV_PATH   = _MISSION_DIR / "mission_33_detections.csv"
+OUTPUT_CROPS_DIR  = _MISSION_DIR / "mission_33_crops"
+OUTPUT_EMBEDDINGS = _MISSION_DIR / "mission_33_embeddings.json"
 
 CONF_THRESHOLD  = 0.15
 IOU_THRESHOLD   = 0.70
@@ -465,7 +466,7 @@ def process_video(
             if crop.size == 0:
                 continue
             cls_slug = cls_name.replace(" ", "_")
-            fname    = f"id{tid:04d}_{cls_slug}_{label}.jpg"
+            fname    = f"id{tid:04d}_{cls_slug}_f{first_real + fi:05d}_{label}.jpg"
             fpath    = video_crops_dir / fname
             cv2.imwrite(str(fpath), crop)
             track_crop_paths.setdefault(tid, []).append(str(fpath))
