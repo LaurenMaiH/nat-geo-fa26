@@ -499,6 +499,7 @@ def api_process_video():
 def api_reassign():
     body = request.get_json()
     target_cid = body["target_cluster_id"]
+    track_keys = body["track_keys"]
 
     state = load_state()
     emb_dict = load_embeddings()
@@ -507,7 +508,7 @@ def api_reassign():
         return jsonify({"error": "Unknown cluster"}), 400
 
     affected = set()
-    for key in body["track_keys"]:
+    for key in track_keys:
         old_cid = state["track_assignments"].get(key, "noise")
         if old_cid == target_cid:
             continue
@@ -527,6 +528,12 @@ def api_reassign():
             cluster["track_keys"], cluster["centroid"], emb_dict
         )
 
+    # NEW: Revert video status to 'processed' if it was previously approved
+    if track_keys:
+        video_name = track_keys[0].split("/")[0]
+        if video_name in state["videos"] and state["videos"][video_name]["status"] == "approved":
+            state["videos"][video_name]["status"] = "processed"
+
     prune_empty_clusters(state)
     save_state(state)
     return jsonify(state)
@@ -537,15 +544,45 @@ def api_approve():
     body = request.get_json()
     video_name = body["video_name"]
     state = load_state()
+
+    # 1. Update the status of the current video
     if video_name in state["videos"]:
         state["videos"][video_name]["status"] = "approved"
+
     all_vids = sorted_videos(load_embeddings())
-    state["current_video"] = next(
-        (v for v in all_vids if state["videos"].get(v, {}).get("status") != "approved"), None
-    )
+    
+    # 2. Sequential Navigation logic
+    if video_name in all_vids:
+        current_idx = all_vids.index(video_name)
+        if current_idx + 1 < len(all_vids):
+            # Move to the sequentially next video
+            state["current_video"] = all_vids[current_idx + 1]
+        else:
+            state["current_video"] = None  # Reached the end
+    else:
+        # Fallback if the requested video somehow doesn't exist
+        state["current_video"] = next(
+            (v for v in all_vids if state["videos"].get(v, {}).get("status") != "approved"), None
+        )
+
     save_state(state)
     return jsonify(state)
 
+@app.route("/api/previous", methods=["POST"])
+def api_previous():
+    body = request.get_json()
+    video_name = body["video_name"]
+    state = load_state()
+    all_vids = sorted_videos(load_embeddings())
+
+    if video_name in all_vids:
+        current_idx = all_vids.index(video_name)
+        if current_idx > 0:
+            # Move to the sequentially previous video
+            state["current_video"] = all_vids[current_idx - 1]
+
+    save_state(state)
+    return jsonify(state)
 
 @app.route("/api/rename", methods=["POST"])
 def api_rename():
@@ -590,6 +627,11 @@ def api_new_cluster():
         "representative": track_key,
     }
     state["track_assignments"][track_key] = new_cid
+
+    # NEW: Revert video status to 'processed' if it was previously approved
+    video_name = track_key.split("/")[0]
+    if video_name in state["videos"] and state["videos"][video_name]["status"] == "approved":
+        state["videos"][video_name]["status"] = "processed"
 
     prune_empty_clusters(state)
     save_state(state)

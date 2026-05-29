@@ -556,22 +556,53 @@
         } finally { setLoading(false); }
       };
 
+      const handlePrevious = async () => {
+        if (!video) return;
+        setLoading(true);
+        try {
+          const state = await post('/api/previous', {video_name: video});
+          setAppState(state);
+          setVideos(await get('/api/videos'));
+          const prevVideo = state.current_video;
+          if (prevVideo) {
+            setTracks([]);
+            setVideo(prevVideo);
+          }
+        } finally {
+          setLoading(false);
+        }
+      };
+
       const handleApprove = async () => {
+        // 1. Approve current video
         const state = await post('/api/approve', {video_name: video});
         setAppState(state);
-        setVideos(await get('/api/videos'));
-        const nextVideo = state.current_video;
-        if (nextVideo) {
-          // Set loading BEFORE switching video so the strip shows a spinner
-          // rather than the next video's tracks all appearing as Unassigned
+        
+        // Fetch updated video list so we know the status of the next one
+        const currentVideos = await get('/api/videos');
+        setVideos(currentVideos);
+        
+        const nextVideoName = state.current_video;
+        if (nextVideoName) {
           setLoading(true);
           setTracks([]);
-          setVideo(nextVideo);
-          try {
-            const nextState = await post('/api/process-video', {video_name: nextVideo, threshold});
-            setAppState(nextState);
-            setVideos(await get('/api/videos'));
-          } finally {
+          setVideo(nextVideoName);
+          
+          // 2. Check if the next video actually needs processing
+          const nextVidObj = currentVideos.find(v => v.name === nextVideoName);
+          const isPending = nextVidObj && nextVidObj.status === 'pending';
+          
+          if (isPending) {
+            try {
+              // ONLY run process-video if it is a brand new (pending) video
+              const nextState = await post('/api/process-video', {video_name: nextVideoName, threshold});
+              setAppState(nextState);
+              setVideos(await get('/api/videos'));
+            } finally {
+              setLoading(false);
+            }
+          } else {
+            // If it's already processed or approved, just load it without overwriting!
             setLoading(false);
           }
         }
@@ -623,7 +654,7 @@
       const clusters = Object.values(appState.clusters || {});
       const videoStatus = appState.videos?.[video]?.status;
       const canProcess = appState.initialized && video && videoStatus === 'pending';
-      const canApprove = video && ['pending', 'processed'].includes(videoStatus);
+      // const canApprove = video && ['pending', 'processed'].includes(videoStatus);
 
       return (
         <div className="flex h-screen" style={{backgroundColor: C.bg}} onClick={clearSelection}>
@@ -730,8 +761,16 @@
                 </label>
                 <div className="flex gap-2 ml-auto">
                   <button
+                    onClick={handlePrevious}
+                    disabled={!video || loading}
+                    className="px-4 py-1.5 rounded text-sm font-medium text-white transition-colors hover:bg-slate-600 disabled:opacity-40"
+                    style={{backgroundColor: '#475569'}}
+                  >
+                    ← Previous Video
+                  </button>
+                  <button
                     onClick={handleApprove}
-                    disabled={!canApprove || loading}
+                    disabled={!video || loading}
                     className="px-4 py-1.5 rounded text-sm font-medium text-white transition-opacity disabled:opacity-40"
                     style={{backgroundColor: '#065f46'}}
                   >
