@@ -43,8 +43,9 @@ APP_SECRET     = os.environ["DROPBOX_APP_SECRET"]
 REFRESH_TOKEN  = os.environ["DROPBOX_REFRESH_TOKEN"]
 
 MISSION_ROOT   = "/DOEX0096_Palau/PLW_dscm_34/Video"
-CSV_PATH       = Path("mission_34.csv")
-CROPS_DIR      = Path("mission_34_crops")
+_MISSION_DIR   = Path(__file__).parent / "processed_missions" / "mission_34"
+CSV_PATH       = _MISSION_DIR / "mission_34.csv"
+CROPS_DIR      = _MISSION_DIR / "mission_34_crops"
 
 FORCE_SPECIES  = None   # set to e.g. "Chaceon micronesicus" to override CSV labels
 CONF_THRESHOLD = 0.15   # minimum confidence to consider a detection at all
