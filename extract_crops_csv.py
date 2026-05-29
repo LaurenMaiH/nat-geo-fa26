@@ -20,6 +20,7 @@ CSV columns used: media / media_id, frame, track_id / tracker_id, x, y, width, h
 Coordinates are normalized (x, y, width, height relative to frame size).
 """
 
+import os
 import csv
 import cv2
 import tempfile
@@ -30,14 +31,16 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from collections import defaultdict
 from tqdm import tqdm
+from dotenv import load_dotenv
 
+load_dotenv()
 
 # ============================================================
 # CONFIG — update these to match your setup
 # ============================================================
-APP_KEY        = ""
-APP_SECRET     = ""
-REFRESH_TOKEN  = ""
+APP_KEY        = os.environ["DROPBOX_APP_KEY"]
+APP_SECRET     = os.environ["DROPBOX_APP_SECRET"]
+REFRESH_TOKEN  = os.environ["DROPBOX_REFRESH_TOKEN"]
 
 MISSION_ROOT   = "/DOEX0096_Palau/PLW_dscm_34/Video"
 CSV_PATH       = Path("mission_34.csv")

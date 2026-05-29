@@ -231,3 +231,5 @@ mission_34_crops/
 *_crops/
 *.jpg
 seaanimals_proto/clustering_review.py
+
+clustering-ui/state.json
