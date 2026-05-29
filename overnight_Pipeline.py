@@ -40,22 +40,20 @@ APP_SECRET     = os.environ["DROPBOX_APP_SECRET"]
 REFRESH_TOKEN  = os.environ["DROPBOX_REFRESH_TOKEN"]
 
         # ADJUST MISSION PATH
-MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_11/Video"
+MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_33/Video"
 
 
     #  # ADJUST video selection OR  set to None for every video
-SELECTED_VIDEOS = [
-    "PLW_dscm_11_c019.mp4", "PLW_dscm_11_c020.mp4",
-    
-]
+SELECTED_VIDEOS = None
 
 
 CHECKPOINT_PATH = Path(__file__).parent / "finetuning" / "checkpoints" / "best.pt"  # set to None to use pretrained weights
 
-_MISSION_DIR      = Path(__file__).parent / "processed_missions" / "mission_11"
-OUTPUT_CSV_PATH   = _MISSION_DIR / "overnight_detections.csv"
-OUTPUT_CROPS_DIR  = _MISSION_DIR / "overnight_crops"      # subfolders per video
-OUTPUT_EMBEDDINGS = _MISSION_DIR / "overnight_embeddings.json"
+_MISSION_DIR      = Path(__file__).parent / "processed_missions" / "mission_33"
+_MISSION_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_CSV_PATH   = _MISSION_DIR / "mission_33_detections.csv"
+OUTPUT_CROPS_DIR  = _MISSION_DIR / "mission_33_crops"      # subfolders per video
+OUTPUT_EMBEDDINGS = _MISSION_DIR / "mission_33_embeddings.json"
 
 CONF_THRESHOLD  = 0.15   # change to 0.10 for more detections
 IOU_THRESHOLD   = 0.70
@@ -428,7 +426,7 @@ def process_video(
             if crop.size == 0:
                 continue
             cls_slug = cls_name.replace(" ", "_")
-            fname    = f"id{tid:04d}_{cls_slug}_{label}.jpg"
+            fname    = f"id{tid:04d}_{cls_slug}_f{first_real + fi:05d}_{label}.jpg"
             fpath    = video_crops_dir / fname
             cv2.imwrite(str(fpath), crop)
             track_crop_paths.setdefault(tid, []).append(str(fpath))
