@@ -15,18 +15,20 @@ import csv
 import zipfile
 import tempfile
 import torch
+from dotenv import load_dotenv
 
 from model_pipeline import process_video_with_model
 
+load_dotenv()
 
 # none processes all vids from a folder
 SELECTED_VIDEOS = ["PLW_dscm_05_c058.mp4", "PLW_dscm_05_c117.mp4","PLW_dscm_05_c120.mp4", "PLW_dscm_05_c137.mp4", "PLW_dscm_05_c183.mp4", "PLW_dscm_05_c186.mp4"]
 # SELECTED_VIDEOS = None
 
 
-APP_KEY        = ""
-APP_SECRET     = ""
-REFRESH_TOKEN  = ""
+APP_KEY        = os.environ["DROPBOX_APP_KEY"]
+APP_SECRET     = os.environ["DROPBOX_APP_SECRET"]
+REFRESH_TOKEN  = os.environ["DROPBOX_REFRESH_TOKEN"]
 MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_05/Video"
 OUTPUT_CSV_PATH = Path.cwd() / "test.csv"
 
