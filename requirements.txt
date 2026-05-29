@@ -13,3 +13,4 @@ matplotlib
 seaborn
 scikit-learn
 scikit-image
+flask
