@@ -13,9 +13,9 @@ from dotenv import load_dotenv
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).parent.parent  # nat-geo/ (clustering-ui lives inside nat-geo/)
-CROPS_DIR = BASE_DIR / "processed_missions" / "mission_11" /"three_crop_output"
-EMBEDDINGS_PATH = BASE_DIR / "processed_missions" / "mission_11" / "embeddings.json"
-STATE_PATH = Path(__file__).parent / "state.json"
+CROPS_DIR = BASE_DIR / "processed_missions" / "mission_11" / "mission_11_crops"
+EMBEDDINGS_PATH = BASE_DIR / "processed_missions" / "mission_11" / "mission_11_embeddings.json"
+STATE_PATH = EMBEDDINGS_PATH.parent / "state.json"
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -115,16 +115,20 @@ def prune_empty_clusters(state):
 
 
 def sorted_videos(emb_dict):
-    return sorted({k.split("/")[0] for k in emb_dict})
+    return sorted({k.rsplit("__", 1)[0] for k in emb_dict})
 
 
 def best_crop_path(video, track_id):
     video_dir = CROPS_DIR / video
     if not video_dir.exists():
         return None
-    matches = sorted(video_dir.glob(f"{track_id}_*_best.jpg"))
+    try:
+        id_prefix = f"id{int(track_id):04d}"
+    except ValueError:
+        id_prefix = track_id
+    matches = sorted(video_dir.glob(f"{id_prefix}_*_mid.jpg"))
     if not matches:
-        matches = sorted(video_dir.glob(f"{track_id}_*.jpg"))
+        matches = sorted(video_dir.glob(f"{id_prefix}_*.jpg"))
     return matches[0] if matches else None
 
 
@@ -299,7 +303,7 @@ def api_state():
     emb = load_embeddings()
     track_counts = defaultdict(int)
     for k in emb:
-        track_counts[k.split("/")[0]] += 1
+        track_counts[k.rsplit("__", 1)[0]] += 1
     for v in sorted(track_counts):
         entry = state["videos"].get(v, {"name": v, "status": "pending"})
         entry["track_count"] = track_counts[v]
@@ -313,7 +317,7 @@ def api_videos():
     emb = load_embeddings()
     track_counts = defaultdict(int)
     for k in emb:
-        track_counts[k.split("/")[0]] += 1
+        track_counts[k.rsplit("__", 1)[0]] += 1
     return jsonify([
         {
             "name": v,
@@ -330,17 +334,17 @@ def api_video_tracks(video_name):
     emb = load_embeddings()
     trash_keys = set(state.get("trash", {}).get("track_keys", []))
     track_ids = sorted(
-        [k.split("/")[1] for k in emb if k.split("/")[0] == video_name],
+        [k.rsplit("__", 1)[1] for k in emb if k.rsplit("__", 1)[0] == video_name],
         key=track_sort_key,
     )
     return jsonify([
         {
-            "track_key": f"{video_name}/{tid}",
+            "track_key": f"{video_name}__{tid}",
             "track_id": tid,
-            "cluster_id": state["track_assignments"].get(f"{video_name}/{tid}", "noise"),
+            "cluster_id": state["track_assignments"].get(f"{video_name}__{tid}", "noise"),
         }
         for tid in track_ids
-        if f"{video_name}/{tid}" not in trash_keys
+        if f"{video_name}__{tid}" not in trash_keys
     ])
 
 
@@ -364,7 +368,7 @@ def api_initialize():
         return jsonify({"error": "Unknown video"}), 400
 
     # ── HDBSCAN on seed video only ────────────────────────────────────────────
-    track_keys    = [k for k in emb_dict if k.split("/")[0] == seed_video]
+    track_keys    = [k for k in emb_dict if k.rsplit("__", 1)[0] == seed_video]
     local_clusters = hdbscan_video(track_keys, emb_dict, min_cluster_size, min_samples)
 
     clusters    = {
@@ -435,7 +439,7 @@ def api_initialize():
 
     track_counts = defaultdict(int)
     for k in emb_dict:
-        track_counts[k.split("/")[0]] += 1
+        track_counts[k.rsplit("__", 1)[0]] += 1
 
     videos = {
         v: {
@@ -481,7 +485,7 @@ def api_process_video():
     min_samples      = state["hdbscan_params"]["min_samples"]
     threshold        = float(body.get("threshold", state.get("cosine_threshold", 0.25)))
 
-    track_keys    = [k for k in emb_dict if k.split("/")[0] == video_name]
+    track_keys    = [k for k in emb_dict if k.rsplit("__", 1)[0] == video_name]
     local_clusters = hdbscan_video(track_keys, emb_dict, min_cluster_size, min_samples)
 
     affected_cids = set()
@@ -605,7 +609,7 @@ def api_reassign():
 
     # NEW: Revert video status to 'processed' if it was previously approved
     if track_keys:
-        video_name = track_keys[0].split("/")[0]
+        video_name = track_keys[0].rsplit("__", 1)[0]
         if video_name in state["videos"] and state["videos"][video_name]["status"] == "approved":
             state["videos"][video_name]["status"] = "processed"
 
@@ -704,7 +708,7 @@ def api_new_cluster():
     state["track_assignments"][track_key] = new_cid
 
     # NEW: Revert video status to 'processed' if it was previously approved
-    video_name = track_key.split("/")[0]
+    video_name = track_key.rsplit("__", 1)[0]
     if video_name in state["videos"] and state["videos"][video_name]["status"] == "approved":
         state["videos"][video_name]["status"] = "processed"
 
@@ -801,10 +805,14 @@ def api_trash_delete():
         if key in emb_dict:
             del emb_dict[key]
             modified_emb = True
-        video, track_id = key.split("/", 1)
+        video, track_id = key.rsplit("__", 1)
         video_dir = CROPS_DIR / video
         if video_dir.exists():
-            for f in video_dir.glob(f"{track_id}_*.jpg"):
+            try:
+                id_prefix = f"id{int(track_id):04d}"
+            except ValueError:
+                id_prefix = track_id
+            for f in video_dir.glob(f"{id_prefix}_*.jpg"):
                 f.unlink(missing_ok=True)
 
     if modified_emb:

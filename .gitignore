@@ -234,3 +234,5 @@ seaanimals_proto/clustering_review.py
 
 clustering-ui/state.json
 *.mp4
+
+**/state.json

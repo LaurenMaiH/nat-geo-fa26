@@ -37,7 +37,7 @@
     }).then(r => r.json());
 
     const cropUrl = trackKey => {
-      const [video, tid] = trackKey.split('/');
+      const [video, tid] = trackKey.split('__');
       return `/api/crop/${video}/${tid}`;
     };
 
@@ -263,7 +263,7 @@
           />
           {!compact && (
             <div className="px-1 py-0.5 text-xs truncate" style={{backgroundColor: C.border, color: '#94a3b8'}}>
-              {trackKey.split('/')[1]}
+              {trackKey.split('__')[1]}
             </div>
           )}
         </div>
@@ -483,7 +483,7 @@
 
       const byVideo = {};
       cluster.track_keys.forEach(key => {
-        const vid = key.split('/')[0];
+        const vid = key.split('__')[0];
         (byVideo[vid] = byVideo[vid] || []).push(key);
       });
       const videoNames = Object.keys(byVideo).sort();
@@ -669,7 +669,7 @@
                           onError={e => { e.target.style.background = '#0A2540'; e.target.style.height = '76px'; }}
                         />
                         <div className="px-1 py-0.5 text-xs truncate" style={{backgroundColor: C.border, color: '#94a3b8'}}>
-                          {key.split('/')[1]}
+                          {key.split('__')[1]}
                         </div>
                       </div>
                     );
