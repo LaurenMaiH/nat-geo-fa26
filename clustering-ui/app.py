@@ -1,6 +1,7 @@
 from flask import Flask, jsonify, request, send_file
 from pathlib import Path
 from collections import defaultdict
+import csv
 import json
 import numpy as np
 import hdbscan as hdbscan_lib
@@ -26,6 +27,68 @@ PROXY_DIR.mkdir(exist_ok=True)
 _dbx_instance = None
 _proxy_status: dict[str, str] = {}  # video_name → "generating" | "ready" | "error"
 _proxy_lock = threading.Lock()
+
+DETECTIONS_CSV = BASE_DIR / "processed_missions" / "mission_11" / "mission_11_detections.csv"
+
+
+def _load_all_detections():
+    cache = {}
+    if not DETECTIONS_CSV.exists():
+        return cache
+    with open(DETECTIONS_CSV, newline='') as f:
+        for row in csv.DictReader(f):
+            vid = row['media_id'].removesuffix('.mp4')
+            frame = int(row['frame'])
+            cache.setdefault(vid, {}).setdefault(frame, []).append({
+                'track_id': int(row['track_id']),
+                'class':    row['class'],
+                'x':        float(row['x']),
+                'y':        float(row['y']),
+                'w':        float(row['width']),
+                'h':        float(row['height']),
+                'conf':     round(float(row['confidence']), 3),
+            })
+    return cache
+
+
+DETECTIONS_CACHE = _load_all_detections()
+
+
+def get_proxy_fps(video_name):
+    proxy = PROXY_DIR / f"{video_name.replace('.mp4', '')}_proxy.mp4"
+    if proxy.exists():
+        try:
+            out = subprocess.run(
+                ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', str(proxy)],
+                capture_output=True, text=True,
+            )
+            data = json.loads(out.stdout)
+            for s in data.get('streams', []):
+                if s.get('codec_type') == 'video':
+                    num, den = s.get('avg_frame_rate', '30/1').split('/')
+                    return float(num) / float(den)
+        except Exception:
+            pass
+    return 30.0
+
+
+def get_black_frame_offset(video_name):
+    proxy = PROXY_DIR / f"{video_name.replace('.mp4', '')}_proxy.mp4"
+    if proxy.exists():
+        try:
+            out = subprocess.run(
+                ['ffmpeg', '-i', str(proxy), '-vf', 'blackdetect=d=0:pix_th=0.1',
+                 '-an', '-f', 'null', '/dev/null'],
+                capture_output=True, text=True,
+            )
+            for line in out.stderr.splitlines():
+                if 'black_start:0' in line and 'black_end:' in line:
+                    for part in line.split():
+                        if part.startswith('black_end:'):
+                            return float(part.split(':')[1])
+        except Exception:
+            pass
+    return 0.0
 
 
 COLORS = [
@@ -326,6 +389,15 @@ def api_videos():
         }
         for v in sorted(track_counts)
     ])
+
+
+@app.route("/api/video/<video_name>/detections")
+def api_video_detections(video_name):
+    return jsonify({
+        "fps":            get_proxy_fps(video_name),
+        "black_duration": get_black_frame_offset(video_name),
+        "detections":     DETECTIONS_CACHE.get(video_name, {}),
+    })
 
 
 @app.route("/api/video/<video_name>/tracks")

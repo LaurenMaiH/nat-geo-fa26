@@ -111,12 +111,36 @@
 
     // ── VideoPlayer ───────────────────────────────────────────────────────────
 
-    function VideoPlayer({ video, height }) {
-      const [status, setStatus] = useState('missing');
+    const CLASS_COLORS = {
+      fish:      '#60A5FA',
+      eel:       '#FBBF24',
+      shark:     '#F87171',
+      animal:    '#A78BFA',
+      jellyfish: '#F472B6',
+      crab:      '#34D399',
+    };
+
+    function getVideoRect(videoEl, canvasEl) {
+      const cw = canvasEl.width,  ch = canvasEl.height;
+      const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+      if (!vw || !vh) return { x: 0, y: 0, w: cw, h: ch };
+      const scale = Math.min(cw / vw, ch / vh);
+      const rw = vw * scale, rh = vh * scale;
+      return { x: (cw - rw) / 2, y: (ch - rh) / 2, w: rw, h: rh };
+    }
+
+    function VideoPlayer({ video, height, showAnnotations, selectedKeys, trackColorMap }) {
+      const [status,        setStatus]        = useState('missing');
+      const [detections,    setDetections]    = useState({});
+      const [fps,           setFps]           = useState(30);
+      const [blackDuration, setBlackDuration] = useState(0);
+      const videoRef = useRef(null);
+      const canvasRef = useRef(null);
 
       useEffect(() => {
         if (!video) return;
         setStatus('missing');
+        setDetections({});
         fetch(`/api/video/${video}/proxy/start`, { method: 'POST' })
           .then(r => r.json()).then(d => setStatus(d.status));
         const iv = setInterval(() => {
@@ -130,14 +154,100 @@
         return () => clearInterval(iv);
       }, [video]);
 
+      useEffect(() => {
+        if (status !== 'ready' || !video) return;
+        get(`/api/video/${video}/detections`).then(data => {
+          setFps(data.fps);
+          setBlackDuration(data.black_duration || 0);
+          setDetections(data.detections);
+        });
+      }, [status, video]);
+
+      useEffect(() => {
+        const videoEl = videoRef.current;
+        const canvasEl = canvasRef.current;
+        if (!videoEl || !canvasEl) return;
+
+        let animId;
+
+        const draw = () => {
+          canvasEl.width  = canvasEl.offsetWidth;
+          canvasEl.height = canvasEl.offsetHeight;
+          const ctx = canvasEl.getContext('2d');
+          ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+          if (!showAnnotations) return;
+
+          const currentFrame = Math.round((videoEl.currentTime - blackDuration) * fps) + 1;
+          const boxes = detections[currentFrame] || detections[String(currentFrame)] || [];
+          if (!boxes.length) return;
+
+          const rect = getVideoRect(videoEl, canvasEl);
+          boxes.forEach(box => {
+            const isSelected = selectedKeys && selectedKeys.has(`${video}__${box.track_id}`);
+            const color = (trackColorMap && trackColorMap[String(box.track_id)]) || '#6B7280';
+            const bx = rect.x + box.x * rect.w;
+            const by = rect.y + box.y * rect.h;
+            const bw = box.w * rect.w;
+            const bh = box.h * rect.h;
+
+            ctx.lineWidth   = isSelected ? 3 : 1.5;
+            ctx.strokeStyle = isSelected ? '#FFFFFF' : color;
+            if (isSelected) { ctx.shadowBlur = 8; ctx.shadowColor = color; }
+            ctx.strokeRect(bx, by, bw, bh);
+            ctx.shadowBlur = 0;
+
+            const label  = `#${box.track_id}`;
+            ctx.font     = '10px monospace';
+            const tw     = ctx.measureText(label).width;
+            const labelY = by > 14 ? by - 1 : by + bh + 13;
+            ctx.fillStyle = isSelected ? '#FFFFFF' : color;
+            ctx.fillRect(bx, labelY - 12, tw + 4, 13);
+            ctx.fillStyle = '#000';
+            ctx.fillText(label, bx + 2, labelY - 1);
+          });
+        };
+
+        const loop = () => { draw(); animId = requestAnimationFrame(loop); };
+        const startLoop = () => { animId = requestAnimationFrame(loop); };
+        const stopLoop  = () => cancelAnimationFrame(animId);
+
+        const onPlay   = () => startLoop();
+        const onPause  = () => { stopLoop(); draw(); };
+        const onSeeked = () => draw();
+        const onEnded  = () => { stopLoop(); draw(); };
+
+        videoEl.addEventListener('play',   onPlay);
+        videoEl.addEventListener('pause',  onPause);
+        videoEl.addEventListener('seeked', onSeeked);
+        videoEl.addEventListener('ended',  onEnded);
+
+        if (!videoEl.paused) startLoop(); else draw();
+
+        return () => {
+          stopLoop();
+          videoEl.removeEventListener('play',   onPlay);
+          videoEl.removeEventListener('pause',  onPause);
+          videoEl.removeEventListener('seeked', onSeeked);
+          videoEl.removeEventListener('ended',  onEnded);
+        };
+      }, [detections, fps, blackDuration, showAnnotations, selectedKeys, trackColorMap, video]);
+
       return (
         <div className="flex-shrink-0 flex items-center justify-center border-b"
-          style={{height, backgroundColor: '#010e1e', borderColor: C.border}}>
-          {status === 'ready' ? (
-            <video key={video} src={`/api/video/${video}/proxy`}
+          style={{height, backgroundColor: '#010e1e', borderColor: C.border, position: 'relative'}}>
+          {status === 'ready' ? (<>
+            <video
+              ref={videoRef}
+              key={video}
+              src={`/api/video/${video}/proxy`}
               controls muted
-              style={{height: '100%', maxWidth: '100%', objectFit: 'contain'}} />
-          ) : (
+              style={{height: '100%', maxWidth: '100%', objectFit: 'contain'}}
+            />
+            <canvas
+              ref={canvasRef}
+              style={{position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none'}}
+            />
+          </>) : (
             <div className="flex flex-col items-center gap-2" style={{color: '#475569'}}>
               {status === 'error'
                 ? <span className="text-xs">Failed to load video</span>
@@ -1088,6 +1198,7 @@
       const [view, setView]               = useState('review');
       const [stripHeight, setStripHeight] = useState(() => Math.round(window.innerHeight / 2.5));
       const [selectedKeys, setSelectedKeys] = useState(new Set());
+      const [showAnnotations, setShowAnnotations] = useState(true);
 
       const handleSelect = useCallback(trackKey => {
         setSelectedKeys(prev => {
@@ -1345,9 +1456,13 @@
         <div className="h-screen flex items-center justify-center" style={{color: '#64748b'}}>Loading...</div>
       );
 
-      const clusters = Object.values(appState?.clusters || {});
-      const videoStatus = appState?.videos?.[video]?.status;
-      const canProcess = appState?.initialized && video && videoStatus === 'pending';
+      const clusters = Object.values(appState.clusters || {});
+      const videoStatus = appState.videos?.[video]?.status;
+      const canProcess = appState.initialized && video && videoStatus === 'pending';
+      const trackColorMap = {};
+      tracks.forEach(t => {
+        trackColorMap[t.track_id] = appState.clusters?.[t.cluster_id]?.color || '#6B7280';
+      });
       // const canApprove = video && ['pending', 'processed'].includes(videoStatus);
 
       return (
@@ -1396,6 +1511,19 @@
                   </span>
                 )}
                 <span className="ml-auto text-xs" style={{color: '#64748b'}}>{tracks.length} tracks</span>
+                {video && (
+                  <button
+                    onClick={e => { e.stopPropagation(); setShowAnnotations(v => !v); }}
+                    className="text-xs px-2 py-1 rounded transition-colors"
+                    style={{
+                      border: `1px solid ${showAnnotations ? C.accent : C.border}`,
+                      color:  showAnnotations ? C.accent : '#475569',
+                      backgroundColor: showAnnotations ? '#0d2a45' : 'transparent',
+                    }}
+                  >
+                    Annotations
+                  </button>
+                )}
                 <button
                   onClick={handleReset}
                   className="text-xs px-2 py-1 rounded transition-colors hover:bg-red-900"
@@ -1410,7 +1538,7 @@
 
               {/* Video player */}
               {video && <>
-                <VideoPlayer video={video} height={videoHeight} />
+                <VideoPlayer video={video} height={videoHeight} showAnnotations={showAnnotations} selectedKeys={selectedKeys} trackColorMap={trackColorMap} />
                 <div
                   onMouseDown={e => {
                     draggingVideo.current = true;
