@@ -1,0 +1,1787 @@
+{% raw %}
+  <script type="text/babel">
+    const { useState, useEffect, useCallback, useRef } = React;
+
+    const C = {
+      bg:     'var(--bg-base)',
+      card:   'var(--bg-surface)',
+      border: 'var(--border-subtle)',
+      hover:  'var(--accent-dim)',
+      accent: 'var(--accent)',
+    };
+
+    // ── Inline SVG icons (no CDN dependency) ─────────────────────────────────
+    const Icons = {
+      Check:        (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||12} height={p.size||12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>,
+      Circle:       (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||12} height={p.size||12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/></svg>,
+      Activity:     (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||12} height={p.size||12} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>,
+      Trash2:       (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="m19 6-.867 12.142A2 2 0 0 1 16.138 20H7.862a2 2 0 0 1-1.995-1.858L5 6m5 0V4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v2"/></svg>,
+      X:            (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>,
+      Plus:         (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>,
+      Search:       (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>,
+      ChevronRight: (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||10} height={p.size||10} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6"/></svg>,
+    };
+
+    const get  = url  => fetch(url).then(r => r.json());
+    const post = (url, body) => fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(r => r.json());
+
+    const cropUrl = trackKey => {
+      const [video, tid] = trackKey.split('__');
+      return `/api/crop/${video}/${tid}`;
+    };
+
+    // ── VideoList ─────────────────────────────────────────────────────────────
+
+    function VideoList({ videos, selected, onSelect }) {
+      const approved = videos.filter(v => v.status === 'approved').length;
+      return (
+        <div className="flex flex-col flex-shrink-0 overflow-hidden border-r" style={{width: 220, backgroundColor: C.card, borderColor: C.border}}>
+          <div className="px-3 py-2.5 flex items-center justify-between border-b" style={{borderColor: C.border}}>
+            <span className="label-caps">Video Queue</span>
+            <span className="font-mono text-[10px]" style={{color: 'var(--text-faint)'}}>{approved}/{videos.length}</span>
+          </div>
+          <div className="overflow-y-auto flex-1">
+            {videos.map(v => {
+              const isSel = selected === v.name;
+              return (
+                <button
+                  key={v.name}
+                  onClick={() => onSelect(v.name)}
+                  className="w-full text-left px-3 py-2 transition-colors"
+                  style={{
+                    backgroundColor: isSel ? 'var(--bg-surface-2)' : 'transparent',
+                    borderLeft: isSel ? '3px solid var(--accent)' : '3px solid transparent',
+                  }}
+                >
+                  <div className="flex items-center gap-2">
+                    <span style={{color: v.status === 'approved' ? 'var(--success)' : v.status === 'processed' ? C.accent : 'var(--text-faint)', display: 'inline-flex', alignItems: 'center'}}>
+                      {v.status === 'approved' ? <Icons.Check size={11}/> : v.status === 'processed' ? <Icons.Activity size={11}/> : <Icons.Circle size={11}/>}
+                    </span>
+                    <span className="truncate text-[13px] font-medium" style={{color: isSel ? 'var(--text-primary)' : 'var(--text-secondary)'}}>{v.name}</span>
+                  </div>
+                  <div className="ml-[19px] font-mono text-[11px]" style={{color: 'var(--text-faint)'}}>{v.track_count} tracks</div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    // ── CropViewer ────────────────────────────────────────────────────────────
+
+    function CropViewer({ trackKey, onClose }) {
+      useEffect(() => {
+        const onKey = e => { if (e.key === 'Escape') onClose(); };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [onClose]);
+
+      return (
+        <div
+          className="fixed inset-0 flex flex-col items-center justify-center modal-backdrop"
+          style={{backgroundColor: 'var(--bg-overlay)', backdropFilter: 'blur(8px)', zIndex: 60}}
+          onClick={onClose}
+        >
+          <div
+            className="flex flex-col items-center gap-3"
+            onClick={e => e.stopPropagation()}
+          >
+            <img
+              src={cropUrl(trackKey)}
+              alt={trackKey}
+              className="rounded-lg"
+              style={{maxWidth: '80vw', maxHeight: '80vh', objectFit: 'contain', boxShadow: 'var(--shadow-modal)'}}
+            />
+            <span className="font-mono text-[11px]" style={{color: 'var(--text-muted)'}}>{trackKey}</span>
+          </div>
+          <button onClick={onClose} className="btn-icon absolute top-4 right-5" style={{padding: '8px'}}>
+            <Icons.X size={18}/>
+          </button>
+        </div>
+      );
+    }
+
+    // ── VideoPlayer ───────────────────────────────────────────────────────────
+
+    const CLASS_COLORS = {
+      fish:      '#60A5FA',
+      eel:       '#FBBF24',
+      shark:     '#F87171',
+      animal:    '#A78BFA',
+      jellyfish: '#F472B6',
+      crab:      '#34D399',
+    };
+
+    function getVideoRect(videoEl, canvasEl) {
+      const cw = canvasEl.width,  ch = canvasEl.height;
+      const vw = videoEl.videoWidth, vh = videoEl.videoHeight;
+      if (!vw || !vh) return { x: 0, y: 0, w: cw, h: ch };
+      const scale = Math.min(cw / vw, ch / vh);
+      const rw = vw * scale, rh = vh * scale;
+      return { x: (cw - rw) / 2, y: (ch - rh) / 2, w: rw, h: rh };
+    }
+
+    function VideoPlayer({ video, height, showAnnotations, selectedKeys, trackColorMap, visibleClusterIds, trackToCluster }) {
+      const [status,        setStatus]        = useState('missing');
+      const [detections,    setDetections]    = useState({});
+      const [fps,           setFps]           = useState(30);
+      const [blackDuration, setBlackDuration] = useState(0);
+      const videoRef = useRef(null);
+      const canvasRef = useRef(null);
+
+      useEffect(() => {
+        if (!video) return;
+        setStatus('missing');
+        setDetections({});
+        fetch(`/api/video/${video}/proxy/start`, { method: 'POST' })
+          .then(r => r.json()).then(d => setStatus(d.status));
+        const iv = setInterval(() => {
+          fetch(`/api/video/${video}/proxy-status`)
+            .then(r => r.json())
+            .then(d => {
+              setStatus(d.status);
+              if (d.status === 'ready' || d.status === 'error') clearInterval(iv);
+            });
+        }, 3000);
+        return () => clearInterval(iv);
+      }, [video]);
+
+      useEffect(() => {
+        if (status !== 'ready' || !video) return;
+        get(`/api/video/${video}/detections`).then(data => {
+          setFps(data.fps);
+          setBlackDuration(data.black_duration || 0);
+          setDetections(data.detections);
+        });
+      }, [status, video]);
+
+      useEffect(() => {
+        const videoEl = videoRef.current;
+        const canvasEl = canvasRef.current;
+        if (!videoEl || !canvasEl) return;
+
+        let animId;
+
+        const draw = () => {
+          canvasEl.width  = canvasEl.offsetWidth;
+          canvasEl.height = canvasEl.offsetHeight;
+          const ctx = canvasEl.getContext('2d');
+          ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
+          if (!showAnnotations) return;
+
+          const currentFrame = Math.round((videoEl.currentTime - blackDuration) * fps) + 1;
+          const boxes = detections[currentFrame] || detections[String(currentFrame)] || [];
+          if (!boxes.length) return;
+
+          const rect = getVideoRect(videoEl, canvasEl);
+          boxes.forEach(box => {
+            if (visibleClusterIds && trackToCluster) {
+              const cid = trackToCluster[String(box.track_id)];
+              if (cid !== undefined && !visibleClusterIds.has(cid)) return;
+            }
+            const isSelected = selectedKeys && selectedKeys.has(`${video}__${box.track_id}`);
+            const color = (trackColorMap && trackColorMap[String(box.track_id)]) || '#6B7280';
+            const bx = rect.x + box.x * rect.w;
+            const by = rect.y + box.y * rect.h;
+            const bw = box.w * rect.w;
+            const bh = box.h * rect.h;
+
+            ctx.lineWidth   = isSelected ? 3 : 1.5;
+            ctx.strokeStyle = isSelected ? '#FFFFFF' : color;
+            if (isSelected) { ctx.shadowBlur = 8; ctx.shadowColor = color; }
+            ctx.strokeRect(bx, by, bw, bh);
+            ctx.shadowBlur = 0;
+
+            const label  = `#${box.track_id}`;
+            ctx.font     = '10px monospace';
+            const tw     = ctx.measureText(label).width;
+            const labelY = by > 14 ? by - 1 : by + bh + 13;
+            ctx.fillStyle = isSelected ? '#FFFFFF' : color;
+            ctx.fillRect(bx, labelY - 12, tw + 4, 13);
+            ctx.fillStyle = '#000';
+            ctx.fillText(label, bx + 2, labelY - 1);
+          });
+        };
+
+        const loop = () => { draw(); animId = requestAnimationFrame(loop); };
+        const startLoop = () => { animId = requestAnimationFrame(loop); };
+        const stopLoop  = () => cancelAnimationFrame(animId);
+
+        const onPlay   = () => startLoop();
+        const onPause  = () => { stopLoop(); draw(); };
+        const onSeeked = () => draw();
+        const onEnded  = () => { stopLoop(); draw(); };
+
+        videoEl.addEventListener('play',   onPlay);
+        videoEl.addEventListener('pause',  onPause);
+        videoEl.addEventListener('seeked', onSeeked);
+        videoEl.addEventListener('ended',  onEnded);
+
+        if (!videoEl.paused) startLoop(); else draw();
+
+        return () => {
+          stopLoop();
+          videoEl.removeEventListener('play',   onPlay);
+          videoEl.removeEventListener('pause',  onPause);
+          videoEl.removeEventListener('seeked', onSeeked);
+          videoEl.removeEventListener('ended',  onEnded);
+        };
+      }, [detections, fps, blackDuration, showAnnotations, selectedKeys, trackColorMap, visibleClusterIds, trackToCluster, video]);
+
+      return (
+        <div className="flex items-center justify-center"
+          style={{height, flex: 1, minWidth: 0, backgroundColor: '#010e1e', position: 'relative'}}>
+          {status === 'ready' ? (<>
+            <video
+              ref={videoRef}
+              key={video}
+              src={`/api/video/${video}/proxy`}
+              controls muted
+              style={{height: '100%', maxWidth: '100%', objectFit: 'contain'}}
+            />
+            <canvas
+              ref={canvasRef}
+              style={{position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', pointerEvents: 'none'}}
+            />
+          </>) : (
+            <div className="flex flex-col items-center gap-2" style={{color: 'var(--text-faint)'}}>
+              {status === 'error'
+                ? <span className="text-xs">Failed to load video</span>
+                : <>
+                    <svg className="animate-spin" style={{width:16,height:16,color:C.accent}} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                      <circle style={{opacity:0.25}} cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                      <path style={{opacity:0.75}} fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                    </svg>
+                    <span className="text-xs">{status === 'generating' ? 'Generating proxy…' : 'Loading…'}</span>
+                  </>
+              }
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── ClusterFilterPanel ────────────────────────────────────────────────────
+
+    function ClusterFilterPanel({ clusters, tracks, visibleClusterIds, onToggle, onToggleAll }) {
+      const countByCluster = {};
+      tracks.forEach(t => { countByCluster[t.cluster_id] = (countByCluster[t.cluster_id] || 0) + 1; });
+
+      const videoClusters = clusters.filter(c => countByCluster[c.id] > 0);
+      if (videoClusters.length === 0) return null;
+
+      const allVisible = videoClusters.every(c => visibleClusterIds.has(c.id));
+
+      return (
+        <div className="flex flex-col flex-shrink-0 overflow-hidden"
+          style={{width: 220, backgroundColor: '#010e1e', paddingLeft: 12}}>
+          <div className="flex items-center justify-between px-3 py-2.5 border-b flex-shrink-0"
+            style={{borderColor: C.border}}>
+            <span className="text-[13px] font-semibold uppercase tracking-wider" style={{color: 'var(--text-secondary)'}}>Show Annotations</span>
+            <button
+              onClick={e => { e.stopPropagation(); onToggleAll(allVisible); }}
+              className="btn-ghost"
+              style={{padding: '3px 10px', fontSize: 12, color: allVisible ? C.accent : 'var(--text-muted)', borderColor: allVisible ? C.accent : 'var(--border-subtle)'}}
+            >
+              {allVisible ? 'Hide All' : 'Show All'}
+            </button>
+          </div>
+          <div className="overflow-y-auto flex-1 py-1">
+            {videoClusters.map(c => {
+              const count = countByCluster[c.id] || 0;
+              const checked = visibleClusterIds.has(c.id);
+              return (
+                <div
+                  key={c.id}
+                  className="flex items-center gap-2 px-3 py-2 cursor-pointer select-none"
+                  style={{opacity: checked ? 1 : 0.4}}
+                  onClick={e => { e.stopPropagation(); onToggle(c.id); }}
+                >
+                  <div
+                    className="w-4 h-4 rounded-sm flex-shrink-0"
+                    style={{
+                      backgroundColor: checked ? c.color : 'transparent',
+                      border: `2px solid ${c.color}`,
+                      transition: 'background-color 0.1s',
+                    }}
+                  />
+                  <span className="text-[14px] truncate flex-1 min-w-0" style={{color: 'var(--text-primary)'}}>{c.name}</span>
+                  <span className="font-mono text-[13px] flex-shrink-0" style={{color: 'var(--text-faint)'}}>{count}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    }
+
+    // ── ContextMenu ───────────────────────────────────────────────────────────
+
+    function ContextMenu({ trackKey, x, y, currentClusterId, clusters, onSelect, onNewCluster, onView, onTrash, onClose }) {
+      useEffect(() => {
+        const onMouseDown = () => onClose();
+        const onKeyDown = e => { if (e.key === 'Escape') onClose(); };
+        window.addEventListener('mousedown', onMouseDown);
+        window.addEventListener('keydown', onKeyDown);
+        return () => {
+          window.removeEventListener('mousedown', onMouseDown);
+          window.removeEventListener('keydown', onKeyDown);
+        };
+      }, [onClose]);
+
+      const menuW = 196, itemH = 32, headerH = 34;
+      const totalH = itemH + 9 + itemH + 9 + headerH + clusters.length * itemH + 9 + itemH + 8;
+      const left = Math.min(x, window.innerWidth  - menuW - 8);
+      const top  = Math.min(y, window.innerHeight - totalH - 8);
+
+      return (
+        <div
+          className="fixed z-50 rounded-lg shadow-2xl py-1"
+          style={{left, top, width: menuW, backgroundColor: 'var(--bg-surface-2)', border: `1px solid var(--border-moderate)`}}
+          onMouseDown={e => e.stopPropagation()}
+        >
+          <button
+            onClick={() => { onView(trackKey); onClose(); }}
+            className="w-full flex items-center gap-2 px-3 text-xs text-left transition-colors hover:bg-slate-800"
+            style={{height: itemH, color: 'var(--text-secondary)'}}
+          >
+            <Icons.Search size={12}/>
+            <span>View crop</span>
+          </button>
+          <button
+            onClick={() => { onTrash(trackKey); onClose(); }}
+            className="w-full flex items-center gap-2 px-3 text-xs text-left transition-colors hover:bg-red-900"
+            style={{height: itemH, color: 'var(--error)'}}
+          >
+            <Icons.Trash2 size={12}/>
+            <span>Move to trash</span>
+          </button>
+          <div style={{borderTop: `1px solid var(--border-subtle)`, margin: '4px 0'}} />
+          <div className="px-3 py-1.5 label-caps">
+            Move to cluster
+          </div>
+          {clusters.map(cluster => (
+            <button
+              key={cluster.id}
+              onClick={() => { onSelect(trackKey, cluster.id); onClose(); }}
+              className="w-full flex items-center gap-2 px-3 text-xs text-left transition-colors hover:bg-slate-800"
+              style={{height: itemH, backgroundColor: cluster.id === currentClusterId ? 'var(--border-subtle)' : 'transparent'}}
+            >
+              <div className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{backgroundColor: cluster.color}} />
+              <span className="truncate flex-1">{cluster.name}</span>
+              {cluster.id === currentClusterId && <span style={{color: 'var(--text-muted)', display:'inline-flex'}}><Icons.Check size={11}/></span>}
+            </button>
+          ))}
+          <div style={{borderTop: `1px solid var(--border-subtle)`, margin: '4px 0'}} />
+          <button
+            onClick={() => { onNewCluster(trackKey); onClose(); }}
+            className="w-full flex items-center gap-2 px-3 text-xs text-left transition-colors hover:bg-slate-800"
+            style={{height: itemH, color: C.accent}}
+          >
+            <Icons.Plus size={12}/>
+            <span>New cluster</span>
+          </button>
+        </div>
+      );
+    }
+
+    // ── CropCard ──────────────────────────────────────────────────────────────
+
+    function CropCard({ trackKey, clusterId, color, compact, onContextMenu, selected, onSelect, selectedKeys, onDrop }) {
+      const [dragOver, setDragOver] = React.useState(false);
+      return (
+        <div
+          draggable
+          onDragStart={e => {
+            e.dataTransfer.setData('trackKeys', JSON.stringify([trackKey]));
+          }}
+          onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={e => {
+            e.preventDefault(); e.stopPropagation(); setDragOver(false);
+            if (!onDrop || !clusterId) return;
+            const keys = JSON.parse(e.dataTransfer.getData('trackKeys') || '[]');
+            if (keys.length) onDrop(keys, clusterId);
+          }}
+          onClick={e => { e.stopPropagation(); onSelect && onSelect(trackKey); }}
+          onContextMenu={e => { e.preventDefault(); if (onContextMenu) onContextMenu(trackKey, e.clientX, e.clientY); }}
+          className="flex-shrink-0 rounded overflow-hidden"
+          style={{
+            border: `2px solid ${dragOver ? (color || C.accent) : (selected ? '#fff' : (color || 'var(--text-faint)'))}`,
+            boxShadow: dragOver ? `0 0 0 3px ${color || C.accent}` : (selected ? `0 0 0 2px ${color || C.accent}` : 'none'),
+            width: compact ? 90 : 96,
+            cursor: 'grab',
+          }}
+          title={trackKey}
+        >
+          <img
+            src={cropUrl(trackKey)}
+            alt={trackKey}
+            draggable={false}
+            style={{width: '100%', height: compact ? 69 : 76, objectFit: 'cover', display: 'block'}}
+            onError={e => { e.target.style.background = 'var(--bg-surface-3)'; e.target.style.height = compact ? '69px' : '76px'; }}
+          />
+          {!compact && (
+            <div className="px-1 py-0.5 font-mono text-[10px] truncate" style={{backgroundColor: 'var(--border-subtle)', color: 'var(--text-secondary)'}}>
+              {trackKey.split('__')[1]}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── ClusterRow ────────────────────────────────────────────────────────────
+
+    function ClusterRow({ cluster, tracks, onContextMenu, onDrop, selectedKeys, onSelect }) {
+      const [over, setOver] = useState(false);
+      const [expanded, setExpanded] = useState(false);
+      const initialized = useRef(false);
+
+      useEffect(() => {
+        if (!initialized.current && tracks.length > 0) {
+          initialized.current = true;
+          setExpanded(true);
+        }
+      }, [tracks]);
+
+      return (
+        <div
+          className="flex-shrink-0 border-b"
+          style={{borderColor: C.border}}
+          onDragOver={e => { e.preventDefault(); setOver(true); }}
+          onDragLeave={() => setOver(false)}
+          onDrop={e => {
+            e.preventDefault(); setOver(false);
+            const keys = JSON.parse(e.dataTransfer.getData('trackKeys') || '[]');
+            if (keys.length) onDrop(keys, cluster.id);
+          }}
+        >
+          <div
+            className="flex items-center gap-2 px-3 py-1.5 cursor-pointer select-none"
+            style={{
+              borderLeft: `3px solid ${over ? cluster.color : 'transparent'}`,
+              backgroundColor: over ? `${cluster.color}10` : 'transparent',
+              transition: 'background-color 0.15s, border-color 0.15s',
+            }}
+            onClick={() => setExpanded(e => !e)}
+          >
+            <span style={{
+              color: 'var(--text-faint)',
+              display: 'inline-flex',
+              transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
+              transition: 'transform 0.15s',
+            }}><Icons.ChevronRight size={10}/></span>
+            <div className="w-2 h-2 rounded-full flex-shrink-0" style={{backgroundColor: cluster.color}} />
+            <span className="text-[13px] font-semibold" style={{color: 'var(--text-secondary)'}}>{cluster.name}</span>
+            <span className="font-mono text-[11px]" style={{color: 'var(--text-faint)'}}>{tracks.length}</span>
+          </div>
+          {expanded && (
+            <div
+              className="flex flex-wrap gap-2 px-3 pb-2"
+              style={{minHeight: 64}}
+            >
+              {tracks.length === 0
+                ? <span className="text-xs self-center" style={{color: 'var(--text-ghost)'}}>Drop tracks here</span>
+                : tracks.map(t => (
+                    <CropCard key={t.track_key} trackKey={t.track_key} clusterId={cluster.id} color={cluster.color} compact={true}
+                      selected={selectedKeys?.has(t.track_key)} onSelect={onSelect} selectedKeys={selectedKeys}
+                      onContextMenu={(key, x, y) => onContextMenu(key, x, y, cluster.id)} onDrop={onDrop} />
+                  ))
+              }
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── NewClusterRow ─────────────────────────────────────────────────────────
+
+    function NewClusterRow({ onDrop }) {
+      const [over, setOver] = useState(false);
+      return (
+        <div
+          className="flex-shrink-0 border-b"
+          style={{borderColor: C.border}}
+          onDragOver={e => { e.preventDefault(); setOver(true); }}
+          onDragLeave={() => setOver(false)}
+          onDrop={e => {
+            e.preventDefault(); setOver(false);
+            const keys = JSON.parse(e.dataTransfer.getData('trackKeys') || '[]');
+            if (keys.length) onDrop(keys);
+          }}
+        >
+          <div
+            className={`flex items-center gap-2 px-3 mx-2 my-1.5 rounded new-cluster-zone${over ? ' over' : ''}`}
+            style={{minHeight: 48}}
+          >
+            <Icons.Plus size={14}/>
+            <span className="text-xs font-semibold">New Cluster</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ── TrashCard ─────────────────────────────────────────────────────────────
+
+    function TrashCard({ trash, onClick }) {
+      const { track_keys = [] } = trash;
+      const count = track_keys.length;
+      const preview = count > 0 ? track_keys[track_keys.length - 1] : null;
+
+      return (
+        <div
+          onClick={onClick}
+          className="cluster-card rounded-lg p-3 cursor-pointer"
+          style={{
+            backgroundColor: C.card,
+            border: `2px solid ${count > 0 ? 'var(--error-border)' : C.border}`,
+            boxShadow: 'var(--shadow-card)',
+          }}
+        >
+          <div className="flex items-center gap-2 mb-2">
+            <span style={{color: count > 0 ? 'var(--error)' : 'var(--text-muted)', display: 'inline-flex'}}>
+              <Icons.Trash2 size={14}/>
+            </span>
+            <span className="text-[13px] font-semibold truncate" style={{color: 'var(--text-primary)'}}>Trash</span>
+            <span className="ml-auto font-mono text-[10px] flex-shrink-0 px-1.5 py-0.5 rounded-full" style={{backgroundColor: 'var(--bg-surface-3)', color: count > 0 ? 'var(--error)' : 'var(--text-muted)'}}>{count}</span>
+          </div>
+          {preview ? (
+            <img
+              src={cropUrl(preview)}
+              alt="trash preview"
+              className="w-full rounded"
+              style={{height: 72, objectFit: 'cover', opacity: 0.5}}
+              onError={e => { e.target.style.display = 'none'; }}
+            />
+          ) : (
+            <div className="w-full rounded flex items-center justify-center" style={{height: 72, backgroundColor: C.bg, opacity: 0.18}}>
+              <Icons.Trash2 size={28}/>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // ── ClusterCard ───────────────────────────────────────────────────────────
+
+    function ClusterCard({ cluster, onClick, onDrop, onRename }) {
+      const [over, setOver] = useState(false);
+      const [editing, setEditing] = useState(false);
+      const [name, setName] = useState(cluster.name);
+
+      useEffect(() => { setName(cluster.name); }, [cluster.name]);
+
+      const submitRename = () => {
+        setEditing(false);
+        const trimmed = name.trim();
+        if (trimmed && trimmed !== cluster.name) onRename(cluster.id, trimmed);
+        else setName(cluster.name);
+      };
+
+      return (
+        <div
+          onClick={() => !editing && onClick(cluster.id)}
+          onDragOver={e => { e.preventDefault(); setOver(true); }}
+          onDragLeave={() => setOver(false)}
+          onDrop={e => { e.preventDefault(); setOver(false); const keys = JSON.parse(e.dataTransfer.getData('trackKeys') || '[]'); if (keys.length) onDrop(keys, cluster.id); }}
+          className="cluster-card rounded-lg p-3 cursor-pointer"
+          style={{
+            backgroundColor: C.card,
+            border: `2px solid ${over ? cluster.color : 'var(--border-subtle)'}`,
+            boxShadow: over ? `0 0 20px ${cluster.color}40` : 'var(--shadow-card)',
+          }}
+        >
+          <div className="flex items-center gap-2 mb-2">
+            <div className="w-3 h-3 rounded-full flex-shrink-0" style={{backgroundColor: cluster.color}} />
+            {editing ? (
+              <input
+                autoFocus
+                className="bg-transparent text-[13px] font-semibold outline-none border-b flex-1 min-w-0"
+                style={{color: 'var(--text-primary)', borderColor: 'var(--border-moderate)'}}
+                value={name}
+                onChange={e => setName(e.target.value)}
+                onBlur={submitRename}
+                onKeyDown={e => {
+                  if (e.key === 'Enter') submitRename();
+                  if (e.key === 'Escape') { setName(cluster.name); setEditing(false); }
+                }}
+                onClick={e => e.stopPropagation()}
+              />
+            ) : (
+              <span
+                className="text-[13px] font-semibold truncate"
+                style={{color: 'var(--text-primary)'}}
+                onDoubleClick={e => { e.stopPropagation(); setEditing(true); }}
+                title="Double-click to rename"
+              >{cluster.name}</span>
+            )}
+            <span className="ml-auto font-mono text-[10px] flex-shrink-0 px-1.5 py-0.5 rounded-full" style={{backgroundColor: 'var(--bg-surface-3)', color: 'var(--text-faint)'}}>{cluster.track_keys.length}</span>
+          </div>
+          {cluster.representative && (
+            <img
+              src={cropUrl(cluster.representative)}
+              alt="representative"
+              className="w-full rounded"
+              style={{height: 72, objectFit: 'cover'}}
+              onError={e => { e.target.style.display = 'none'; }}
+            />
+          )}
+        </div>
+      );
+    }
+
+    // ── ClusterModal ──────────────────────────────────────────────────────────
+
+    function ClusterModal({ cluster, onClose, onDrop, onRename, onContextMenu, dimmed, selectedKeys, onSelect }) {
+      const [name, setName] = useState(cluster.name);
+
+      const submitRename = () => { if (name !== cluster.name) onRename(cluster.id, name); };
+
+      const byVideo = {};
+      cluster.track_keys.forEach(key => {
+        const vid = key.split('__')[0];
+        (byVideo[vid] = byVideo[vid] || []).push(key);
+      });
+      const videoNames = Object.keys(byVideo).sort();
+
+      return (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center modal-backdrop"
+          style={{backgroundColor: 'var(--bg-overlay)', backdropFilter: 'blur(6px)'}}
+          onClick={onClose}
+        >
+          <div
+            className="modal-content rounded-xl p-5 mx-6 overflow-y-auto relative"
+            style={{backgroundColor: 'var(--bg-surface-2)', border: `2px solid ${cluster.color}`, maxWidth: 820, width: '100%', maxHeight: '85vh', boxShadow: 'var(--shadow-modal)'}}
+            onClick={e => e.stopPropagation()}
+            onDragOver={e => e.preventDefault()}
+            onDrop={e => { e.preventDefault(); const keys = JSON.parse(e.dataTransfer.getData('trackKeys') || '[]'); if (keys.length) onDrop(keys, cluster.id); }}
+          >
+            {dimmed && (
+              <div className="absolute inset-0 rounded-xl" style={{backgroundColor: 'rgba(0,0,0,0.2)', zIndex: 1}} />
+            )}
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-4 h-4 rounded-full flex-shrink-0" style={{backgroundColor: cluster.color}} />
+              <input
+                className="bg-transparent text-lg font-semibold outline-none border-b flex-1"
+                style={{color: 'var(--text-primary)', borderColor: 'var(--border-moderate)'}}
+                value={name}
+                onChange={e => setName(e.target.value)}
+                onBlur={submitRename}
+                onKeyDown={e => e.key === 'Enter' && submitRename()}
+              />
+              <span className="font-mono text-[12px]" style={{color: 'var(--text-muted)'}}>({cluster.track_keys.length} tracks)</span>
+              <button onClick={onClose} className="btn-icon ml-1">
+                <Icons.X size={16}/>
+              </button>
+            </div>
+            {videoNames.map(videoName => (
+              <div key={videoName} className="mb-5">
+                <div className="font-mono text-[11px] font-semibold mb-2 pb-1 border-b truncate" style={{color: 'var(--text-muted)', borderColor: C.border}}>
+                  {videoName}
+                  <span className="ml-2 font-normal" style={{color: 'var(--text-ghost)'}}>{byVideo[videoName].length}</span>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {byVideo[videoName].map(key => (
+                    <CropCard key={key} trackKey={key} clusterId={cluster.id} color={cluster.color} compact={false}
+                      selected={selectedKeys?.has(key)} onSelect={onSelect} selectedKeys={selectedKeys}
+                      onContextMenu={(k, x, y) => onContextMenu(k, x, y, cluster.id)} onDrop={onDrop} />
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ── TrashModal ────────────────────────────────────────────────────────────
+
+    function TrashModal({ trash, onClose, onRestore, onDelete }) {
+      const { track_keys = [], metadata = {} } = trash;
+      const [selected, setSelected] = useState(new Set());
+
+      const toggleSelect = key => {
+        setSelected(prev => {
+          const next = new Set(prev);
+          if (next.has(key)) next.delete(key); else next.add(key);
+          return next;
+        });
+      };
+
+      const byCluster = {};
+      track_keys.forEach(key => {
+        const meta = metadata[key] || {};
+        const label = meta.source_cluster_name || meta.source_cluster_id || 'Unknown';
+        (byCluster[label] = byCluster[label] || []).push(key);
+      });
+      const clusterLabels = Object.keys(byCluster).sort();
+
+      const selCount = selected.size;
+      const targets = selCount > 0 ? [...selected] : [];
+
+      const handleRestore = () => {
+        onRestore(targets);
+        setSelected(new Set());
+      };
+
+      const handleDelete = () => {
+        if (!window.confirm(`Permanently delete ${selCount} crop(s)? This cannot be undone.`)) return;
+        onDelete(targets);
+        setSelected(new Set());
+      };
+
+      const allSelected = track_keys.length > 0 && selected.size === track_keys.length;
+
+      const handleSelectAll = () => {
+        setSelected(allSelected ? new Set() : new Set(track_keys));
+      };
+
+      return (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center modal-backdrop"
+          style={{backgroundColor: 'var(--bg-overlay)', backdropFilter: 'blur(6px)'}}
+          onClick={onClose}
+        >
+          <div
+            className="modal-content rounded-xl p-5 mx-6 overflow-y-auto relative"
+            style={{backgroundColor: 'var(--bg-surface-2)', border: '2px solid var(--error-border)', maxWidth: 820, width: '100%', maxHeight: '85vh', boxShadow: 'var(--shadow-modal)'}}
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-3 mb-3">
+              <span style={{color: 'var(--error)', display: 'inline-flex'}}><Icons.Trash2 size={16}/></span>
+              <span className="text-lg font-semibold" style={{color: 'var(--text-primary)'}}>Trash</span>
+              <span className="font-mono text-[12px]" style={{color: 'var(--text-muted)'}}>({track_keys.length} item{track_keys.length !== 1 ? 's' : ''})</span>
+              <div className="ml-auto flex items-center gap-2">
+                {track_keys.length > 0 && (
+                  <button onClick={handleSelectAll} className="btn-secondary" style={{padding: '3px 10px', fontSize: 11}}>
+                    {allSelected ? 'Deselect All' : 'Select All'}
+                  </button>
+                )}
+                <button onClick={onClose} className="btn-icon ml-1">
+                  <Icons.X size={16}/>
+                </button>
+              </div>
+            </div>
+
+            {track_keys.length > 0 && (
+              <div className="flex items-center gap-2 mb-4 px-3 py-2 rounded" style={{backgroundColor: C.bg}}>
+                <span className="text-xs" style={{color: 'var(--text-muted)'}}>
+                  {selCount === 0 ? 'Click crops to select' : `${selCount} selected`}
+                </span>
+                <div className="ml-auto flex gap-2">
+                  <button onClick={handleRestore} disabled={selCount === 0} className="btn-secondary" style={{padding: '3px 10px', fontSize: 11}}>
+                    Restore
+                  </button>
+                  <button onClick={handleDelete} disabled={selCount === 0} className="btn-danger" style={{padding: '3px 10px', fontSize: 11}}>
+                    Delete Forever
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {track_keys.length === 0 ? (
+              <div className="flex items-center justify-center py-16" style={{color: 'var(--text-ghost)'}}>
+                <span className="text-sm">Trash is empty</span>
+              </div>
+            ) : (
+              clusterLabels.map(label => (
+                <div key={label} className="mb-6">
+                  <div className="font-mono text-[11px] font-semibold mb-2 pb-1 border-b" style={{color: 'var(--text-muted)', borderColor: C.border}}>
+                    From: {label}
+                    <span className="ml-2 font-normal" style={{color: 'var(--text-ghost)'}}>{byCluster[label].length}</span>
+                  </div>
+                  <div className="flex flex-wrap gap-3">
+                    {byCluster[label].map(key => {
+                      const isSel = selected.has(key);
+                      return (
+                      <div
+                        key={key}
+                        onClick={() => toggleSelect(key)}
+                        className="rounded overflow-hidden"
+                        style={{
+                          border: `2px solid ${isSel ? '#fff' : 'var(--error-border)'}`,
+                          boxShadow: isSel ? '0 0 0 2px var(--error)' : 'none',
+                          width: 96,
+                          cursor: 'pointer',
+                        }}
+                        title={key}
+                      >
+                        <img
+                          src={cropUrl(key)}
+                          alt={key}
+                          draggable={false}
+                          style={{width: '100%', height: 76, objectFit: 'cover', display: 'block'}}
+                          onError={e => { e.target.style.background = 'var(--bg-surface-3)'; e.target.style.height = '76px'; }}
+                        />
+                        <div className="px-1 py-0.5 font-mono text-[10px] truncate" style={{backgroundColor: 'var(--border-subtle)', color: 'var(--text-secondary)'}}>
+                          {key.split('__')[1]}
+                        </div>
+                      </div>
+                    );
+                    })}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── InitPanel ─────────────────────────────────────────────────────────────
+
+    function InitPanel({ videos, onInitialize }) {
+      const [seedVideo, setSeed] = useState('');
+      const [minClusterSize, setMCS] = useState(2);
+      const [minSamples, setMS] = useState(1);
+      const [cosineThreshold, setCT] = useState(0.25);
+      const [loading, setLoading] = useState(false);
+
+      const inputStyle = {
+        backgroundColor: 'var(--bg-surface-3)',
+        border: `1px solid var(--border-moderate)`,
+        color: 'var(--text-primary)',
+        borderRadius: 'var(--radius-md)',
+        padding: '6px 10px',
+        width: '100%',
+      };
+
+      const submit = async () => {
+        setLoading(true);
+        try { await onInitialize({seed_video: seedVideo, min_cluster_size: minClusterSize, min_samples: minSamples, cosine_threshold: cosineThreshold}); }
+        finally { setLoading(false); }
+      };
+
+      return (
+        <div className="flex-1 flex items-center justify-center p-6">
+          <div className="w-full max-w-sm rounded-xl p-8 space-y-5" style={{backgroundColor: C.card, border: `1px solid var(--border-subtle)`, boxShadow: 'var(--shadow-elevated)'}}>
+            <h2 className="text-lg font-semibold" style={{color: 'var(--text-primary)'}}>Initialize Clustering</h2>
+
+            <div>
+              <label className="block label-caps mb-1.5">
+                Seed video <span style={{color: 'var(--text-faint)', textTransform: 'none', letterSpacing: 'normal', fontSize: '10px'}}>(HDBSCAN runs here first)</span>
+              </label>
+              <select style={inputStyle} value={seedVideo} onChange={e => setSeed(e.target.value)}>
+                <option value="">Select seed video...</option>
+                {videos.map(v => <option key={v.name} value={v.name}>{v.name} ({v.track_count} tracks)</option>)}
+              </select>
+            </div>
+
+            <div className="flex gap-3">
+              <div className="flex-1">
+                <label className="block label-caps mb-1.5">Min cluster size</label>
+                <input type="number" min="2" style={inputStyle} value={minClusterSize} onChange={e => setMCS(+e.target.value)} />
+              </div>
+              <div className="flex-1">
+                <label className="block label-caps mb-1.5">Min samples</label>
+                <input type="number" min="1" style={inputStyle} value={minSamples} onChange={e => setMS(+e.target.value)} />
+              </div>
+            </div>
+
+            <div>
+              <label className="flex justify-between items-center mb-1.5">
+                <span className="label-caps">Cosine threshold</span>
+                <span className="font-mono text-[13px]" style={{color: C.accent}}>{cosineThreshold.toFixed(2)}</span>
+              </label>
+              <input type="range" min="0.05" max="0.5" step="0.01"
+                value={cosineThreshold} onChange={e => setCT(+e.target.value)}
+                style={{width: '100%'}} />
+            </div>
+
+            <button
+              onClick={submit}
+              disabled={!seedVideo || loading}
+              className="btn-primary w-full"
+              style={{padding: '10px 16px'}}
+            >
+              {loading ? 'Running HDBSCAN...' : 'Initialize with HDBSCAN'}
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ── PipelineView ──────────────────────────────────────────────────────────
+
+    const STAGES = ["downloading", "resizing", "detecting", "cropping", "embedding", "done"];
+
+    function StagePip({ stage, current }) {
+      const idx    = STAGES.indexOf(stage);
+      const curIdx = STAGES.indexOf(current);
+      const done   = curIdx > idx;
+      const active = curIdx === idx;
+      return (
+        <div
+          className="px-2 py-0.5 rounded-full font-medium border"
+          style={{
+            fontSize: 10,
+            backgroundColor: done ? 'var(--success-bg)' : active ? 'var(--accent-glow)' : 'var(--bg-surface-3)',
+            borderColor:     done ? 'var(--success-border)' : active ? C.accent : 'var(--border-subtle)',
+            color:           done ? 'var(--success)' : active ? C.accent : 'var(--text-faint)',
+            transition: 'all 0.3s',
+          }}
+        >
+          {stage}
+        </div>
+      );
+    }
+
+    function PipelineView() {
+      const [status, setStatus]   = useState(null);
+      const [log, setLog]         = useState([]);
+      const [missions, setMissions] = useState([]);
+      const [config, setConfig]   = useState({
+        mission_id: '', mission_path: '', start_from: '',
+        conf_threshold: 0.15, iou_threshold: 0.70,
+        min_track_len: 3, crops_per_track: 3,
+      });
+      const logRef = useRef(null);
+
+      const refreshStatus = useCallback(async () => {
+        const [s, l] = await Promise.all([
+          fetch('/api/pipeline/status').then(r => r.json()),
+          fetch('/api/pipeline/log').then(r => r.json()),
+        ]);
+        setStatus(s);
+        setLog(l.lines || []);
+      }, []);
+
+      useEffect(() => {
+        refreshStatus();
+        fetch('/api/pipeline/missions').then(r => r.json()).then(setMissions);
+      }, []);
+
+      useEffect(() => {
+        if (!status?.running) return;
+        const id = setInterval(refreshStatus, 1500);
+        return () => clearInterval(id);
+      }, [status?.running]);
+
+      useEffect(() => {
+        if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+      }, [log]);
+
+      const handleStart = async () => {
+        if (!config.mission_id.trim()) return;
+        await post('/api/pipeline/start', config);
+        refreshStatus();
+      };
+
+      const handleStop = async () => {
+        await post('/api/pipeline/stop', {});
+        refreshStatus();
+      };
+
+      const running  = status?.running;
+      const done     = status?.current_stage === 'done';
+      const progress = status?.videos_total > 0
+        ? (status.videos_done / status.videos_total * 100).toFixed(1) : 0;
+
+      const inputSty = {
+        backgroundColor: 'var(--bg-surface-3)',
+        border: `1px solid var(--border-moderate)`,
+        color: 'var(--text-primary)',
+        borderRadius: 'var(--radius-md)',
+        padding: '5px 10px',
+        width: '100%',
+        fontFamily: 'inherit',
+        fontSize: 13,
+      };
+
+      return (
+        <div className="flex flex-1 min-h-0 overflow-hidden">
+
+          {/* ── LEFT: Config ── */}
+          <div className="flex flex-col overflow-y-auto flex-shrink-0 border-r p-5 gap-4"
+               style={{width: 300, backgroundColor: C.card, borderColor: C.border}}>
+
+            <div className="label-caps">Mission Config</div>
+
+            <div>
+              <label className="block label-caps mb-1.5">Mission ID</label>
+              <input style={inputSty} value={config.mission_id}
+                onChange={e => setConfig(p => ({...p, mission_id: e.target.value}))}
+                placeholder="e.g. PLW_dscm_33" disabled={running} />
+            </div>
+
+            <div>
+              <label className="block label-caps mb-1.5">
+                Dropbox path <span style={{color: 'var(--text-faint)', textTransform: 'none', letterSpacing: 'normal'}}>(optional)</span>
+              </label>
+              <input style={inputSty} value={config.mission_path}
+                onChange={e => setConfig(p => ({...p, mission_path: e.target.value}))}
+                placeholder="/DOEX0096_Palau/{mission_id}/Video" disabled={running} />
+            </div>
+
+            <div>
+              <label className="block label-caps mb-1.5">
+                Start from video <span style={{color: 'var(--text-faint)', textTransform: 'none', letterSpacing: 'normal'}}>(optional)</span>
+              </label>
+              <input style={inputSty} value={config.start_from}
+                onChange={e => setConfig(p => ({...p, start_from: e.target.value}))}
+                placeholder="e.g. PLW_dscm_33_c007.mp4" disabled={running} />
+            </div>
+
+            <div className="border-t pt-4" style={{borderColor: C.border}}>
+              <div className="label-caps mb-3">Detection params</div>
+
+              {[
+                {key:'conf_threshold', label:'Conf threshold', min:0.01, max:0.9, step:0.01},
+                {key:'iou_threshold',  label:'IoU threshold',  min:0.1,  max:0.9, step:0.05},
+              ].map(({key, label, min, max, step}) => (
+                <div key={key} className="mb-3">
+                  <label className="flex justify-between items-center mb-1.5">
+                    <span className="label-caps">{label}</span>
+                    <span className="font-mono text-[12px]" style={{color: C.accent}}>{config[key].toFixed(2)}</span>
+                  </label>
+                  <input type="range" min={min} max={max} step={step}
+                    value={config[key]} disabled={running}
+                    onChange={e => setConfig(p => ({...p, [key]: +e.target.value}))}
+                    style={{width:'100%'}} />
+                </div>
+              ))}
+
+              {[
+                {key:'min_track_len',   label:'Min track length', min:1, max:20},
+                {key:'crops_per_track', label:'Crops per track',  min:1, max:5},
+              ].map(({key, label, min, max}) => (
+                <div key={key} className="mb-3">
+                  <label className="block label-caps mb-1.5">{label}</label>
+                  <input type="number" min={min} max={max} style={inputSty}
+                    value={config[key]} disabled={running}
+                    onChange={e => setConfig(p => ({...p, [key]: +e.target.value}))} />
+                </div>
+              ))}
+            </div>
+
+            <button
+              onClick={running ? handleStop : handleStart}
+              disabled={!running && !config.mission_id.trim()}
+              className="w-full rounded-lg font-medium disabled:opacity-40"
+              style={{
+                padding: '10px 16px',
+                backgroundColor: running ? 'var(--error-bg)' : C.hover,
+                color: running ? 'var(--error)' : 'var(--text-primary)',
+                border: `1px solid ${running ? 'var(--error-border)' : 'var(--border-strong)'}`,
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+                fontSize: 13,
+                transition: 'background var(--transition-base)',
+              }}
+            >
+              {running ? '⏹ Stop after current video' : '▶ Start Pipeline'}
+            </button>
+
+            {missions.length > 0 && (
+              <div className="border-t pt-4" style={{borderColor: C.border}}>
+                <div className="label-caps mb-2">Processed missions</div>
+                {missions.map(m => (
+                  <div key={m.mission_id} className="flex items-center justify-between py-1.5"
+                       style={{borderBottom:`1px solid var(--border-subtle)`}}>
+                    <span className="text-[13px]" style={{color: 'var(--text-secondary)'}}>{m.mission_id}</span>
+                    <span className="font-mono text-[11px]" style={{color: 'var(--text-faint)'}}>{m.n_embeddings} emb</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* ── RIGHT: Monitor ── */}
+          <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
+
+            {/* Stats bar */}
+            <div className="flex items-center gap-0 flex-shrink-0 border-b"
+                 style={{backgroundColor: C.card, borderColor: C.border}}>
+              {status ? (<>
+                {[
+                  {label: 'Mission',    value: status.mission_id || '—', mono: true, accent: true},
+                  {label: 'Progress',   value: `${status.videos_done} / ${status.videos_total || '?'} videos`, mono: true},
+                  {label: 'Tracks',     value: status.tracks_found, mono: true},
+                  {label: 'Embeddings', value: status.embeddings_total, mono: true},
+                  ...(status.errors?.length > 0 ? [{label: 'Errors', value: status.errors.length, mono: true, err: true}] : []),
+                ].map((s, i) => (
+                  <div key={i} className="flex flex-col px-5 py-3" style={{borderRight: `1px solid var(--border-subtle)`}}>
+                    <span className="label-caps mb-1">{s.label}</span>
+                    <span className="font-mono text-[14px]" style={{color: s.err ? 'var(--error)' : s.accent ? C.accent : 'var(--text-primary)'}}>{s.value}</span>
+                  </div>
+                ))}
+                <div className="flex items-center gap-2 ml-auto px-5">
+                  <div style={{
+                    width: 8, height: 8, borderRadius: '50%',
+                    backgroundColor: running ? 'var(--success)' : done ? '#60a5fa' : 'var(--text-faint)',
+                    boxShadow: running ? '0 0 6px var(--success)' : 'none',
+                    animation: running ? 'pulse-dot 1.5s ease-in-out infinite' : 'none',
+                  }} />
+                  <span className="text-xs" style={{color: running ? 'var(--success)' : 'var(--text-muted)'}}>
+                    {running ? 'Running' : done ? 'Complete' : 'Idle'}
+                  </span>
+                </div>
+              </>) : (
+                <span className="text-sm px-5 py-3" style={{color: 'var(--text-faint)'}}>No pipeline run yet this session</span>
+              )}
+            </div>
+
+            {/* Current video + stage pip */}
+            {status?.current_video && (
+              <div className="flex items-center gap-6 px-6 py-3 flex-shrink-0 border-b"
+                   style={{backgroundColor: C.bg, borderColor: C.border}}>
+                <div>
+                  <div className="label-caps mb-1">Current video</div>
+                  <div className="font-mono text-[13px]" style={{color: 'var(--text-primary)'}}>{status.current_video}</div>
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  {STAGES.filter(s => s !== 'done').map(s => (
+                    <StagePip key={s} stage={s} current={status.current_stage || ''} />
+                  ))}
+                </div>
+                {status.frame_progress && (
+                  <div className="ml-auto flex items-center gap-3">
+                    <span className="font-mono text-[11px]" style={{color: 'var(--text-muted)'}}>
+                      {status.frame_progress.current} / {status.frame_progress.total}
+                    </span>
+                    <div style={{width:120, height:6, backgroundColor: 'var(--bg-surface-3)', borderRadius:3}}>
+                      <div style={{
+                        width: `${(status.frame_progress.current / status.frame_progress.total * 100).toFixed(1)}%`,
+                        height: '100%', backgroundColor: C.accent, borderRadius:3,
+                        transition: 'width 0.5s ease',
+                      }} />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Overall progress bar */}
+            {status?.videos_total > 0 && (
+              <div className="px-6 pt-4 flex-shrink-0">
+                <div className="flex justify-between items-center mb-2">
+                  <span className="label-caps">Overall progress</span>
+                  <span className="font-mono text-[12px]" style={{color: 'var(--text-muted)'}}>{progress}%</span>
+                </div>
+                <div style={{height: 8, backgroundColor: 'var(--bg-surface-3)', borderRadius: 'var(--radius-sm)'}}>
+                  <div style={{
+                    width: `${progress}%`, height:'100%',
+                    backgroundColor: done ? 'var(--success)' : C.accent,
+                    borderRadius: 'var(--radius-sm)',
+                    transition:'width 0.4s cubic-bezier(0.4, 0, 0.2, 1)',
+                  }} />
+                </div>
+              </div>
+            )}
+
+            {/* Error list */}
+            {status?.errors?.length > 0 && (
+              <div className="px-6 pt-3 flex-shrink-0">
+                <div className="label-caps mb-2" style={{color: 'var(--error)'}}>
+                  Errors ({status.errors.length})
+                </div>
+                <div className="rounded p-2 overflow-y-auto max-h-24"
+                     style={{backgroundColor: 'var(--error-bg)', border:`1px solid var(--error-border)`}}>
+                  {status.errors.map((e, i) => (
+                    <div key={i} className="font-mono text-[11px]" style={{color:'#fca5a5', lineHeight: 1.7}}>
+                      [{e.video}] {e.error}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Log window */}
+            <div className="flex-1 min-h-0 px-6 pt-3 pb-4 flex flex-col">
+              <div className="label-caps mb-2">Output log</div>
+              <div ref={logRef}
+                   className="flex-1 overflow-y-auto rounded p-3 font-mono"
+                   style={{backgroundColor:'#010810', border:`1px solid var(--border-subtle)`, fontSize: 12, lineHeight: 1.7}}>
+                {log.length === 0
+                  ? <span style={{color:'var(--text-ghost)'}}>No output yet. Start the pipeline to begin.</span>
+                  : log.map((line, i) => (
+                    <div key={i} style={{
+                      color: line.includes('✓') ? 'var(--success)'
+                           : line.includes('✗') || line.includes('ERROR') || line.includes('FATAL') ? 'var(--error)'
+                           : line.includes('→') ? C.accent
+                           : 'var(--text-secondary)',
+                    }}>{line}</div>
+                  ))
+                }
+              </div>
+            </div>
+
+            {/* Done banner */}
+            {done && (
+              <div className="px-6 pb-4 flex-shrink-0">
+                <div className="rounded-lg p-4 flex items-center justify-between"
+                     style={{backgroundColor:'var(--success-bg)', border:`1px solid var(--success-border)`}}>
+                  <div>
+                    <div className="font-medium text-sm" style={{color:'var(--success)'}}>Pipeline complete</div>
+                    <div className="font-mono text-[11px] mt-0.5" style={{color:'#86efac'}}>
+                      {status.videos_done} videos · {status.embeddings_total} embeddings ready
+                    </div>
+                  </div>
+                  <div className="text-xs" style={{color:'#86efac'}}>Switch to Cluster Review →</div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // ── App ───────────────────────────────────────────────────────────────────
+
+    function App() {
+      const [appState, setAppState]   = useState(null);
+      const [videos, setVideos]       = useState([]);
+      const [video, setVideo]         = useState(null);
+      const [tracks, setTracks]       = useState([]);
+      const [openCluster, setOpen]    = useState(null);
+      const [threshold, setThreshold] = useState(0.25);
+      const [loading, setLoading]     = useState(false);
+      const [contextMenu, setContextMenu] = useState(null);
+      const [cropViewer, setCropViewer]   = useState(null);
+      const [trashOpen, setTrashOpen]     = useState(false);
+      const [view, setView]               = useState('review');
+      const [stripHeight, setStripHeight] = useState(() => Math.round(window.innerHeight / 2.5));
+      const [selectedKeys, setSelectedKeys] = useState(new Set());
+      const [visibleClusterIds, setVisibleClusterIds] = useState(new Set());
+
+      useEffect(() => {
+        if (!appState?.clusters) return;
+        setVisibleClusterIds(prev => {
+          const allIds = Object.keys(appState.clusters);
+          const next = new Set(prev);
+          allIds.forEach(id => next.add(id));
+          [...next].forEach(id => { if (!appState.clusters[id]) next.delete(id); });
+          return next;
+        });
+      }, [appState?.clusters]);
+
+      const toggleClusterVisibility = useCallback(clusterId => {
+        setVisibleClusterIds(prev => {
+          const next = new Set(prev);
+          if (next.has(clusterId)) next.delete(clusterId); else next.add(clusterId);
+          return next;
+        });
+      }, []);
+
+      const toggleAllClusters = useCallback((currentlyAllVisible) => {
+        if (currentlyAllVisible) {
+          setVisibleClusterIds(new Set());
+        } else {
+          setVisibleClusterIds(new Set(Object.keys(appState?.clusters || {})));
+        }
+      }, [appState?.clusters]);
+
+      const handleSelect = useCallback(trackKey => {
+        setSelectedKeys(prev => {
+          const next = new Set(prev);
+          if (next.has(trackKey)) next.delete(trackKey); else next.add(trackKey);
+          return next;
+        });
+      }, []);
+      const clearSelection = useCallback(() => setSelectedKeys(new Set()), []);
+      const [videoHeight, setVideoHeight] = useState(300);
+      const dragging        = useRef(false);
+      const dragStartY      = useRef(0);
+      const dragStartH      = useRef(0);
+      const draggingVideo   = useRef(false);
+      const dragStartVideoY = useRef(0);
+      const dragStartVideoH = useRef(0);
+
+      useEffect(() => {
+        const onMove = e => {
+          if (dragging.current) {
+            const delta = e.clientY - dragStartY.current;
+            setStripHeight(Math.max(80, Math.min(dragStartH.current + delta, window.innerHeight - 220)));
+          }
+          if (draggingVideo.current) {
+            const delta = e.clientY - dragStartVideoY.current;
+            setVideoHeight(Math.max(300, Math.min(dragStartVideoH.current + delta, window.innerHeight - 220)));
+          }
+        };
+        const onUp = () => {
+          dragging.current = false;
+          draggingVideo.current = false;
+          document.body.style.cursor = '';
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+        return () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+      }, []);
+
+      useEffect(() => {
+        if (openCluster && appState && !appState.clusters?.[openCluster]) {
+          setOpen(null);
+        }
+      }, [appState, openCluster]);
+
+      const refresh = useCallback(async () => {
+        const [state, vids] = await Promise.all([get('/api/state'), get('/api/videos')]);
+        setAppState(state);
+        setVideos(vids);
+        return state;
+      }, []);
+
+      useEffect(() => {
+        refresh().then(s => { if (s.initialized && s.current_video) handleResume(s); });
+      }, []);
+
+      useEffect(() => {
+        if (!video) return;
+        get(`/api/video/${video}/tracks`).then(setTracks);
+      }, [video, appState]);
+
+      const handleInitialize = async params => {
+        setLoading(true);
+        try {
+          const state = await post('/api/initialize', params);
+          setAppState(state);
+          setVideos(await get('/api/videos'));
+          setVideo(params.seed_video);
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const handleResume = useCallback(async (state) => {
+        const cv = state.current_video;
+        if (!cv) return;
+        const videoStatus = state.videos?.[cv]?.status;
+        if (videoStatus === 'pending') {
+          setLoading(true);
+          setTracks([]);
+          setVideo(cv);
+          try {
+            const nextState = await post('/api/process-video', {
+              video_name: cv,
+              threshold: state.cosine_threshold ?? 0.25,
+            });
+            setAppState(nextState);
+            setVideos(await get('/api/videos'));
+          } finally {
+            setLoading(false);
+          }
+        } else {
+          setVideo(cv);
+        }
+      }, []);
+
+      const handleReassign = async (trackKeyOrKeys, targetClusterId) => {
+        const dropped = Array.isArray(trackKeyOrKeys) ? trackKeyOrKeys : [trackKeyOrKeys];
+        const keys = [...new Set([...dropped, ...selectedKeys])];
+        setTracks(prev => prev.map(t => keys.includes(t.track_key) ? {...t, cluster_id: targetClusterId} : t));
+        const state = await post('/api/reassign', {track_keys: keys, target_cluster_id: targetClusterId});
+        setAppState(state);
+        setVideos(await get('/api/videos'));
+        setSelectedKeys(new Set());
+      };
+
+      const handleProcess = async () => {
+        setLoading(true);
+        try {
+          setAppState(await post('/api/process-video', {video_name: video, threshold}));
+          setVideos(await get('/api/videos'));
+        } finally { setLoading(false); }
+      };
+
+      const handlePrevious = async () => {
+        if (!video) return;
+        setLoading(true);
+        try {
+          const state = await post('/api/previous', {video_name: video});
+          setAppState(state);
+          setVideos(await get('/api/videos'));
+          const prevVideo = state.current_video;
+          if (prevVideo) {
+            setTracks([]);
+            setVideo(prevVideo);
+          }
+        } finally {
+          setLoading(false);
+        }
+      };
+
+      const handleApprove = async () => {
+        const state = await post('/api/approve', {video_name: video});
+        setAppState(state);
+
+        const currentVideos = await get('/api/videos');
+        setVideos(currentVideos);
+
+        const nextVideoName = state.current_video;
+        if (nextVideoName) {
+          setLoading(true);
+          setTracks([]);
+          setVideo(nextVideoName);
+
+          const nextVidObj = currentVideos.find(v => v.name === nextVideoName);
+          const isPending = nextVidObj && nextVidObj.status === 'pending';
+
+          if (isPending) {
+            try {
+              const nextState = await post('/api/process-video', {video_name: nextVideoName, threshold});
+              setAppState(nextState);
+              setVideos(await get('/api/videos'));
+            } finally {
+              setLoading(false);
+            }
+          } else {
+            setLoading(false);
+          }
+        }
+      };
+
+      const handleRename = async (clusterId, name) => {
+        setAppState(await post('/api/rename', {cluster_id: clusterId, name}));
+      };
+
+      const handleVideoSelect = useCallback(async (videoName) => {
+        const vidObj = videos.find(v => v.name === videoName);
+        if (vidObj?.status === 'pending') {
+          setLoading(true);
+          setTracks([]);
+          setVideo(videoName);
+          try {
+            const nextState = await post('/api/process-video', { video_name: videoName, threshold });
+            setAppState(nextState);
+            setVideos(await get('/api/videos'));
+          } finally {
+            setLoading(false);
+          }
+        } else {
+          setVideo(videoName);
+        }
+      }, [videos, threshold]);
+
+      const handleReset = async () => {
+        if (!window.confirm('Reset all clustering? This cannot be undone.')) return;
+        const state = await post('/api/reset', {});
+        setAppState(state);
+        setVideos(await get('/api/videos'));
+        setVideo(null);
+        setTracks([]);
+        setOpen(null);
+      };
+
+      const handleTrashAdd = async (trackKeyOrKeys) => {
+        const keys = Array.isArray(trackKeyOrKeys) ? trackKeyOrKeys : [trackKeyOrKeys];
+        const allKeys = [...new Set([...keys, ...(selectedKeys.has(keys[0]) ? [...selectedKeys] : [])])];
+        const state = await post('/api/trash/add', { track_keys: allKeys });
+        setAppState(state);
+        setVideos(await get('/api/videos'));
+        setTracks(prev => prev.filter(t => !allKeys.includes(t.track_key)));
+        setSelectedKeys(new Set());
+      };
+
+      const handleTrashRestore = async (trackKeys) => {
+        const state = await post('/api/trash/restore', { track_keys: trackKeys });
+        setAppState(state);
+        setVideos(await get('/api/videos'));
+        if (video) {
+          const updatedTracks = await get(`/api/video/${video}/tracks`);
+          setTracks(updatedTracks);
+        }
+      };
+
+      const handleTrashDelete = async (trackKeys) => {
+        const state = await post('/api/trash/delete', { track_keys: trackKeys });
+        setAppState(state);
+        setVideos(await get('/api/videos'));
+      };
+
+      const openContextMenu = useCallback((trackKey, x, y, currentClusterId) => {
+        setContextMenu({ trackKey, x, y, currentClusterId });
+      }, []);
+
+      const handleContextMenuSelect = async (trackKey, clusterId) => {
+        setContextMenu(null);
+        const keys = selectedKeys.has(trackKey) ? [...selectedKeys] : [trackKey];
+        await handleReassign(keys, clusterId);
+      };
+
+      const handleNewCluster = async trackKeyOrKeys => {
+        setContextMenu(null);
+        const keys = Array.isArray(trackKeyOrKeys) ? trackKeyOrKeys : [trackKeyOrKeys];
+        let state = await post('/api/new-cluster', {track_key: keys[0]});
+        if (keys.length > 1) {
+          const newCid = state.track_assignments[keys[0]];
+          state = await post('/api/reassign', {track_keys: keys.slice(1), target_cluster_id: newCid});
+        }
+        setAppState(state);
+        setVideos(await get('/api/videos'));
+        setTracks(prev => prev.map(t =>
+          keys.includes(t.track_key) ? {...t, cluster_id: state.track_assignments[t.track_key]} : t
+        ));
+        setSelectedKeys(new Set());
+      };
+
+      if (!appState && view === 'review') return (
+        <div className="h-screen flex items-center justify-center" style={{color: 'var(--text-muted)'}}>Loading...</div>
+      );
+
+      const clusters = Object.values(appState?.clusters || {});
+      const videoStatus = appState?.videos?.[video]?.status;
+      const canProcess = appState?.initialized && video && videoStatus === 'pending';
+      const trackColorMap = {};
+      const trackToCluster = {};
+      tracks.forEach(t => {
+        trackColorMap[t.track_id] = appState?.clusters?.[t.cluster_id]?.color || '#6B7280';
+        trackToCluster[String(t.track_id)] = t.cluster_id;
+      });
+
+      return (
+        <div className="flex flex-col h-screen" style={{backgroundColor: C.bg}}>
+
+          {/* ── Top nav ── */}
+          <div className="flex items-center flex-shrink-0 border-b px-4 gap-4"
+               style={{height: 52, backgroundColor: C.card, borderColor: C.border}}>
+
+            {/* Logo */}
+            <div className="flex items-center gap-2 flex-shrink-0" style={{marginRight: 8}}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{color: C.accent}}>
+                <path d="M2 12C2 12 5 6 12 6C19 6 22 12 22 12C22 12 19 18 12 18C5 18 2 12 2 12Z" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                <circle cx="12" cy="12" r="2.5" fill="currentColor"/>
+              </svg>
+              <span className="text-sm font-semibold" style={{color: 'var(--text-primary)'}}>
+                NatGeo <span style={{color: C.accent}}>Species</span>
+              </span>
+            </div>
+
+            {/* Pill tab switcher */}
+            <div className="flex items-center rounded-full p-1 gap-0.5" style={{backgroundColor: 'var(--bg-surface-3)', border: '1px solid var(--border-subtle)'}}>
+              {['pipeline', 'review'].map(v => (
+                <button key={v} onClick={() => setView(v)}
+                  className="px-4 py-1 rounded-full text-[13px] font-medium transition-all"
+                  style={{
+                    backgroundColor: view === v ? 'var(--bg-surface-2)' : 'transparent',
+                    color: view === v ? 'var(--text-primary)' : 'var(--text-muted)',
+                    border: view === v ? '1px solid var(--border-moderate)' : '1px solid transparent',
+                    cursor: 'pointer',
+                  }}>
+                  {v === 'pipeline' ? 'Pipeline' : 'Cluster Review'}
+                </button>
+              ))}
+            </div>
+
+            {/* Status badge */}
+            {appState?.initialized && videos.length > 0 && (
+              <div className="ml-auto font-mono text-[11px] px-2.5 py-1 rounded" style={{backgroundColor: 'var(--bg-surface-3)', color: 'var(--text-secondary)', border: '1px solid var(--border-subtle)'}}>
+                {videos.filter(v => v.status === 'approved').length}/{videos.length} approved
+              </div>
+            )}
+          </div>
+
+          {/* ── View content ── */}
+          {view === 'pipeline' ? (
+            <PipelineView />
+          ) : (
+            <div className="flex flex-1 min-h-0 overflow-hidden" onClick={clearSelection}>
+              <VideoList videos={videos} selected={video} onSelect={handleVideoSelect} />
+
+              <div className="flex flex-col flex-1 min-w-0">
+                {!appState?.initialized ? (
+                  <InitPanel videos={videos} onInitialize={handleInitialize} />
+                ) : (<>
+
+              {/* Header */}
+              <div className="flex items-center gap-3 px-4 py-2.5 flex-shrink-0 border-b" style={{backgroundColor: C.card, borderColor: C.border}}>
+                <span className="font-medium text-[14px]" style={{color: 'var(--text-primary)'}}>{video || 'Select a video'}</span>
+                {videoStatus && (
+                  <span className="font-mono text-[11px] px-2 py-0.5 rounded-full" style={{
+                    backgroundColor: videoStatus === 'approved' ? 'var(--success-bg)' : videoStatus === 'processed' ? 'rgba(86,168,224,0.1)' : 'var(--bg-surface-3)',
+                    color: videoStatus === 'approved' ? 'var(--success)' : videoStatus === 'processed' ? C.accent : 'var(--text-secondary)',
+                    border: `1px solid ${videoStatus === 'approved' ? 'var(--success-border)' : videoStatus === 'processed' ? 'var(--accent-dim)' : 'var(--border-subtle)'}`,
+                  }}>
+                    {videoStatus}
+                  </span>
+                )}
+                <span className="ml-auto font-mono text-[11px]" style={{color: 'var(--text-faint)'}}>{tracks.length} tracks</span>
+                <button
+                  onClick={handleReset}
+                  className="btn-ghost"
+                  style={{color: 'var(--error)', borderColor: 'var(--error-border)'}}
+                >
+                  Restart
+                </button>
+              </div>
+
+              {/* Scrollable body */}
+              <div className="flex-1 overflow-y-auto flex flex-col">
+
+              {/* Video player */}
+              {video && <>
+                <div className="flex flex-shrink-0 border-b" style={{height: videoHeight, borderColor: C.border}}>
+                  <ClusterFilterPanel
+                    clusters={clusters}
+                    tracks={tracks}
+                    visibleClusterIds={visibleClusterIds}
+                    onToggle={toggleClusterVisibility}
+                    onToggleAll={toggleAllClusters}
+                  />
+                  <VideoPlayer video={video} height={videoHeight} showAnnotations={true} selectedKeys={selectedKeys} trackColorMap={trackColorMap} visibleClusterIds={visibleClusterIds} trackToCluster={trackToCluster} />
+                </div>
+                <div
+                  onMouseDown={e => {
+                    draggingVideo.current = true;
+                    dragStartVideoY.current = e.clientY;
+                    dragStartVideoH.current = videoHeight;
+                    document.body.style.cursor = 'row-resize';
+                    e.preventDefault();
+                  }}
+                  className="flex-shrink-0 flex items-center justify-center transition-colors hover:bg-slate-800"
+                  style={{height: 6, cursor: 'row-resize', backgroundColor: 'var(--border-subtle)', borderTop: `1px solid var(--border-moderate)`, borderBottom: `1px solid var(--border-moderate)`}}
+                >
+                  <div style={{width: 32, height: 2, borderRadius: 1, backgroundColor: 'var(--border-moderate)'}} />
+                </div>
+              </>}
+
+              {/* Crop strip */}
+              <div className="flex-shrink-0" style={{backgroundColor: C.card, height: stripHeight, overflowY: 'auto'}}>
+                {loading
+                  ? <div className="flex items-center justify-center h-full gap-2">
+                      <svg className="animate-spin" style={{width:16,height:16,color:C.accent}} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle style={{opacity:0.25}} cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                        <path style={{opacity:0.75}} fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                      </svg>
+                      <span className="text-sm" style={{color: 'var(--text-faint)'}}>Processing video...</span>
+                    </div>
+                  : tracks.length === 0
+                  ? <div className="flex items-center justify-center h-full">
+                      <span className="text-sm" style={{color: 'var(--text-faint)'}}>No tracks for this video</span>
+                    </div>
+                  : (() => {
+                      const real = clusters.filter(c => c.id !== 'noise').sort((a, b) => a.id.localeCompare(b.id));
+                      const noise = clusters.find(c => c.id === 'noise');
+                      const row = c => (
+                        <ClusterRow key={`${video}-${c.id}`} cluster={c}
+                          tracks={tracks.filter(t => t.cluster_id === c.id)}
+                          onContextMenu={openContextMenu} onDrop={handleReassign}
+                          selectedKeys={selectedKeys} onSelect={handleSelect} />
+                      );
+                      return [
+                        ...real.map(row),
+                        <NewClusterRow key="__new__" onDrop={handleNewCluster} />,
+                        ...(noise ? [row(noise)] : []),
+                      ];
+                    })()
+                }
+              </div>
+
+              {/* Resizer */}
+              <div
+                onMouseDown={e => {
+                  dragging.current = true;
+                  dragStartY.current = e.clientY;
+                  dragStartH.current = stripHeight;
+                  document.body.style.cursor = 'row-resize';
+                  e.preventDefault();
+                }}
+                className="flex-shrink-0 flex items-center justify-center transition-colors hover:bg-slate-800"
+                style={{height: 6, cursor: 'row-resize', backgroundColor: 'var(--border-subtle)', borderTop: `1px solid var(--border-moderate)`, borderBottom: `1px solid var(--border-moderate)`}}
+              >
+                <div style={{width: 32, height: 2, borderRadius: 1, backgroundColor: 'var(--border-moderate)'}} />
+              </div>
+
+              {/* Cluster grid */}
+              <div className="p-4">
+                <div className="grid gap-3" style={{gridTemplateColumns: 'repeat(auto-fill, minmax(148px, 1fr))'}}>
+                  {[
+                    ...clusters.filter(c => c.id !== 'noise').sort((a, b) => a.id.localeCompare(b.id)),
+                    ...clusters.filter(c => c.id === 'noise'),
+                  ].map(cluster => (
+                    <ClusterCard
+                      key={cluster.id}
+                      cluster={cluster}
+                      onClick={setOpen}
+                      onDrop={handleReassign}
+                      onRename={handleRename}
+                    />
+                  ))}
+                  <TrashCard
+                    trash={appState?.trash || { track_keys: [] }}
+                    onClick={() => setTrashOpen(true)}
+                  />
+                </div>
+              </div>
+
+              </div>{/* end scrollable body */}
+
+              {/* Action bar */}
+              <div className="flex items-center gap-4 px-4 flex-shrink-0 border-t" style={{height: 52, backgroundColor: C.card, borderColor: C.border}}>
+                <label className="flex items-center gap-3">
+                  <span className="label-caps">Threshold</span>
+                  <input
+                    type="range" min="0.05" max="0.5" step="0.01"
+                    value={threshold}
+                    onChange={e => setThreshold(+e.target.value)}
+                    className="w-28"
+                  />
+                  <span className="font-mono text-[13px] w-8 text-right" style={{color: C.accent}}>{threshold.toFixed(2)}</span>
+                </label>
+                <div className="flex gap-2 ml-auto">
+                  <button
+                    onClick={handlePrevious}
+                    disabled={!video || loading}
+                    className="btn-secondary"
+                  >
+                    ← Previous
+                  </button>
+                  <button
+                    onClick={handleApprove}
+                    disabled={!video || loading}
+                    className="btn-primary"
+                    style={(!video || loading) ? {} : {backgroundColor: 'var(--success-bg)', borderColor: 'var(--success-border)', color: 'var(--success)'}}
+                  >
+                    {loading ? 'Processing...' : 'Approve & Next ✓'}
+                  </button>
+                </div>
+              </div>
+
+            </>)}
+              </div>
+            </div>
+          )}
+
+          {openCluster && appState?.clusters?.[openCluster] && (
+            <ClusterModal
+              cluster={appState.clusters[openCluster]}
+              onClose={() => setOpen(null)}
+              onDrop={handleReassign}
+              onRename={handleRename}
+              onContextMenu={openContextMenu}
+              dimmed={!!cropViewer}
+              selectedKeys={selectedKeys} onSelect={handleSelect}
+            />
+          )}
+          {cropViewer && <CropViewer trackKey={cropViewer} onClose={() => setCropViewer(null)} />}
+          {trashOpen && (
+            <TrashModal
+              trash={appState?.trash || { track_keys: [], metadata: {} }}
+              onClose={() => setTrashOpen(false)}
+              onRestore={handleTrashRestore}
+              onDelete={handleTrashDelete}
+            />
+          )}
+          {contextMenu && (
+            <ContextMenu
+              {...contextMenu}
+              clusters={clusters}
+              onSelect={handleContextMenuSelect}
+              onNewCluster={handleNewCluster}
+              onView={setCropViewer}
+              onTrash={handleTrashAdd}
+              onClose={() => setContextMenu(null)}
+            />
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+{% endraw %}
