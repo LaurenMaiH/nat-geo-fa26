@@ -857,6 +857,331 @@
       );
     }
 
+    // ── PipelineView ──────────────────────────────────────────────────────────
+
+    const STAGES = ["downloading", "resizing", "detecting", "cropping", "embedding", "done"];
+
+    function StagePip({ stage, current }) {
+      const idx    = STAGES.indexOf(stage);
+      const curIdx = STAGES.indexOf(current);
+      const done   = curIdx > idx;
+      const active = curIdx === idx;
+      return (
+        <div className="flex items-center gap-1">
+          <div style={{
+            width: 8, height: 8, borderRadius: '50%',
+            backgroundColor: done ? '#4ade80' : active ? C.accent : '#1e3a5f',
+            boxShadow: active ? `0 0 6px ${C.accent}` : 'none',
+            transition: 'all 0.3s',
+          }} />
+          <span className="text-xs" style={{color: done ? '#4ade80' : active ? C.accent : '#475569'}}>
+            {stage}
+          </span>
+        </div>
+      );
+    }
+
+    function PipelineView() {
+      const [status, setStatus]   = useState(null);
+      const [log, setLog]         = useState([]);
+      const [missions, setMissions] = useState([]);
+      const [config, setConfig]   = useState({
+        mission_id: '', mission_path: '', start_from: '',
+        conf_threshold: 0.15, iou_threshold: 0.70,
+        min_track_len: 3, crops_per_track: 3,
+      });
+      const logRef = useRef(null);
+
+      const refreshStatus = useCallback(async () => {
+        const [s, l] = await Promise.all([
+          fetch('/api/pipeline/status').then(r => r.json()),
+          fetch('/api/pipeline/log').then(r => r.json()),
+        ]);
+        setStatus(s);
+        setLog(l.lines || []);
+      }, []);
+
+      useEffect(() => {
+        refreshStatus();
+        fetch('/api/pipeline/missions').then(r => r.json()).then(setMissions);
+      }, []);
+
+      useEffect(() => {
+        if (!status?.running) return;
+        const id = setInterval(refreshStatus, 1500);
+        return () => clearInterval(id);
+      }, [status?.running]);
+
+      useEffect(() => {
+        if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+      }, [log]);
+
+      const handleStart = async () => {
+        if (!config.mission_id.trim()) return;
+        await post('/api/pipeline/start', config);
+        refreshStatus();
+      };
+
+      const handleStop = async () => {
+        await post('/api/pipeline/stop', {});
+        refreshStatus();
+      };
+
+      const running  = status?.running;
+      const done     = status?.current_stage === 'done';
+      const progress = status?.videos_total > 0
+        ? (status.videos_done / status.videos_total * 100).toFixed(1) : 0;
+
+      const inputSty = {
+        backgroundColor: C.border, border: `1px solid ${C.hover}`,
+        color: '#f1f5f9', borderRadius: 6, padding: '5px 10px',
+        width: '100%', fontFamily: 'inherit', fontSize: 13,
+      };
+
+      return (
+        <div className="flex flex-1 min-h-0 overflow-hidden">
+
+          {/* ── LEFT: Config ── */}
+          <div className="flex flex-col overflow-y-auto flex-shrink-0 border-r p-5 gap-4"
+               style={{width: 300, backgroundColor: C.card, borderColor: C.border}}>
+
+            <div className="text-xs font-semibold uppercase tracking-wider" style={{color: '#94a3b8'}}>
+              Mission Config
+            </div>
+
+            <div>
+              <label className="block text-xs mb-1" style={{color: '#94a3b8'}}>Mission ID</label>
+              <input style={inputSty} value={config.mission_id}
+                onChange={e => setConfig(p => ({...p, mission_id: e.target.value}))}
+                placeholder="e.g. PLW_dscm_33" disabled={running} />
+            </div>
+
+            <div>
+              <label className="block text-xs mb-1" style={{color: '#94a3b8'}}>
+                Dropbox path <span style={{color:'#475569'}}>(optional override)</span>
+              </label>
+              <input style={inputSty} value={config.mission_path}
+                onChange={e => setConfig(p => ({...p, mission_path: e.target.value}))}
+                placeholder="/DOEX0096_Palau/{mission_id}/Video" disabled={running} />
+            </div>
+
+            <div>
+              <label className="block text-xs mb-1" style={{color: '#94a3b8'}}>
+                Start from video <span style={{color:'#475569'}}>(optional)</span>
+              </label>
+              <input style={inputSty} value={config.start_from}
+                onChange={e => setConfig(p => ({...p, start_from: e.target.value}))}
+                placeholder="e.g. PLW_dscm_33_c007.mp4" disabled={running} />
+            </div>
+
+            <div className="border-t pt-4" style={{borderColor: C.border}}>
+              <div className="text-xs font-semibold uppercase tracking-wider mb-3" style={{color:'#94a3b8'}}>
+                Detection params
+              </div>
+
+              {[
+                {key:'conf_threshold', label:'Conf threshold', min:0.01, max:0.9, step:0.01},
+                {key:'iou_threshold',  label:'IoU threshold',  min:0.1,  max:0.9, step:0.05},
+              ].map(({key, label, min, max, step}) => (
+                <div key={key} className="mb-3">
+                  <label className="flex justify-between text-xs mb-1" style={{color:'#94a3b8'}}>
+                    <span>{label}</span>
+                    <span className="font-mono" style={{color: C.accent}}>{config[key].toFixed(2)}</span>
+                  </label>
+                  <input type="range" min={min} max={max} step={step}
+                    value={config[key]} disabled={running}
+                    onChange={e => setConfig(p => ({...p, [key]: +e.target.value}))}
+                    style={{width:'100%'}} />
+                </div>
+              ))}
+
+              {[
+                {key:'min_track_len',   label:'Min track length', min:1, max:20},
+                {key:'crops_per_track', label:'Crops per track',  min:1, max:5},
+              ].map(({key, label, min, max}) => (
+                <div key={key} className="mb-3">
+                  <label className="block text-xs mb-1" style={{color:'#94a3b8'}}>{label}</label>
+                  <input type="number" min={min} max={max} style={inputSty}
+                    value={config[key]} disabled={running}
+                    onChange={e => setConfig(p => ({...p, [key]: +e.target.value}))} />
+                </div>
+              ))}
+            </div>
+
+            <button
+              onClick={running ? handleStop : handleStart}
+              disabled={!running && !config.mission_id.trim()}
+              className="w-full py-2.5 rounded-lg font-medium text-white transition-opacity disabled:opacity-40"
+              style={{backgroundColor: running ? '#7f1d1d' : '#065f46'}}
+            >
+              {running ? '⏹ Stop after current video' : '▶ Start Pipeline'}
+            </button>
+
+            {missions.length > 0 && (
+              <div className="border-t pt-4" style={{borderColor: C.border}}>
+                <div className="text-xs font-semibold uppercase tracking-wider mb-2" style={{color:'#94a3b8'}}>
+                  Processed missions
+                </div>
+                {missions.map(m => (
+                  <div key={m.mission_id} className="flex items-center justify-between py-1.5 text-xs"
+                       style={{borderBottom:`1px solid ${C.border}`}}>
+                    <span style={{color:'#e2e8f0'}}>{m.mission_id}</span>
+                    <span style={{color:'#64748b'}}>{m.n_embeddings} emb</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* ── RIGHT: Monitor ── */}
+          <div className="flex flex-col flex-1 min-w-0 overflow-hidden">
+
+            {/* Stats bar */}
+            <div className="flex items-center gap-6 px-6 py-3 flex-shrink-0 border-b"
+                 style={{backgroundColor: C.card, borderColor: C.border}}>
+              {status ? (<>
+                <div>
+                  <div className="text-xs" style={{color:'#94a3b8'}}>Mission</div>
+                  <div className="text-sm font-mono" style={{color: C.accent}}>{status.mission_id || '—'}</div>
+                </div>
+                <div>
+                  <div className="text-xs" style={{color:'#94a3b8'}}>Progress</div>
+                  <div className="text-sm font-mono" style={{color:'#e2e8f0'}}>
+                    {status.videos_done} / {status.videos_total || '?'} videos
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs" style={{color:'#94a3b8'}}>Tracks</div>
+                  <div className="text-sm font-mono" style={{color:'#e2e8f0'}}>{status.tracks_found}</div>
+                </div>
+                <div>
+                  <div className="text-xs" style={{color:'#94a3b8'}}>Embeddings</div>
+                  <div className="text-sm font-mono" style={{color:'#e2e8f0'}}>{status.embeddings_total}</div>
+                </div>
+                {status.errors?.length > 0 && (
+                  <div>
+                    <div className="text-xs" style={{color:'#94a3b8'}}>Errors</div>
+                    <div className="text-sm font-mono" style={{color:'#f87171'}}>{status.errors.length}</div>
+                  </div>
+                )}
+                <div className="ml-auto flex items-center gap-2">
+                  <div style={{
+                    width: 8, height: 8, borderRadius: '50%',
+                    backgroundColor: running ? '#4ade80' : done ? '#60a5fa' : '#475569',
+                    boxShadow: running ? '0 0 6px #4ade80' : 'none',
+                  }} />
+                  <span className="text-xs" style={{color: running ? '#4ade80' : '#94a3b8'}}>
+                    {running ? 'Running' : done ? 'Complete' : 'Idle'}
+                  </span>
+                </div>
+              </>) : (
+                <span className="text-sm" style={{color:'#475569'}}>No pipeline run yet this session</span>
+              )}
+            </div>
+
+            {/* Current video + stage pip */}
+            {status?.current_video && (
+              <div className="flex items-center gap-6 px-6 py-3 flex-shrink-0 border-b"
+                   style={{backgroundColor: C.bg, borderColor: C.border}}>
+                <div>
+                  <div className="text-xs mb-1" style={{color:'#94a3b8'}}>Current video</div>
+                  <div className="font-mono text-sm" style={{color:'#e2e8f0'}}>{status.current_video}</div>
+                </div>
+                <div className="flex items-center gap-3 flex-wrap">
+                  {STAGES.filter(s => s !== 'done').map(s => (
+                    <StagePip key={s} stage={s} current={status.current_stage || ''} />
+                  ))}
+                </div>
+                {status.frame_progress && (
+                  <div className="ml-auto flex items-center gap-2">
+                    <div className="text-xs" style={{color:'#94a3b8'}}>
+                      Frame {status.frame_progress.current} / {status.frame_progress.total}
+                    </div>
+                    <div style={{width:120, height:4, backgroundColor: C.border, borderRadius:2}}>
+                      <div style={{
+                        width: `${(status.frame_progress.current / status.frame_progress.total * 100).toFixed(1)}%`,
+                        height: '100%', backgroundColor: C.accent, borderRadius:2,
+                        transition: 'width 0.5s ease',
+                      }} />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Overall progress bar */}
+            {status?.videos_total > 0 && (
+              <div className="px-6 pt-3 flex-shrink-0">
+                <div className="flex justify-between text-xs mb-1" style={{color:'#64748b'}}>
+                  <span>Overall progress</span><span>{progress}%</span>
+                </div>
+                <div style={{height:6, backgroundColor: C.border, borderRadius:3}}>
+                  <div style={{
+                    width: `${progress}%`, height:'100%',
+                    backgroundColor: done ? '#4ade80' : C.accent,
+                    borderRadius:3, transition:'width 0.5s ease',
+                  }} />
+                </div>
+              </div>
+            )}
+
+            {/* Error list */}
+            {status?.errors?.length > 0 && (
+              <div className="px-6 pt-3 flex-shrink-0">
+                <div className="text-xs font-semibold mb-1" style={{color:'#f87171'}}>
+                  Errors ({status.errors.length})
+                </div>
+                <div className="rounded p-2 overflow-y-auto max-h-24"
+                     style={{backgroundColor:'#1c0a0a', border:`1px solid #7f1d1d`}}>
+                  {status.errors.map((e, i) => (
+                    <div key={i} className="text-xs font-mono" style={{color:'#fca5a5'}}>
+                      [{e.video}] {e.error}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Log window */}
+            <div className="flex-1 min-h-0 px-6 pt-3 pb-4 flex flex-col">
+              <div className="text-xs mb-1" style={{color:'#475569'}}>Log</div>
+              <div ref={logRef}
+                   className="flex-1 overflow-y-auto rounded p-3 font-mono text-xs"
+                   style={{backgroundColor:'#010810', border:`1px solid ${C.border}`, lineHeight:1.6}}>
+                {log.length === 0
+                  ? <span style={{color:'#1e3a5f'}}>No output yet. Start the pipeline to begin.</span>
+                  : log.map((line, i) => (
+                    <div key={i} style={{
+                      color: line.includes('✓') ? '#4ade80'
+                           : line.includes('✗') || line.includes('ERROR') || line.includes('FATAL') ? '#f87171'
+                           : line.includes('→') ? C.accent
+                           : '#94a3b8',
+                    }}>{line}</div>
+                  ))
+                }
+              </div>
+            </div>
+
+            {/* Done banner */}
+            {done && (
+              <div className="px-6 pb-4 flex-shrink-0">
+                <div className="rounded-lg p-4 flex items-center justify-between"
+                     style={{backgroundColor:'#052e16', border:`1px solid #166534`}}>
+                  <div>
+                    <div className="font-medium text-sm" style={{color:'#4ade80'}}>Pipeline complete</div>
+                    <div className="text-xs mt-0.5" style={{color:'#86efac'}}>
+                      {status.videos_done} videos · {status.embeddings_total} embeddings ready
+                    </div>
+                  </div>
+                  <div className="text-xs" style={{color:'#86efac'}}>Switch to Cluster Review →</div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
     // ── App ───────────────────────────────────────────────────────────────────
 
     function App() {
@@ -870,6 +1195,7 @@
       const [contextMenu, setContextMenu] = useState(null);
       const [cropViewer, setCropViewer]   = useState(null);
       const [trashOpen, setTrashOpen]     = useState(false);
+      const [view, setView]               = useState('review');
       const [stripHeight, setStripHeight] = useState(() => Math.round(window.innerHeight / 2.5));
       const [selectedKeys, setSelectedKeys] = useState(new Set());
       const [showAnnotations, setShowAnnotations] = useState(true);
@@ -1126,7 +1452,7 @@
         setSelectedKeys(new Set());
       };
 
-      if (!appState) return (
+      if (!appState && view === 'review') return (
         <div className="h-screen flex items-center justify-center" style={{color: '#64748b'}}>Loading...</div>
       );
 
@@ -1140,13 +1466,38 @@
       // const canApprove = video && ['pending', 'processed'].includes(videoStatus);
 
       return (
-        <div className="flex h-screen" style={{backgroundColor: C.bg}} onClick={clearSelection}>
-          <VideoList videos={videos} selected={video} onSelect={handleVideoSelect} />
+        <div className="flex flex-col h-screen" style={{backgroundColor: C.bg}}>
 
-          <div className="flex flex-col flex-1 min-w-0">
-            {!appState.initialized ? (
-              <InitPanel videos={videos} onInitialize={handleInitialize} />
-            ) : (<>
+          {/* ── Top nav ── */}
+          <div className="flex items-center flex-shrink-0 border-b px-4"
+               style={{height: 44, backgroundColor: C.card, borderColor: C.border}}>
+            <span className="text-sm font-semibold mr-6" style={{color: C.accent}}>🐟 NatGeo</span>
+            {['pipeline', 'review'].map(v => (
+              <button key={v} onClick={() => setView(v)}
+                className="px-4 h-full text-sm capitalize"
+                style={{
+                  color: view === v ? C.accent : '#64748b',
+                  borderBottom: view === v ? `2px solid ${C.accent}` : '2px solid transparent',
+                  background: 'none', border: 'none',
+                  borderBottom: view === v ? `2px solid ${C.accent}` : '2px solid transparent',
+                  cursor: 'pointer',
+                }}>
+                {v === 'pipeline' ? 'Pipeline' : 'Cluster Review'}
+              </button>
+            ))}
+          </div>
+
+          {/* ── View content ── */}
+          {view === 'pipeline' ? (
+            <PipelineView />
+          ) : (
+            <div className="flex flex-1 min-h-0 overflow-hidden" onClick={clearSelection}>
+              <VideoList videos={videos} selected={video} onSelect={handleVideoSelect} />
+
+              <div className="flex flex-col flex-1 min-w-0">
+                {!appState?.initialized ? (
+                  <InitPanel videos={videos} onInitialize={handleInitialize} />
+                ) : (<>
 
               {/* Header */}
               <div className="flex items-center gap-3 px-4 py-2.5 flex-shrink-0 border-b" style={{backgroundColor: C.card, borderColor: C.border}}>
@@ -1266,7 +1617,7 @@
                     />
                   ))}
                   <TrashCard
-                    trash={appState.trash || { track_keys: [] }}
+                    trash={appState?.trash || { track_keys: [] }}
                     onClick={() => setTrashOpen(true)}
                   />
                 </div>
@@ -1307,9 +1658,11 @@
               </div>
 
             </>)}
-          </div>
+              </div>
+            </div>
+          )}
 
-          {openCluster && appState.clusters?.[openCluster] && (
+          {openCluster && appState?.clusters?.[openCluster] && (
             <ClusterModal
               cluster={appState.clusters[openCluster]}
               onClose={() => setOpen(null)}
@@ -1323,7 +1676,7 @@
           {cropViewer && <CropViewer trackKey={cropViewer} onClose={() => setCropViewer(null)} />}
           {trashOpen && (
             <TrashModal
-              trash={appState.trash || { track_keys: [], metadata: {} }}
+              trash={appState?.trash || { track_keys: [], metadata: {} }}
               onClose={() => setTrashOpen(false)}
               onRestore={handleTrashRestore}
               onDelete={handleTrashDelete}
