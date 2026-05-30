@@ -20,6 +20,7 @@
       Plus:         (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>,
       Search:       (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>,
       ChevronRight: (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||10} height={p.size||10} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="9 18 15 12 9 6"/></svg>,
+      BarChart2:    (p={}) => <svg xmlns="http://www.w3.org/2000/svg" width={p.size||14} height={p.size||14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/><line x1="2" y1="20" x2="22" y2="20"/></svg>,
     };
 
     const get  = url  => fetch(url).then(r => r.json());
@@ -235,7 +236,7 @@
 
       return (
         <div className="flex items-center justify-center"
-          style={{height, flex: 1, minWidth: 0, backgroundColor: '#010e1e', position: 'relative'}}>
+          style={{height, flex: 1, minWidth: 0, backgroundColor: C.bg, position: 'relative'}}>
           {status === 'ready' ? (<>
             <video
               ref={videoRef}
@@ -268,28 +269,28 @@
 
     // ── ClusterFilterPanel ────────────────────────────────────────────────────
 
-    function ClusterFilterPanel({ clusters, tracks, visibleClusterIds, onToggle, onToggleAll }) {
+    function ClusterFilterPanel({ clusters, tracks, visibleClusterIds, onToggle, onToggleAll, onStatsClick }) {
       const countByCluster = {};
       tracks.forEach(t => { countByCluster[t.cluster_id] = (countByCluster[t.cluster_id] || 0) + 1; });
 
       const videoClusters = clusters.filter(c => countByCluster[c.id] > 0);
-      if (videoClusters.length === 0) return null;
-
-      const allVisible = videoClusters.every(c => visibleClusterIds.has(c.id));
+      const allVisible = videoClusters.length > 0 && videoClusters.every(c => visibleClusterIds.has(c.id));
 
       return (
         <div className="flex flex-col flex-shrink-0 overflow-hidden"
-          style={{width: 220, backgroundColor: '#010e1e', paddingLeft: 12}}>
+          style={{width: 220, backgroundColor: C.bg, paddingLeft: 12}}>
           <div className="flex items-center justify-between px-3 py-2.5 border-b flex-shrink-0"
             style={{borderColor: C.border}}>
             <span className="text-[13px] font-semibold uppercase tracking-wider" style={{color: 'var(--text-secondary)'}}>Show Annotations</span>
-            <button
-              onClick={e => { e.stopPropagation(); onToggleAll(allVisible); }}
-              className="btn-ghost"
-              style={{padding: '3px 10px', fontSize: 12, color: allVisible ? C.accent : 'var(--text-muted)', borderColor: allVisible ? C.accent : 'var(--border-subtle)'}}
-            >
-              {allVisible ? 'Hide All' : 'Show All'}
-            </button>
+            {videoClusters.length > 0 && (
+              <button
+                onClick={e => { e.stopPropagation(); onToggleAll(allVisible); }}
+                className="btn-ghost"
+                style={{padding: '3px 10px', fontSize: 12, color: allVisible ? C.accent : 'var(--text-muted)', borderColor: allVisible ? C.accent : 'var(--border-subtle)'}}
+              >
+                {allVisible ? 'Hide All' : 'Show All'}
+              </button>
+            )}
           </div>
           <div className="overflow-y-auto flex-1 py-1">
             {videoClusters.map(c => {
@@ -315,6 +316,22 @@
                 </div>
               );
             })}
+          </div>
+          <div className="flex-shrink-0 border-t p-2.5 pr-4" style={{borderColor: C.border}}>
+            <button
+              onClick={e => { e.stopPropagation(); onStatsClick(); }}
+              className="w-full flex items-center gap-2 px-2.5 py-2 rounded-md text-[12px] font-medium transition-colors"
+              style={{
+                color: C.accent,
+                backgroundColor: 'var(--accent-glow)',
+                border: `1px solid var(--accent-dim)`,
+                cursor: 'pointer',
+                fontFamily: 'inherit',
+              }}
+            >
+              <Icons.BarChart2 size={13}/>
+              Video Statistics
+            </button>
           </div>
         </div>
       );
@@ -834,6 +851,418 @@
       );
     }
 
+    // ── Video Statistics charts ───────────────────────────────────────────────
+
+    function gaussianSmooth(values, sigma) {
+      if (sigma === 0) return values;
+      const radius = Math.ceil(sigma * 3);
+      const kernel = [];
+      let kernelSum = 0;
+      for (let i = -radius; i <= radius; i++) {
+        const w = Math.exp(-(i * i) / (2 * sigma * sigma));
+        kernel.push(w);
+        kernelSum += w;
+      }
+      const norm = kernel.map(w => w / kernelSum);
+      return values.map((_, idx) => {
+        let sum = 0;
+        for (let k = 0; k < norm.length; k++) {
+          const j = Math.max(0, Math.min(values.length - 1, idx - radius + k));
+          sum += values[j] * norm[k];
+        }
+        return sum;
+      });
+    }
+
+    function TracksChart({ framesData, clusterMeta }) {
+      const [sigma, setSigma] = useState(3);
+
+      if (!framesData.length) return <div className="flex items-center justify-center py-20 text-sm" style={{color:'var(--text-faint)'}}>No detection data for this video</div>;
+
+      const W = 720, H = 300;
+      const pad = {l: 48, r: 24, t: 20, b: 44};
+      const pw = W - pad.l - pad.r, ph = H - pad.t - pad.b;
+      const frames = framesData.map(d => d.frame);
+      const minF = frames[0], maxF = frames[frames.length - 1];
+      const frameRange = maxF - minF || 1;
+      const maxCount = Math.max(1, ...clusterMeta.map(c => Math.max(...framesData.map(d => d[c.id] || 0))));
+      const xS = f => pad.l + ((f - minF) / frameRange) * pw;
+      const yS = v => pad.t + ph - (v / maxCount) * ph;
+      const yTickVals = Array.from({length: 6}, (_, i) => Math.round((maxCount / 5) * i));
+      const xTickFrames = Array.from({length: 6}, (_, i) => Math.round(minF + frameRange * i / 5));
+
+      return (
+        <div>
+          <div className="flex items-center justify-between mb-4">
+            <p className="text-[12px]" style={{color:'var(--text-muted)'}}>Number of distinct tracks visible per cluster across every detection frame</p>
+            <div className="flex items-center gap-2 flex-shrink-0 ml-4">
+              <span className="label-caps" style={{whiteSpace:'nowrap'}}>Smoothing σ</span>
+              <input
+                type="range" min="0" max="15" step="0.5"
+                value={sigma}
+                onChange={e => setSigma(+e.target.value)}
+                style={{width: 80}}
+              />
+              <span className="font-mono text-[11px]" style={{color: C.accent, minWidth: 24}}>{sigma}</span>
+            </div>
+          </div>
+          <svg viewBox={`0 0 ${W} ${H}`} style={{width:'100%',height:'auto',overflow:'visible'}}>
+            {yTickVals.map((v, i) => (
+              <g key={i}>
+                <line x1={pad.l} y1={yS(v)} x2={W-pad.r} y2={yS(v)} stroke="#1e3a5f" strokeWidth={1} strokeDasharray={v===0?undefined:'4,4'}/>
+                <text x={pad.l-8} y={yS(v)+4} textAnchor="end" fontSize={10} fill="#475569">{v}</text>
+              </g>
+            ))}
+            {xTickFrames.map((f, i) => (
+              <text key={i} x={xS(f)} y={H-pad.b+16} textAnchor="middle" fontSize={10} fill="#475569">{f}</text>
+            ))}
+            {clusterMeta.map(c => {
+              const raw = framesData.map(d => d[c.id] || 0);
+              const smoothed = gaussianSmooth(raw, sigma);
+              const pts = framesData.map((d, i) => `${xS(d.frame).toFixed(1)},${yS(smoothed[i]).toFixed(1)}`).join(' ');
+              return <polyline key={c.id} points={pts} fill="none" stroke={c.color} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" opacity={0.9}/>;
+            })}
+            <line x1={pad.l} y1={pad.t} x2={pad.l} y2={pad.t+ph} stroke="#334155" strokeWidth={1.5}/>
+            <line x1={pad.l} y1={pad.t+ph} x2={W-pad.r} y2={pad.t+ph} stroke="#334155" strokeWidth={1.5}/>
+            <text x={13} y={pad.t+ph/2} textAnchor="middle" fontSize={10} fill="#475569" transform={`rotate(-90,13,${pad.t+ph/2})`}>Tracks</text>
+            <text x={pad.l+pw/2} y={H-2} textAnchor="middle" fontSize={10} fill="#475569">Frame</text>
+          </svg>
+          <div className="flex flex-wrap gap-5 mt-4">
+            {clusterMeta.map(c => (
+              <div key={c.id} className="flex items-center gap-2">
+                <div style={{width:14,height:3,borderRadius:2,backgroundColor:c.color,flexShrink:0}}/>
+                <span className="text-[12px]" style={{color:'var(--text-secondary)'}}>{c.name}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function SpeciesChart({ entries }) {
+      const sorted = [...entries].sort((a, b) => b.count - a.count);
+      const total = sorted.reduce((s, e) => s + e.count, 0);
+      if (!total) return <div className="flex items-center justify-center py-20 text-sm" style={{color:'var(--text-faint)'}}>No cluster data for this video</div>;
+
+      const cx = 130, cy = 130, outerR = 100, innerR = 58;
+      const donutSlice = (startA, endA) => {
+        const [cos, sin] = [Math.cos, Math.sin];
+        const x1=cx+outerR*cos(startA), y1=cy+outerR*sin(startA);
+        const x2=cx+outerR*cos(endA),   y2=cy+outerR*sin(endA);
+        const x3=cx+innerR*cos(endA),   y3=cy+innerR*sin(endA);
+        const x4=cx+innerR*cos(startA), y4=cy+innerR*sin(startA);
+        const large = endA-startA > Math.PI ? 1 : 0;
+        return `M${x1.toFixed(2)} ${y1.toFixed(2)} A${outerR} ${outerR} 0 ${large} 1 ${x2.toFixed(2)} ${y2.toFixed(2)} L${x3.toFixed(2)} ${y3.toFixed(2)} A${innerR} ${innerR} 0 ${large} 0 ${x4.toFixed(2)} ${y4.toFixed(2)}Z`;
+      };
+
+      let angle = -Math.PI / 2;
+      const slices = sorted.map(e => {
+        const sweep = (e.count / total) * 2 * Math.PI;
+        const path = donutSlice(angle, angle + sweep);
+        angle += sweep;
+        return { ...e, path };
+      });
+
+      return (
+        <div className="flex items-center gap-10 flex-wrap">
+          <svg viewBox="0 0 260 260" style={{width:240,flexShrink:0}}>
+            {slices.map((s, i) => <path key={i} d={s.path} fill={s.color} opacity={0.9}/>)}
+            <text x={cx} y={cy-8} textAnchor="middle" fontSize={24} fontWeight="700" fill="#f1f5f9">{total.toLocaleString()}</text>
+            <text x={cx} y={cy+14} textAnchor="middle" fontSize={11} fill="#64748b">tracks</text>
+          </svg>
+          <div className="flex flex-col gap-3">
+            {slices.map((s, i) => (
+              <div key={i} className="flex items-center gap-3">
+                <div style={{width:14,height:14,borderRadius:3,backgroundColor:s.color,flexShrink:0}}/>
+                <div>
+                  <div className="text-[13px] font-medium" style={{color:'var(--text-primary)'}}>{s.name}</div>
+                  <div className="font-mono text-[11px]" style={{color:'var(--text-faint)'}}>
+                    {s.count.toLocaleString()} · {((s.count/total)*100).toFixed(1)}%
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function ConfidenceChart({ timeline }) {
+      if (!timeline.length) return <div className="flex items-center justify-center py-20 text-sm" style={{color:'var(--text-faint)'}}>No confidence data</div>;
+
+      const W = 720, H = 260;
+      const pad = {l: 52, r: 24, t: 20, b: 44};
+      const pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+      const frames = timeline.map(d => d.frame);
+      const minF = frames[0], maxF = frames[frames.length-1];
+      const frameRange = maxF - minF || 1;
+      const xS = f => pad.l + ((f-minF)/frameRange)*pw;
+      const yS = v => pad.t + ph - v*ph;
+      const xTickFrames = Array.from({length:6}, (_,i) => Math.round(minF + frameRange*i/5));
+      const yTickVals = [0, 0.25, 0.5, 0.75, 1.0];
+      const topPts = timeline.map(d => `${xS(d.frame).toFixed(1)},${yS(d.avg_conf).toFixed(1)}`).join(' ');
+      const areaPoints = [
+        `${xS(frames[0]).toFixed(1)},${yS(0).toFixed(1)}`,
+        ...timeline.map(d => `${xS(d.frame).toFixed(1)},${yS(d.avg_conf).toFixed(1)}`),
+        `${xS(frames[frames.length-1]).toFixed(1)},${yS(0).toFixed(1)}`,
+      ].join(' ');
+
+      return (
+        <div>
+          <p className="text-[12px] mb-4" style={{color:'var(--text-muted)'}}>Average detection confidence per frame — higher values mean the model is more certain about its detections</p>
+          <svg viewBox={`0 0 ${W} ${H}`} style={{width:'100%',height:'auto'}}>
+            <defs>
+              <linearGradient id="confGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={C.accent} stopOpacity="0.4"/>
+                <stop offset="100%" stopColor={C.accent} stopOpacity="0.03"/>
+              </linearGradient>
+            </defs>
+            {yTickVals.map((v,i) => (
+              <g key={i}>
+                <line x1={pad.l} y1={yS(v)} x2={W-pad.r} y2={yS(v)} stroke="#1e3a5f" strokeWidth={1} strokeDasharray={v===0?undefined:'4,4'}/>
+                <text x={pad.l-8} y={yS(v)+4} textAnchor="end" fontSize={10} fill="#475569">{v.toFixed(2)}</text>
+              </g>
+            ))}
+            {xTickFrames.map((f,i) => (
+              <text key={i} x={xS(f)} y={H-pad.b+16} textAnchor="middle" fontSize={10} fill="#475569">{f}</text>
+            ))}
+            <polygon points={areaPoints} fill="url(#confGrad)"/>
+            <polyline points={topPts} fill="none" stroke={C.accent} strokeWidth={2} strokeLinejoin="round"/>
+            <line x1={pad.l} y1={pad.t} x2={pad.l} y2={pad.t+ph} stroke="#334155" strokeWidth={1.5}/>
+            <line x1={pad.l} y1={pad.t+ph} x2={W-pad.r} y2={pad.t+ph} stroke="#334155" strokeWidth={1.5}/>
+            <text x={13} y={pad.t+ph/2} textAnchor="middle" fontSize={10} fill="#475569" transform={`rotate(-90,13,${pad.t+ph/2})`}>Confidence</text>
+            <text x={pad.l+pw/2} y={H-2} textAnchor="middle" fontSize={10} fill="#475569">Frame</text>
+          </svg>
+        </div>
+      );
+    }
+
+    function SpatialHeatmap({ heatmap }) {
+      if (!heatmap.length) return <div className="flex items-center justify-center py-20 text-sm" style={{color:'var(--text-faint)'}}>No spatial data</div>;
+
+      const GRID = 10, cellW = 48, cellH = 27;
+      const W = GRID*cellW, H = GRID*cellH;
+      const maxCount = Math.max(...heatmap.map(h => h.count), 1);
+      const grid = {};
+      heatmap.forEach(h => { grid[`${h.gx},${h.gy}`] = h.count; });
+
+      return (
+        <div>
+          <p className="text-[12px] mb-4" style={{color:'var(--text-muted)'}}>Spatial distribution of all detections across the video frame — each cell represents a 10% × 10% region</p>
+          <div className="flex gap-8 items-start flex-wrap">
+            <div style={{flexShrink:0}}>
+              <div className="font-mono text-[10px] mb-2 text-center" style={{color:'var(--text-faint)'}}>← video frame area →</div>
+              <svg viewBox={`0 0 ${W} ${H}`} style={{width:W,height:H,border:'1px solid #1e3a5f',borderRadius:4}}>
+                {Array.from({length:GRID}).flatMap((_,gy) =>
+                  Array.from({length:GRID}).map((_,gx) => {
+                    const count = grid[`${gx},${gy}`] || 0;
+                    const opacity = count > 0 ? 0.1 + 0.9*(count/maxCount) : 0;
+                    return (
+                      <g key={`${gx}-${gy}`}>
+                        <rect x={gx*cellW} y={gy*cellH} width={cellW} height={cellH} fill={C.accent} fillOpacity={opacity}/>
+                        <rect x={gx*cellW} y={gy*cellH} width={cellW} height={cellH} fill="none" stroke="#0a1a2e" strokeWidth={0.5}/>
+                        {count > 0 && (
+                          <text x={gx*cellW+cellW/2} y={gy*cellH+cellH/2+3.5} textAnchor="middle" fontSize={8}
+                            fill={opacity > 0.55 ? '#0f172a' : '#94a3b8'} fontFamily="monospace">{count}</text>
+                        )}
+                      </g>
+                    );
+                  })
+                )}
+              </svg>
+            </div>
+            <div className="flex flex-col gap-1.5 pt-8">
+              <span className="label-caps mb-1">Density scale</span>
+              {[1.0, 0.75, 0.5, 0.25, 0.05].map((t, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <div style={{width:22,height:13,borderRadius:2,backgroundColor:C.accent,opacity:0.1+0.9*t,flexShrink:0}}/>
+                  <span className="font-mono text-[11px]" style={{color:'var(--text-faint)'}}>{Math.round(maxCount*t)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function DurationHistogram({ durations }) {
+      if (!durations.length) return <div className="flex items-center justify-center py-20 text-sm" style={{color:'var(--text-faint)'}}>No track duration data</div>;
+
+      const BINS = 12;
+      const maxDur = Math.max(...durations), minDur = Math.min(...durations);
+      const range = maxDur - minDur || 1;
+      const binSize = Math.ceil(range / BINS);
+      const bins = Array.from({length:BINS}, (_,i) => ({label: minDur + i*binSize, count:0}));
+      durations.forEach(d => { bins[Math.min(Math.floor((d-minDur)/binSize), BINS-1)].count++; });
+
+      const W = 720, H = 260;
+      const pad = {l:52, r:24, t:20, b:54};
+      const pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+      const barW = pw/BINS, gap = 3;
+      const maxBin = Math.max(...bins.map(b=>b.count), 1);
+      const yS = v => pad.t + ph - (v/maxBin)*ph;
+      const yTicks = [0, 0.25, 0.5, 0.75, 1.0].map(t => Math.round(maxBin*t));
+      const avg = Math.round(durations.reduce((a,b)=>a+b,0)/durations.length);
+
+      return (
+        <div>
+          <p className="text-[12px] mb-4" style={{color:'var(--text-muted)'}}>Distribution of how many frames each tracked animal remained visible — longer durations indicate animals moving through the full frame</p>
+          <svg viewBox={`0 0 ${W} ${H}`} style={{width:'100%',height:'auto'}}>
+            {yTicks.map((v,i) => (
+              <g key={i}>
+                <line x1={pad.l} y1={yS(v)} x2={W-pad.r} y2={yS(v)} stroke="#1e3a5f" strokeWidth={1} strokeDasharray={v===0?undefined:'4,4'}/>
+                <text x={pad.l-8} y={yS(v)+4} textAnchor="end" fontSize={10} fill="#475569">{v}</text>
+              </g>
+            ))}
+            {bins.map((b,i) => {
+              const x = pad.l + i*barW + gap/2;
+              const bw = barW - gap;
+              const bh = (b.count/maxBin)*ph;
+              const by = pad.t + ph - bh;
+              return (
+                <g key={i}>
+                  <rect x={x} y={by} width={bw} height={Math.max(bh,0)} fill={C.accent} fillOpacity={0.7} rx={2}/>
+                  {b.count > 0 && bh > 16 && (
+                    <text x={x+bw/2} y={by+13} textAnchor="middle" fontSize={9} fill="#0f172a">{b.count}</text>
+                  )}
+                  <text x={x+bw/2} y={H-pad.b+16} textAnchor="middle" fontSize={9} fill="#475569"
+                    transform={b.label > 99 ? `rotate(-35,${x+bw/2},${H-pad.b+16})` : undefined}>{b.label}</text>
+                </g>
+              );
+            })}
+            <line x1={pad.l} y1={pad.t} x2={pad.l} y2={pad.t+ph} stroke="#334155" strokeWidth={1.5}/>
+            <line x1={pad.l} y1={pad.t+ph} x2={W-pad.r} y2={pad.t+ph} stroke="#334155" strokeWidth={1.5}/>
+            <text x={13} y={pad.t+ph/2} textAnchor="middle" fontSize={10} fill="#475569" transform={`rotate(-90,13,${pad.t+ph/2})`}>Tracks</text>
+            <text x={pad.l+pw/2} y={H-4} textAnchor="middle" fontSize={10} fill="#475569">Duration (frames)</text>
+          </svg>
+          <div className="flex gap-6 mt-4 font-mono text-[11px]" style={{color:'var(--text-muted)'}}>
+            <span>Total: <span style={{color:C.accent}}>{durations.length}</span> tracks</span>
+            <span>Min: <span style={{color:C.accent}}>{minDur}</span> frames</span>
+            <span>Max: <span style={{color:C.accent}}>{maxDur}</span> frames</span>
+            <span>Avg: <span style={{color:C.accent}}>{avg}</span> frames</span>
+          </div>
+        </div>
+      );
+    }
+
+    // ── VideoStatsModal ───────────────────────────────────────────────────────
+
+    function VideoStatsModal({ video, clusters, onClose }) {
+      const [tab, setTab] = useState('tracks');
+      const [data, setData] = useState(null);
+      const [loading, setLoading] = useState(true);
+
+      useEffect(() => {
+        setLoading(true);
+        setData(null);
+        get(`/api/video/${video}/stats`).then(d => { setData(d); setLoading(false); });
+      }, [video]);
+
+      useEffect(() => {
+        const onKey = e => { if (e.key === 'Escape') onClose(); };
+        window.addEventListener('keydown', onKey);
+        return () => window.removeEventListener('keydown', onKey);
+      }, [onClose]);
+
+      const clusterEntries = clusters
+        .map(c => ({
+          name: c.name,
+          color: c.color,
+          count: c.track_keys.filter(k => k.startsWith(video + '__')).length,
+        }))
+        .filter(e => e.count > 0);
+
+      const TABS = [
+        { id: 'tracks',     label: 'Tracks per Cluster' },
+        { id: 'species',    label: 'Clusters' },
+        { id: 'confidence', label: 'Confidence' },
+        { id: 'heatmap',    label: 'Spatial Heatmap' },
+        { id: 'durations',  label: 'Track Durations' },
+      ];
+
+      return (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center"
+          style={{backgroundColor:'var(--bg-overlay)', backdropFilter:'blur(8px)'}}
+          onClick={onClose}
+        >
+          <div
+            className="rounded-xl flex flex-col mx-6"
+            style={{
+              backgroundColor:'var(--bg-surface-2)',
+              border:'1px solid var(--border-moderate)',
+              maxWidth:900, width:'100%', maxHeight:'92vh',
+              boxShadow:'var(--shadow-modal)',
+            }}
+            onClick={e => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-center gap-3 px-6 py-4 border-b flex-shrink-0" style={{borderColor:'var(--border-subtle)'}}>
+              <span style={{color:C.accent, display:'inline-flex'}}><Icons.BarChart2 size={16}/></span>
+              <span className="text-[15px] font-semibold" style={{color:'var(--text-primary)'}}>Video Statistics</span>
+              <span className="font-mono text-[12px] px-2 py-0.5 rounded" style={{color:'var(--text-muted)', backgroundColor:'var(--bg-surface-3)'}}>{video}</span>
+              {data && (
+                <div className="flex items-center gap-5 ml-3">
+                  {[
+                    {label:'Detections', value: data.total_detections.toLocaleString()},
+                    {label:'Tracks', value: data.total_tracks.toLocaleString()},
+                  ].map(s => (
+                    <div key={s.label} className="flex items-center gap-1.5">
+                      <span className="label-caps">{s.label}</span>
+                      <span className="font-mono text-[13px]" style={{color:C.accent}}>{s.value}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <button onClick={onClose} className="btn-icon ml-auto"><Icons.X size={16}/></button>
+            </div>
+
+            {/* Tabs */}
+            <div className="flex items-center px-6 border-b flex-shrink-0" style={{borderColor:'var(--border-subtle)'}}>
+              {TABS.map(t => (
+                <button key={t.id} onClick={() => setTab(t.id)}
+                  className="px-4 py-3 text-[13px] font-medium transition-colors"
+                  style={{
+                    color: tab===t.id ? C.accent : 'var(--text-muted)',
+                    borderBottom: `2px solid ${tab===t.id ? C.accent : 'transparent'}`,
+                    backgroundColor: 'transparent',
+                    cursor: 'pointer',
+                    marginBottom: -1,
+                    fontFamily: 'inherit',
+                  }}
+                >{t.label}</button>
+              ))}
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 overflow-y-auto p-6 min-h-0">
+              {loading ? (
+                <div className="flex items-center justify-center h-52 gap-2" style={{color:'var(--text-faint)'}}>
+                  <svg className="animate-spin" style={{width:16,height:16}} xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                    <circle style={{opacity:0.25}} cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path style={{opacity:0.75}} fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                  </svg>
+                  <span className="text-sm">Loading statistics…</span>
+                </div>
+              ) : !data ? (
+                <div className="flex items-center justify-center h-52 text-sm" style={{color:'var(--text-faint)'}}>No data available for this video</div>
+              ) : tab === 'tracks' ? (
+                <TracksChart framesData={data.frames_data} clusterMeta={data.cluster_meta}/>
+              ) : tab === 'species' ? (
+                <SpeciesChart entries={clusterEntries}/>
+              ) : tab === 'confidence' ? (
+                <ConfidenceChart timeline={data.confidence_timeline}/>
+              ) : tab === 'heatmap' ? (
+                <SpatialHeatmap heatmap={data.spatial_heatmap}/>
+              ) : (
+                <DurationHistogram durations={data.track_durations}/>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     // ── InitPanel ─────────────────────────────────────────────────────────────
 
     function InitPanel({ videos, onInitialize }) {
@@ -1245,6 +1674,7 @@
       const [contextMenu, setContextMenu] = useState(null);
       const [cropViewer, setCropViewer]   = useState(null);
       const [trashOpen, setTrashOpen]     = useState(false);
+      const [statsOpen, setStatsOpen]     = useState(false);
       const [view, setView]               = useState('review');
       const [stripHeight, setStripHeight] = useState(() => Math.round(window.innerHeight / 2.5));
       const [selectedKeys, setSelectedKeys] = useState(new Set());
@@ -1615,15 +2045,17 @@
 
               {/* Video player */}
               {video && <>
-                <div className="flex flex-shrink-0 border-b" style={{height: videoHeight, borderColor: C.border}}>
+                <div className="flex flex-shrink-0 border-b" style={{height: videoHeight, borderColor: C.border, gap: 12}}>
                   <ClusterFilterPanel
                     clusters={clusters}
                     tracks={tracks}
                     visibleClusterIds={visibleClusterIds}
                     onToggle={toggleClusterVisibility}
                     onToggleAll={toggleAllClusters}
+                    onStatsClick={() => setStatsOpen(true)}
                   />
                   <VideoPlayer video={video} height={videoHeight} showAnnotations={true} selectedKeys={selectedKeys} trackColorMap={trackColorMap} visibleClusterIds={visibleClusterIds} trackToCluster={trackToCluster} />
+                  <div style={{width: 220, flexShrink: 1}} />
                 </div>
                 <div
                   onMouseDown={e => {
@@ -1759,6 +2191,13 @@
             />
           )}
           {cropViewer && <CropViewer trackKey={cropViewer} onClose={() => setCropViewer(null)} />}
+          {statsOpen && video && (
+            <VideoStatsModal
+              video={video}
+              clusters={clusters}
+              onClose={() => setStatsOpen(false)}
+            />
+          )}
           {trashOpen && (
             <TrashModal
               trash={appState?.trash || { track_keys: [], metadata: {} }}

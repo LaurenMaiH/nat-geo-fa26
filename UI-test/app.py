@@ -420,6 +420,87 @@ def api_video_tracks(video_name):
     ])
 
 
+@app.route("/api/video/<video_name>/stats")
+def api_video_stats(video_name):
+    state = load_state()
+    detections = DETECTIONS_CACHE.get(video_name, {})
+
+    # Build track_id (int) → cluster_id for this video
+    track_to_cluster = {}
+    for track_key, cid in state.get("track_assignments", {}).items():
+        vid, tid = track_key.rsplit("__", 1)
+        if vid == video_name:
+            try:
+                track_to_cluster[int(tid)] = cid
+            except ValueError:
+                pass
+
+    cluster_objs = state.get("clusters", {})
+    all_cids = list(cluster_objs.keys())
+
+    # Per-frame accumulation
+    frame_cluster_tracks = {}   # frame → {cid → set of track_ids}
+    class_dist = defaultdict(int)
+    conf_by_frame = defaultdict(lambda: [0.0, 0])   # frame → [sum, count]
+    spatial_grid = defaultdict(int)                  # (gx, gy) → count
+    track_first = {}
+    track_last = {}
+    GRID = 10
+
+    for frame, boxes in detections.items():
+        fc = defaultdict(set)
+        for box in boxes:
+            tid = box["track_id"]
+            cid = track_to_cluster.get(tid, "noise")
+            fc[cid].add(tid)
+            class_dist[box["class"]] += 1
+            conf_by_frame[frame][0] += box["conf"]
+            conf_by_frame[frame][1] += 1
+            gx = min(int(box["x"] * GRID), GRID - 1)
+            gy = min(int(box["y"] * GRID), GRID - 1)
+            spatial_grid[(gx, gy)] += 1
+            if tid not in track_first:
+                track_first[tid] = frame
+            track_last[tid] = frame
+        frame_cluster_tracks[frame] = fc
+
+    # frames_data: one entry per frame, all cluster IDs present
+    frames_data = []
+    for frame in sorted(frame_cluster_tracks.keys()):
+        entry = {"frame": frame}
+        for cid in all_cids:
+            entry[cid] = len(frame_cluster_tracks[frame].get(cid, set()))
+        frames_data.append(entry)
+
+    # Confidence timeline (every frame, averaged)
+    confidence_timeline = [
+        {"frame": f, "avg_conf": round(s / c, 4)}
+        for f, (s, c) in sorted(conf_by_frame.items()) if c > 0
+    ]
+
+    # Track durations (in frames)
+    track_durations = [
+        track_last[tid] - track_first[tid] + 1
+        for tid in track_first
+    ]
+
+    cluster_meta = [
+        {"id": cid, "name": cluster_objs[cid].get("name", cid), "color": cluster_objs[cid].get("color", "#6B7280")}
+        for cid in all_cids
+    ]
+
+    return jsonify({
+        "frames_data": frames_data,
+        "cluster_meta": cluster_meta,
+        "class_distribution": dict(class_dist),
+        "confidence_timeline": confidence_timeline,
+        "spatial_heatmap": [{"gx": gx, "gy": gy, "count": cnt} for (gx, gy), cnt in spatial_grid.items()],
+        "track_durations": track_durations,
+        "total_detections": sum(len(b) for b in detections.values()),
+        "total_tracks": len(track_first),
+    })
+
+
 @app.route("/api/initialize", methods=["POST"])
 def api_initialize():
     """
