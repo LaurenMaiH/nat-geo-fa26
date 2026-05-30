@@ -48,8 +48,9 @@ MISSION_ID   = "PLW_dscm_33"          # ← only line to change between missions
 MISSION_PATH = f"/DOEX0096_Palau/{MISSION_ID}/Video"   # ← and this one
 
 SELECTED_VIDEOS = None  # set to a list of filenames, or None for all
+START_FROM      = "PLW_dscm_33_c167.mp4"  # set to a filename to start from that video (inclusive)
 
-CHECKPOINT_PATH = Path(__file__).parent / "finetuning" / "checkpoints" / "best.pt"
+CHECKPOINT_PATH = Path(__file__).parent / "checkpoints" / "best.pt"
 
 _MISSION_DIR      = Path(__file__).parent / "processed_missions" / MISSION_ID
 _MISSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -466,7 +467,7 @@ def connect_dropbox():
 
 
 # ──────── MAIN ───────────────────────────────────────────────────────────────
-def main():
+def main(reporter=None):
     print(f"Using device: {INFERENCE_DEVICE}")
 
     dbx            = connect_dropbox()
@@ -501,22 +502,37 @@ def main():
         idx     = next(i for i, e in enumerate(entries) if e.name == last_processed)
         entries = entries[idx + 1:]
         print(f"Resuming after '{last_processed}': {len(entries)} videos remaining")
+    elif START_FROM and START_FROM in {e.name for e in entries}:
+        idx     = next(i for i, e in enumerate(entries) if e.name == START_FROM)
+        entries = entries[idx:]
+        print(f"Starting from '{START_FROM}': {len(entries)} videos remaining")
     else:
         print("Starting from the beginning")
 
+    total   = len(entries)
     counter = 0
     with tempfile.TemporaryDirectory(prefix="natgeo_") as tmpdir:
         tmpdir = Path(tmpdir)
-        for entry in entries:
+        for idx, entry in enumerate(entries):
+            if reporter and reporter.should_stop():
+                print("Stop signal received — exiting after current video.")
+                break
+
             video_name = Path(entry.name).stem
             media_id   = entry.name
             local_path = tmpdir / entry.name
+
+            if reporter:
+                reporter.begin_video(video_name, idx + 1, total)
+                reporter.stage("downloading")
 
             print(f"\n{'='*60}")
             print(f"Downloading: {entry.name}")
             dbx.files_download_to_file(str(local_path), f"{MISSION_PATH}/{entry.name}")
 
             try:
+                if reporter:
+                    reporter.stage("detecting")
                 track_crops = process_video(
                     local_path, media_id, video_name, model, tracker,
                     OUTPUT_CSV_PATH, OUTPUT_CROPS_DIR,
@@ -526,6 +542,8 @@ def main():
                 # ── Batch embedding per track ─────────────────────────────────
                 total_crops = sum(len(v) for v in track_crops.values())
                 print(f"  Embedding {total_crops} crops across {len(track_crops)} tracks...")
+                if reporter:
+                    reporter.stage("embedding")
                 for tid, crop_paths in track_crops.items():
                     images = [cv2.imread(p) for p in crop_paths]
                     images = [img for img in images if img is not None]
@@ -548,9 +566,13 @@ def main():
                 counter += 1
                 print(f"✓  {entry.name}  ({len(track_crops)} tracks, "
                       f"{len(all_embeddings)} total embeddings so far)")
+                if reporter:
+                    reporter.video_done(video_name, len(track_crops), len(all_embeddings))
 
             except Exception as e:
                 print(f"✗  {entry.name} failed: {e}")
+                if reporter:
+                    reporter.video_error(video_name, str(e))
             finally:
                 local_path.unlink(missing_ok=True)
 
@@ -559,6 +581,8 @@ def main():
     print(f"  Detections CSV : {OUTPUT_CSV_PATH}")
     print(f"  Crops folder   : {OUTPUT_CROPS_DIR}/")
     print(f"  Embeddings JSON: {OUTPUT_EMBEDDINGS}  ({len(all_embeddings)} entries)")
+    if reporter:
+        reporter.pipeline_done(counter, len(all_embeddings))
 
 
 if __name__ == "__main__":
