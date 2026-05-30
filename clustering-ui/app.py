@@ -865,5 +865,258 @@ def api_proxy_serve(video_name):
     return send_file(proxy_path, mimetype="video/mp4", conditional=True)
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PIPELINE — routes and state management
+# All clustering routes above are completely untouched.
+# ══════════════════════════════════════════════════════════════════════════════
+
+import sys
+import io
+from collections import deque
+from datetime import datetime
+
+# ── Pipeline shared state ─────────────────────────────────────────────────────
+
+_pipeline_lock  = threading.Lock()
+_stop_event     = threading.Event()
+_log_buffer     = deque(maxlen=300)
+
+_pipeline_state = {
+    "running":          False,
+    "mission_id":       None,
+    "current_video":    None,
+    "current_stage":    None,
+    "frame_progress":   None,
+    "videos_done":      0,
+    "videos_total":     0,
+    "tracks_found":     0,
+    "embeddings_total": 0,
+    "errors":           [],
+    "started_at":       None,
+    "finished_at":      None,
+}
+
+
+# ── PipelineReporter ──────────────────────────────────────────────────────────
+
+class PipelineReporter:
+    def log(self, msg: str):
+        ts   = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        with _pipeline_lock:
+            _log_buffer.append(line)
+
+    def begin_video(self, video_name: str, idx: int, total: int):
+        with _pipeline_lock:
+            _pipeline_state["current_video"]  = video_name
+            _pipeline_state["current_stage"]  = "downloading"
+            _pipeline_state["videos_total"]   = total
+            _pipeline_state["frame_progress"] = None
+        self.log(f"▶ [{idx}/{total}] {video_name}")
+
+    def stage(self, stage: str):
+        with _pipeline_lock:
+            _pipeline_state["current_stage"] = stage
+        self.log(f"  → {stage}")
+
+    def frame_progress(self, current: int, total: int):
+        with _pipeline_lock:
+            _pipeline_state["frame_progress"] = {"current": current, "total": total}
+
+    def update_embeddings(self, total: int):
+        with _pipeline_lock:
+            _pipeline_state["embeddings_total"] = total
+
+    def video_done(self, video_name: str, n_tracks: int, n_embeddings: int):
+        with _pipeline_lock:
+            _pipeline_state["videos_done"]      += 1
+            _pipeline_state["tracks_found"]     += n_tracks
+            _pipeline_state["embeddings_total"]  = n_embeddings
+            _pipeline_state["frame_progress"]    = None
+        self.log(f"  ✓ done — {n_tracks} tracks, {n_embeddings} total embeddings")
+
+    def video_error(self, video_name: str, error: str):
+        with _pipeline_lock:
+            _pipeline_state["errors"].append({"video": video_name, "error": error})
+        self.log(f"  ✗ ERROR: {error}")
+
+    def pipeline_done(self, n_videos: int, n_embeddings: int):
+        with _pipeline_lock:
+            _pipeline_state["running"]       = False
+            _pipeline_state["current_stage"] = "done"
+            _pipeline_state["finished_at"]   = datetime.now().isoformat()
+        self.log(f"Pipeline complete — {n_videos} videos, {n_embeddings} embeddings")
+
+    def should_stop(self) -> bool:
+        return _stop_event.is_set()
+
+
+# ── Log capture ───────────────────────────────────────────────────────────────
+
+class _LogCapture(io.TextIOBase):
+    def __init__(self, original, reporter: PipelineReporter):
+        self._orig     = original
+        self._reporter = reporter
+
+    def write(self, s: str):
+        self._orig.write(s)
+        self._orig.flush()
+        stripped = s.rstrip("\n")
+        if stripped:
+            self._reporter.log(stripped)
+        return len(s)
+
+    def flush(self):
+        self._orig.flush()
+
+
+# ── Thread target ─────────────────────────────────────────────────────────────
+
+def _run_pipeline(config: dict):
+    reporter    = PipelineReporter()
+    orig_stdout = sys.stdout
+    sys.stdout  = _LogCapture(orig_stdout, reporter)
+
+    try:
+        import importlib.util
+        import traceback
+
+        pipeline_path = BASE_DIR / "overnight_pipeline_optimized.py"
+        reporter.log(f"Pipeline script path: {pipeline_path}")
+        reporter.log(f"Exists: {pipeline_path.exists()}")
+
+        if not pipeline_path.exists():
+            raise FileNotFoundError(
+                f"overnight_pipeline_optimized.py not found at {pipeline_path}. "
+                f"Expected it at nat-geo/overnight_pipeline_optimized.py"
+            )
+
+        reporter.log("Loading pipeline module...")
+        spec = importlib.util.spec_from_file_location("pipeline", pipeline_path)
+        mod  = importlib.util.module_from_spec(spec)
+
+        overrides = {
+            "MISSION_ID":      config["mission_id"],
+            "MISSION_PATH":    config.get("mission_path") or
+                               f"/DOEX0096_Palau/{config['mission_id']}/Video",
+            "START_FROM":      config.get("start_from") or None,
+            "SELECTED_VIDEOS": config.get("selected_videos") or None,
+            "CONF_THRESHOLD":  float(config.get("conf_threshold",  0.15)),
+            "IOU_THRESHOLD":   float(config.get("iou_threshold",   0.70)),
+            "MIN_TRACK_LEN":   int(config.get("min_track_len",     3)),
+            "CROPS_PER_TRACK": int(config.get("crops_per_track",   3)),
+        }
+        for k, v in overrides.items():
+            setattr(mod, k, v)
+
+        reporter.log("Executing pipeline module (imports + top-level setup)...")
+        spec.loader.exec_module(mod)
+        reporter.log("Module loaded. Applying config overrides...")
+
+        for k, v in overrides.items():
+            setattr(mod, k, v)
+
+        mission_dir = BASE_DIR / "processed_missions" / config["mission_id"]
+        mission_dir.mkdir(parents=True, exist_ok=True)
+        mod.OUTPUT_CSV_PATH   = mission_dir / f"{config['mission_id']}_detections.csv"
+        mod.OUTPUT_CROPS_DIR  = mission_dir / f"{config['mission_id']}_crops"
+        mod.OUTPUT_EMBEDDINGS = mission_dir / f"{config['mission_id']}_embeddings.json"
+
+        reporter.log(f"Output dir: {mission_dir}")
+        reporter.log("Calling main()...")
+        mod.main(reporter=reporter)
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        reporter.log(f"FATAL: {e}")
+        for line in tb.splitlines():
+            reporter.log(line)
+        with _pipeline_lock:
+            _pipeline_state["running"]     = False
+            _pipeline_state["finished_at"] = datetime.now().isoformat()
+            _pipeline_state["errors"].append({"video": "—", "error": str(e)})
+    finally:
+        sys.stdout = orig_stdout
+
+
+# ── Pipeline routes ───────────────────────────────────────────────────────────
+
+@app.route("/api/pipeline/status")
+def api_pipeline_status():
+    with _pipeline_lock:
+        return jsonify(dict(_pipeline_state))
+
+
+@app.route("/api/pipeline/log")
+def api_pipeline_log():
+    with _pipeline_lock:
+        lines = list(_log_buffer)
+    return jsonify({"lines": lines})
+
+
+@app.route("/api/pipeline/start", methods=["POST"])
+def api_pipeline_start():
+    config = request.get_json()
+    if not config.get("mission_id"):
+        return jsonify({"error": "mission_id required"}), 400
+
+    with _pipeline_lock:
+        if _pipeline_state["running"]:
+            return jsonify({"error": "Pipeline already running"}), 409
+
+        _stop_event.clear()
+        _log_buffer.clear()
+        _pipeline_state.update({
+            "running":          True,
+            "mission_id":       config["mission_id"],
+            "current_video":    None,
+            "current_stage":    "starting",
+            "frame_progress":   None,
+            "videos_done":      0,
+            "videos_total":     0,
+            "tracks_found":     0,
+            "embeddings_total": 0,
+            "errors":           [],
+            "started_at":       datetime.now().isoformat(),
+            "finished_at":      None,
+        })
+
+    threading.Thread(target=_run_pipeline, args=(config,), daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
+@app.route("/api/pipeline/stop", methods=["POST"])
+def api_pipeline_stop():
+    _stop_event.set()
+    return jsonify({"ok": True, "message": "Stop signal sent — will finish after current video."})
+
+
+@app.route("/api/pipeline/missions")
+def api_pipeline_missions():
+    missions_root = BASE_DIR / "processed_missions"
+    if not missions_root.exists():
+        return jsonify([])
+    missions = []
+    for d in sorted(missions_root.iterdir()):
+        if not d.is_dir():
+            continue
+        emb_file = next(d.glob("*_embeddings.json"), None)
+        crop_dir = next(d.glob("*_crops"), None)
+        n_emb    = 0
+        if emb_file and emb_file.exists():
+            try:
+                n_emb = len(json.loads(emb_file.read_text()))
+            except Exception:
+                pass
+        missions.append({
+            "mission_id":   d.name,
+            "has_crops":    crop_dir is not None and crop_dir.exists(),
+            "n_embeddings": n_emb,
+            "emb_path":     str(emb_file) if emb_file else None,
+        })
+    return jsonify(missions)
+
+
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
