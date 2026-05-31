@@ -37,10 +37,34 @@
 
     // ── VideoList ─────────────────────────────────────────────────────────────
 
-    function VideoList({ videos, selected, onSelect }) {
+    function VideoList({ videos, selected, onSelect, missions, currentMission, onMissionChange }) {
       const approved = videos.filter(v => v.status === 'approved').length;
       return (
         <div className="flex flex-col flex-shrink-0 overflow-hidden border-r" style={{width: 220, backgroundColor: C.card, borderColor: C.border}}>
+          {missions && missions.length > 0 && (
+            <div className="px-3 py-2 border-b" style={{borderColor: C.border}}>
+              <div className="label-caps mb-1.5">Mission</div>
+              <select
+                value={currentMission || ''}
+                onChange={e => onMissionChange && onMissionChange(e.target.value)}
+                style={{
+                  width: '100%',
+                  backgroundColor: 'var(--bg-surface-3)',
+                  border: '1px solid var(--border-moderate)',
+                  color: 'var(--text-primary)',
+                  borderRadius: 4,
+                  padding: '4px 6px',
+                  fontSize: 12,
+                  fontFamily: 'inherit',
+                  cursor: 'pointer',
+                }}
+              >
+                {missions.map(m => (
+                  <option key={m.mission_id} value={m.mission_id}>{m.mission_id}</option>
+                ))}
+              </select>
+            </div>
+          )}
           <div className="px-3 py-2.5 flex items-center justify-between border-b" style={{borderColor: C.border}}>
             <span className="label-caps">Video Queue</span>
             <span className="font-mono text-[10px]" style={{color: 'var(--text-faint)'}}>{approved}/{videos.length}</span>
@@ -1361,7 +1385,7 @@
       );
     }
 
-    function PipelineView() {
+    function PipelineView({ onGoToReview }) {
       const [status, setStatus]   = useState(null);
       const [log, setLog]         = useState([]);
       const [missions, setMissions] = useState([]);
@@ -1371,6 +1395,7 @@
         min_track_len: 3, crops_per_track: 3,
       });
       const logRef = useRef(null);
+      const [stopRequested, setStopRequested] = useState(false);
 
       const refreshStatus = useCallback(async () => {
         const [s, l] = await Promise.all([
@@ -1393,6 +1418,10 @@
       }, [status?.running]);
 
       useEffect(() => {
+        if (!status?.running) setStopRequested(false);
+      }, [status?.running]);
+
+      useEffect(() => {
         if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
       }, [log]);
 
@@ -1403,6 +1432,7 @@
       };
 
       const handleStop = async () => {
+        setStopRequested(true);
         await post('/api/pipeline/stop', {});
         refreshStatus();
       };
@@ -1490,21 +1520,30 @@
             </div>
 
             <button
-              onClick={running ? handleStop : handleStart}
-              disabled={!running && !config.mission_id.trim()}
+              onClick={running && !stopRequested ? handleStop : (!running ? handleStart : undefined)}
+              disabled={(!running && !config.mission_id.trim()) || stopRequested}
               className="w-full rounded-lg font-medium disabled:opacity-40"
               style={{
                 padding: '10px 16px',
-                backgroundColor: running ? 'var(--error-bg)' : C.hover,
-                color: running ? 'var(--error)' : 'var(--text-primary)',
-                border: `1px solid ${running ? 'var(--error-border)' : 'var(--border-strong)'}`,
-                cursor: 'pointer',
+                backgroundColor: running
+                  ? (stopRequested ? '#431407' : 'var(--error-bg)')
+                  : C.hover,
+                color: running
+                  ? (stopRequested ? '#fb923c' : 'var(--error)')
+                  : 'var(--text-primary)',
+                border: `1px solid ${running
+                  ? (stopRequested ? '#7c2d12' : 'var(--error-border)')
+                  : 'var(--border-strong)'}`,
+                cursor: stopRequested ? 'default' : 'pointer',
                 fontFamily: 'inherit',
                 fontSize: 13,
-                transition: 'background var(--transition-base)',
+                transition: 'all var(--transition-base)',
               }}
             >
-              {running ? '⏹ Stop after current video' : '▶ Start Pipeline'}
+              {running
+                ? (stopRequested ? '⏸ Stopping after current video…' : '⏹ Stop after current video')
+                : '▶ Start Pipeline'
+              }
             </button>
 
             {missions.length > 0 && (
@@ -1556,33 +1595,63 @@
               )}
             </div>
 
-            {/* Current video + stage pip */}
+            {/* Current video progress */}
             {status?.current_video && (
-              <div className="flex items-center gap-6 px-6 py-3 flex-shrink-0 border-b"
-                   style={{backgroundColor: C.bg, borderColor: C.border}}>
-                <div>
-                  <div className="label-caps mb-1">Current video</div>
+              <div className="px-6 py-3 flex-shrink-0 border-b" style={{backgroundColor: C.bg, borderColor: C.border}}>
+                <div className="flex items-center justify-between mb-2">
                   <div className="font-mono text-[13px]" style={{color: 'var(--text-primary)'}}>{status.current_video}</div>
-                </div>
-                <div className="flex items-center gap-2 flex-wrap">
-                  {STAGES.filter(s => s !== 'done').map(s => (
-                    <StagePip key={s} stage={s} current={status.current_stage || ''} />
-                  ))}
-                </div>
-                {status.frame_progress && (
-                  <div className="ml-auto flex items-center gap-3">
+                  {status.frame_progress && (
                     <span className="font-mono text-[11px]" style={{color: 'var(--text-muted)'}}>
-                      {status.frame_progress.current} / {status.frame_progress.total}
+                      frame {status.frame_progress.current.toLocaleString()} / {status.frame_progress.total.toLocaleString()}
                     </span>
-                    <div style={{width:120, height:6, backgroundColor: 'var(--bg-surface-3)', borderRadius:3}}>
-                      <div style={{
-                        width: `${(status.frame_progress.current / status.frame_progress.total * 100).toFixed(1)}%`,
-                        height: '100%', backgroundColor: C.accent, borderRadius:3,
-                        transition: 'width 0.5s ease',
-                      }} />
-                    </div>
-                  </div>
-                )}
+                  )}
+                </div>
+                {/* 3-segment bar: detecting | extracting | embedding */}
+                <div className="flex gap-0.5" style={{height: 6}}>
+                  {[
+                    {label: 'Detecting',  stageStart: 0,   stageEnd: 1/3},
+                    {label: 'Extracting', stageStart: 1/3, stageEnd: 2/3},
+                    {label: 'Embedding',  stageStart: 2/3, stageEnd: 1},
+                  ].map(({label, stageStart, stageEnd}, i) => {
+                    const pct = status.video_stage_pct ?? 0;
+                    const fill = Math.min(Math.max((pct - stageStart) / (stageEnd - stageStart), 0), 1);
+                    const isActive = pct >= stageStart && pct < stageEnd;
+                    return (
+                      <div key={label} style={{
+                        flex: 1,
+                        position: 'relative',
+                        overflow: 'hidden',
+                        borderRadius: i === 0 ? '3px 0 0 3px' : i === 2 ? '0 3px 3px 0' : 0,
+                        backgroundColor: 'var(--bg-surface-3)',
+                      }}>
+                        <div style={{
+                          position: 'absolute', inset: 0,
+                          transform: `scaleX(${fill})`,
+                          transformOrigin: 'left',
+                          backgroundColor: isActive ? C.accent : (fill >= 1 ? 'var(--success)' : C.accent),
+                          transition: 'transform 0.4s ease',
+                        }} />
+                      </div>
+                    );
+                  })}
+                </div>
+                {/* Stage labels */}
+                <div className="flex mt-1" style={{fontSize: 10}}>
+                  {['Detecting', 'Extracting', 'Embedding'].map((label, i) => {
+                    const stagePcts = [0, 1/3, 2/3];
+                    const pct = status.video_stage_pct ?? 0;
+                    const done = pct >= stagePcts[i] + 1/3;
+                    const active = pct >= stagePcts[i] && pct < stagePcts[i] + 1/3;
+                    return (
+                      <span key={label} style={{
+                        flex: 1,
+                        textAlign: i === 0 ? 'left' : i === 2 ? 'right' : 'center',
+                        color: active ? C.accent : done ? 'var(--success)' : 'var(--text-faint)',
+                        fontWeight: active ? 500 : 400,
+                      }}>{label}</span>
+                    );
+                  })}
+                </div>
               </div>
             )}
 
@@ -1590,7 +1659,7 @@
             {status?.videos_total > 0 && (
               <div className="px-6 pt-4 flex-shrink-0">
                 <div className="flex justify-between items-center mb-2">
-                  <span className="label-caps">Overall progress</span>
+                  <span className="label-caps">Overall mission progress</span>
                   <span className="font-mono text-[12px]" style={{color: 'var(--text-muted)'}}>{progress}%</span>
                 </div>
                 <div style={{height: 8, backgroundColor: 'var(--bg-surface-3)', borderRadius: 'var(--radius-sm)'}}>
@@ -1652,7 +1721,21 @@
                       {status.videos_done} videos · {status.embeddings_total} embeddings ready
                     </div>
                   </div>
-                  <div className="text-xs" style={{color:'#86efac'}}>Switch to Cluster Review →</div>
+                  {onGoToReview && (
+                    <button
+                      onClick={() => onGoToReview(status.mission_id)}
+                      className="text-xs px-3 py-1.5 rounded font-medium transition-colors hover:opacity-80"
+                      style={{
+                        backgroundColor: 'var(--success-border)',
+                        color: 'var(--success)',
+                        border: '1px solid var(--success)',
+                        cursor: 'pointer',
+                        fontFamily: 'inherit',
+                      }}
+                    >
+                      Switch to Cluster Review →
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -1676,6 +1759,8 @@
       const [trashOpen, setTrashOpen]     = useState(false);
       const [statsOpen, setStatsOpen]     = useState(false);
       const [view, setView]               = useState('review');
+      const [reviewMissions, setReviewMissions]           = useState([]);
+      const [currentReviewMission, setCurrentReviewMission] = useState('');
       const [stripHeight, setStripHeight] = useState(() => Math.round(window.innerHeight / 2.5));
       const [selectedKeys, setSelectedKeys] = useState(new Set());
       const [visibleClusterIds, setVisibleClusterIds] = useState(new Set());
@@ -1756,6 +1841,44 @@
         setVideos(vids);
         return state;
       }, []);
+
+      const fetchReviewMissions = useCallback(async () => {
+        try {
+          const ms = await get('/api/review/missions');
+          if (!Array.isArray(ms)) return;
+          setReviewMissions(ms);
+          const cur = ms.find(m => m.is_current);
+          if (cur) setCurrentReviewMission(cur.mission_id);
+        } catch (_) {}
+      }, []);
+
+      useEffect(() => {
+        if (view === 'review') fetchReviewMissions();
+      }, [view, fetchReviewMissions]);
+
+      const handleSwitchMission = useCallback(async (missionId) => {
+        if (!missionId || missionId === currentReviewMission) return;
+        await post('/api/select-review-mission', { mission_id: missionId });
+        setCurrentReviewMission(missionId);
+        setVideo(null);
+        setTracks([]);
+        setOpen(null);
+        await refresh();
+      }, [currentReviewMission, refresh]);
+
+      const handleGoToReview = useCallback(async (missionId) => {
+        if (missionId) {
+          try {
+            await post('/api/select-review-mission', { mission_id: missionId });
+            setCurrentReviewMission(missionId);
+          } catch (_) {}
+        }
+        setVideo(null);
+        setTracks([]);
+        setOpen(null);
+        await refresh();
+        setView('review');
+      }, [refresh]);
 
       useEffect(() => {
         refresh().then(s => { if (s.initialized && s.current_video) handleResume(s); });
@@ -2008,10 +2131,11 @@
 
           {/* ── View content ── */}
           {view === 'pipeline' ? (
-            <PipelineView />
+            <PipelineView onGoToReview={handleGoToReview} />
           ) : (
             <div className="flex flex-1 min-h-0 overflow-hidden" onClick={clearSelection}>
-              <VideoList videos={videos} selected={video} onSelect={handleVideoSelect} />
+              <VideoList videos={videos} selected={video} onSelect={handleVideoSelect}
+                missions={reviewMissions} currentMission={currentReviewMission} onMissionChange={handleSwitchMission} />
 
               <div className="flex flex-col flex-1 min-w-0">
                 {!appState?.initialized ? (

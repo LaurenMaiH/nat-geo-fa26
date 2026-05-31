@@ -15,8 +15,15 @@ app = Flask(__name__)
 
 BASE_DIR = Path(__file__).parent.parent  # nat-geo/ (clustering-ui lives inside nat-geo/)
 CROPS_DIR = BASE_DIR / "processed_missions" / "mission_11" / "mission_11_crops"
-EMBEDDINGS_PATH = BASE_DIR / "processed_missions" / "mission_11" / "mission_11_embeddings.json"
-STATE_PATH = EMBEDDINGS_PATH.parent / "state.json"
+
+_FALLBACK_MISSION  = "mission_11"
+_review_mission_id = _FALLBACK_MISSION
+
+
+def _review_paths(mission_id=None):
+    m = mission_id or _review_mission_id
+    d = BASE_DIR / "processed_missions" / m
+    return d / f"{m}_embeddings.json", d / "state.json"
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -104,8 +111,9 @@ _DEFAULT_TRASH = lambda: {"track_keys": [], "metadata": {}}
 
 
 def load_state():
-    if STATE_PATH.exists():
-        state = json.loads(STATE_PATH.read_text())
+    _, state_path = _review_paths()
+    if state_path.exists():
+        state = json.loads(state_path.read_text())
         if "trash" not in state:
             state["trash"] = _DEFAULT_TRASH()
         return state
@@ -128,13 +136,15 @@ def load_state():
 
 
 def save_state(state):
-    STATE_PATH.write_text(json.dumps(state, indent=2))
+    _, state_path = _review_paths()
+    state_path.write_text(json.dumps(state, indent=2))
 
 
 def load_embeddings():
-    if not EMBEDDINGS_PATH.exists():
+    emb_path, _ = _review_paths()
+    if not emb_path.exists():
         return {}
-    return json.loads(EMBEDDINGS_PATH.read_text())
+    return json.loads(emb_path.read_text())
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -181,8 +191,24 @@ def sorted_videos(emb_dict):
     return sorted({k.rsplit("__", 1)[0] for k in emb_dict})
 
 
+def _crops_dir_for_video(video):
+    """Resolve the crops directory for a video clip.
+
+    Supports the PLW_dscm_XX naming convention (missions 03, 33, etc.) where
+    the mission folder and crops subfolder are derived from the video name prefix.
+    Falls back to the global CROPS_DIR for legacy missions.
+    """
+    parts = video.rsplit('_c', 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        mission_id = parts[0]
+        candidate = BASE_DIR / "processed_missions" / mission_id / f"{mission_id}_crops"
+        if candidate.exists():
+            return candidate
+    return CROPS_DIR
+
+
 def best_crop_path(video, track_id):
-    video_dir = CROPS_DIR / video
+    video_dir = _crops_dir_for_video(video) / video
     if not video_dir.exists():
         return None
     try:
@@ -959,7 +985,7 @@ def api_trash_delete():
             del emb_dict[key]
             modified_emb = True
         video, track_id = key.rsplit("__", 1)
-        video_dir = CROPS_DIR / video
+        video_dir = _crops_dir_for_video(video) / video
         if video_dir.exists():
             try:
                 id_prefix = f"id{int(track_id):04d}"
@@ -969,7 +995,8 @@ def api_trash_delete():
                 f.unlink(missing_ok=True)
 
     if modified_emb:
-        EMBEDDINGS_PATH.write_text(json.dumps(emb_dict))
+        emb_path, _ = _review_paths()
+        emb_path.write_text(json.dumps(emb_dict))
 
     save_state(state)
     return jsonify(state)
@@ -977,9 +1004,42 @@ def api_trash_delete():
 
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
-    if STATE_PATH.exists():
-        STATE_PATH.unlink()
+    _, state_path = _review_paths()
+    if state_path.exists():
+        state_path.unlink()
     return jsonify(load_state())
+
+
+@app.route("/api/select-review-mission", methods=["POST"])
+def api_select_review_mission():
+    global _review_mission_id
+    body = request.get_json()
+    mission_id = body.get("mission_id")
+    if not mission_id:
+        return jsonify({"error": "mission_id required"}), 400
+    emb_path, _ = _review_paths(mission_id)
+    if not emb_path.exists():
+        return jsonify({"error": f"No embeddings found for mission {mission_id}"}), 404
+    _review_mission_id = mission_id
+    return jsonify({"ok": True, "mission_id": mission_id})
+
+
+@app.route("/api/review/missions")
+def api_review_missions():
+    missions_root = BASE_DIR / "processed_missions"
+    if not missions_root.exists():
+        return jsonify([])
+    result = []
+    for d in sorted(missions_root.iterdir()):
+        if not d.is_dir():
+            continue
+        if not any(d.glob("*_crops")):
+            continue
+        result.append({
+            "mission_id": d.name,
+            "is_current": d.name == _review_mission_id,
+        })
+    return jsonify(result)
 
 
 @app.route("/api/crop/<video>/<track_id>")
@@ -1041,6 +1101,7 @@ _pipeline_state = {
     "current_video":    None,
     "current_stage":    None,
     "frame_progress":   None,
+    "video_stage_pct":  0.0,
     "videos_done":      0,
     "videos_total":     0,
     "tracks_found":     0,
@@ -1048,6 +1109,14 @@ _pipeline_state = {
     "errors":           [],
     "started_at":       None,
     "finished_at":      None,
+}
+
+_STAGE_START_PCT = {
+    "downloading": 0.0,
+    "resizing":    0.0,
+    "detecting":   0.0,
+    "cropping":    1/3,
+    "embedding":   2/3,
 }
 
 
@@ -1066,16 +1135,25 @@ class PipelineReporter:
             _pipeline_state["current_stage"]  = "downloading"
             _pipeline_state["videos_total"]   = total
             _pipeline_state["frame_progress"] = None
+            _pipeline_state["video_stage_pct"] = 0.0
         self.log(f"▶ [{idx}/{total}] {video_name}")
 
     def stage(self, stage: str):
         with _pipeline_lock:
-            _pipeline_state["current_stage"] = stage
+            _pipeline_state["current_stage"]  = stage
+            _pipeline_state["video_stage_pct"] = _STAGE_START_PCT.get(stage, 0.0)
+            _pipeline_state["frame_progress"] = None
         self.log(f"  → {stage}")
 
     def frame_progress(self, current: int, total: int):
         with _pipeline_lock:
             _pipeline_state["frame_progress"] = {"current": current, "total": total}
+            if total > 0:
+                _pipeline_state["video_stage_pct"] = (current / total) * (1/3)
+
+    def set_video_pct(self, pct: float):
+        with _pipeline_lock:
+            _pipeline_state["video_stage_pct"] = round(min(max(pct, 0.0), 1.0), 4)
 
     def update_embeddings(self, total: int):
         with _pipeline_lock:
@@ -1087,6 +1165,7 @@ class PipelineReporter:
             _pipeline_state["tracks_found"]     += n_tracks
             _pipeline_state["embeddings_total"]  = n_embeddings
             _pipeline_state["frame_progress"]    = None
+            _pipeline_state["video_stage_pct"]   = 1.0
         self.log(f"  ✓ done — {n_tracks} tracks, {n_embeddings} total embeddings")
 
     def video_error(self, video_name: str, error: str):
@@ -1272,4 +1351,4 @@ def api_pipeline_missions():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True, use_reloader=False, port=5000)
