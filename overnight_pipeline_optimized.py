@@ -263,7 +263,8 @@ def process_video(
     tracker_config: str,
     csv_path: Path,
     crops_dir: Path,
-    tmpdir: Path,       # ← passed in so resized video lands here
+    tmpdir: Path,
+    reporter=None,
 ) -> dict:
     resized_path = None
     work_path    = video_path
@@ -372,7 +373,11 @@ def process_video(
             frame_idx += 1
             pbar.update(1)
             pbar.set_postfix(inferred=frames_inferred)
+            if reporter and frame_idx % 50 == 0:
+                reporter.frame_progress(frame_idx, total_frames)
 
+    if reporter:
+        reporter.frame_progress(total_frames, total_frames)
     cap.release()
     csv_file.flush()
     csv_file.close()
@@ -411,8 +416,9 @@ def process_video(
     cap2 = cv2.VideoCapture(str(work_path))
     current_frame = -1
     sorted_frames = sorted(needed.keys())
+    n_crop_frames = len(sorted_frames)
 
-    for fi in tqdm(sorted_frames, desc=f"  Cropping {video_name}", unit="frame", leave=False):
+    for crop_fi, fi in enumerate(tqdm(sorted_frames, desc=f"  Cropping {video_name}", unit="frame", leave=False)):
         abs_fi = first_real + fi
 
         # Forward-seek with grab() when close; random seek when far or going back
@@ -442,6 +448,9 @@ def process_video(
             fpath    = video_crops_dir / fname
             cv2.imwrite(str(fpath), crop)
             track_crop_paths.setdefault(tid, []).append(str(fpath))
+
+        if reporter and n_crop_frames > 0:
+            reporter.set_video_pct(1/3 + (crop_fi + 1) / n_crop_frames * (1/3))
 
     cap2.release()
 
@@ -536,7 +545,8 @@ def main(reporter=None):
                 track_crops = process_video(
                     local_path, media_id, video_name, model, tracker,
                     OUTPUT_CSV_PATH, OUTPUT_CROPS_DIR,
-                    tmpdir=tmpdir,   # ← pass tmpdir for resized video
+                    tmpdir=tmpdir,
+                    reporter=reporter,
                 )
 
                 # ── Batch embedding per track ─────────────────────────────────
@@ -544,7 +554,9 @@ def main(reporter=None):
                 print(f"  Embedding {total_crops} crops across {len(track_crops)} tracks...")
                 if reporter:
                     reporter.stage("embedding")
-                for tid, crop_paths in track_crops.items():
+                track_items  = list(track_crops.items())
+                n_emb_tracks = len(track_items)
+                for emb_i, (tid, crop_paths) in enumerate(track_items):
                     images = [cv2.imread(p) for p in crop_paths]
                     images = [img for img in images if img is not None]
                     if not images:
@@ -554,6 +566,8 @@ def main(reporter=None):
                     mean_v = vecs.mean(axis=0)
                     mean_v /= (np.linalg.norm(mean_v) + 1e-8)
                     all_embeddings[f"{video_name}__{tid}"] = mean_v.tolist()
+                    if reporter and n_emb_tracks > 0:
+                        reporter.set_video_pct(2/3 + (emb_i + 1) / n_emb_tracks * (1/3))
 
                 with open(OUTPUT_EMBEDDINGS, "w") as f:
                     json.dump(all_embeddings, f)

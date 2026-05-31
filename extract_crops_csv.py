@@ -11,12 +11,12 @@ Two modes (auto-detected from CSV headers):
   Annotated   — CSV has 'Scientific Name' column → subdirs by species
   Unannotated — no species labels               → subdirs by video stem
 
-Output structure:
-    Annotated:   crops/Coryphaenoides/PLW_dscm_57_c001_frame0042_det00_best.jpg
-    Unannotated: crops/PLW_dscm_57_c002/PLW_dscm_57_c002_frame0593_det00_best.jpg
+Output structure (matches overnight pipeline convention):
+    Annotated:   crops/Coryphaenoides_yaquinae/id0007_coryphaenoides_yaquinae_f00269_mid.jpg
+    Unannotated: crops/PLW_dscm_57_c002/id0007_fish_f00269_mid.jpg
 
-CSV columns used: media / media_id, frame, track_id / tracker_id, x, y, width, height,
-                  confidence, Scientific Name (optional)
+CSV columns used: media / media_id, frame, track_id / tracker_id, class (optional),
+                  x, y, width, height, confidence, Scientific Name (optional)
 Coordinates are normalized (x, y, width, height relative to frame size).
 """
 
@@ -91,7 +91,7 @@ def select_three_crops(detections: list[dict], window_pct: float = WINDOW_PCT) -
 
     # Deduplicate by frame (short tracks may collapse to fewer than 3)
     seen = {}
-    for tag, det in [("best", best), ("early", early), ("late", late)]:
+    for tag, det in [("mid", best), ("early", early), ("late", late)]:
         if det["frame"] not in seen:
             seen[det["frame"]] = {**det, "tag": tag}
 
@@ -135,14 +135,15 @@ def load_detections(csv_path: Path) -> tuple[dict[str, list[dict]], bool]:
             species = FORCE_SPECIES or row.get("Scientific Name", "").strip()
 
         by_video_track[media][track_id].append({
-            "frame":    int(row["frame"]),
-            "x":        float(row["x"]),
-            "y":        float(row["y"]),
-            "w":        float(row["width"]),
-            "h":        float(row["height"]),
-            "species":  species,
-            "conf":     conf,
-            "track_id": track_id,
+            "frame":      int(row["frame"]),
+            "x":          float(row["x"]),
+            "y":          float(row["y"]),
+            "w":          float(row["width"]),
+            "h":          float(row["height"]),
+            "species":    species,
+            "class_name": row.get("class", "").strip(),
+            "conf":       conf,
+            "track_id":   track_id,
         })
 
     if skipped_conf:
@@ -257,9 +258,17 @@ def extract_crops_from_video(
             out_dir.mkdir(parents=True, exist_ok=True)
 
             tag = det.get("tag", "det")
-            tid = det.get("track_id", "notrack")
-            stem = video_path.stem
-            fname = f"{stem}_track{tid}_frame{frame_idx:05d}_{tag}.jpg"
+            tid = det.get("track_id")
+            if det.get("species"):
+                cls_slug = det["species"].lower().replace(" ", "_")
+            elif det.get("class_name"):
+                cls_slug = det["class_name"].replace(" ", "_")
+            else:
+                cls_slug = "unknown"
+            if isinstance(tid, int):
+                fname = f"id{tid:04d}_{cls_slug}_f{frame_idx:05d}_{tag}.jpg"
+            else:
+                fname = f"id{tid or 'notrack'}_{cls_slug}_f{frame_idx:05d}_{tag}.jpg"
             out_path = out_dir / fname
 
             if write_executor:

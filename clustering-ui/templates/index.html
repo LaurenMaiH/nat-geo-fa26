@@ -43,9 +43,33 @@
 
     // ── VideoList ─────────────────────────────────────────────────────────────
 
-    function VideoList({ videos, selected, onSelect }) {
+    function VideoList({ videos, selected, onSelect, missions, currentMission, onMissionChange }) {
       return (
         <div className="flex flex-col flex-shrink-0 overflow-hidden border-r" style={{width: 208, backgroundColor: C.card, borderColor: C.border}}>
+          {missions && missions.length > 0 && (
+            <div className="px-3 py-2 border-b" style={{borderColor: C.border}}>
+              <div className="text-xs font-semibold uppercase tracking-wider mb-1.5" style={{color: '#94a3b8'}}>Mission</div>
+              <select
+                value={currentMission || ''}
+                onChange={e => onMissionChange && onMissionChange(e.target.value)}
+                style={{
+                  width: '100%',
+                  backgroundColor: C.border,
+                  border: `1px solid ${C.hover}`,
+                  color: '#f1f5f9',
+                  borderRadius: 4,
+                  padding: '4px 6px',
+                  fontSize: 12,
+                  fontFamily: 'inherit',
+                  cursor: 'pointer',
+                }}
+              >
+                {missions.map(m => (
+                  <option key={m.mission_id} value={m.mission_id}>{m.mission_id}</option>
+                ))}
+              </select>
+            </div>
+          )}
           <div className="px-3 py-2 text-xs font-semibold uppercase tracking-wider border-b" style={{color: '#94a3b8', borderColor: C.border}}>
             Videos
           </div>
@@ -939,7 +963,7 @@
       );
     }
 
-    function PipelineView() {
+    function PipelineView({ onGoToReview }) {
       const [status, setStatus]   = useState(null);
       const [log, setLog]         = useState([]);
       const [missions, setMissions] = useState([]);
@@ -949,6 +973,7 @@
         min_track_len: 3, crops_per_track: 3,
       });
       const logRef = useRef(null);
+      const [stopRequested, setStopRequested] = useState(false);
 
       const refreshStatus = useCallback(async () => {
         const [s, l] = await Promise.all([
@@ -971,6 +996,10 @@
       }, [status?.running]);
 
       useEffect(() => {
+        if (!status?.running) setStopRequested(false);
+      }, [status?.running]);
+
+      useEffect(() => {
         if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
       }, [log]);
 
@@ -981,6 +1010,7 @@
       };
 
       const handleStop = async () => {
+        setStopRequested(true);
         await post('/api/pipeline/stop', {});
         refreshStatus();
       };
@@ -1067,12 +1097,16 @@
             </div>
 
             <button
-              onClick={running ? handleStop : handleStart}
-              disabled={!running && !config.mission_id.trim()}
+              onClick={running && !stopRequested ? handleStop : (!running ? handleStart : undefined)}
+              disabled={(!running && !config.mission_id.trim()) || stopRequested}
               className="w-full py-2.5 rounded-lg font-medium text-white transition-opacity disabled:opacity-40"
-              style={{backgroundColor: running ? '#7f1d1d' : '#065f46'}}
+              style={{backgroundColor: running ? (stopRequested ? '#431407' : '#7f1d1d') : '#065f46',
+                      color: running && stopRequested ? '#fb923c' : undefined}}
             >
-              {running ? '⏹ Stop after current video' : '▶ Start Pipeline'}
+              {running
+                ? (stopRequested ? '⏸ Stopping after current video…' : '⏹ Stop after current video')
+                : '▶ Start Pipeline'
+              }
             </button>
 
             {missions.length > 0 && (
@@ -1231,7 +1265,21 @@
                       {status.videos_done} videos · {status.embeddings_total} embeddings ready
                     </div>
                   </div>
-                  <div className="text-xs" style={{color:'#86efac'}}>Switch to Cluster Review →</div>
+                  {onGoToReview && (
+                    <button
+                      onClick={() => onGoToReview(status.mission_id)}
+                      className="text-xs px-3 py-1.5 rounded font-medium transition-opacity hover:opacity-80"
+                      style={{
+                        backgroundColor: '#166534',
+                        color: '#4ade80',
+                        border: '1px solid #4ade80',
+                        cursor: 'pointer',
+                        fontFamily: 'inherit',
+                      }}
+                    >
+                      Switch to Cluster Review →
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -1254,6 +1302,8 @@
       const [cropViewer, setCropViewer]   = useState(null);
       const [trashOpen, setTrashOpen]     = useState(false);
       const [view, setView]               = useState('review');
+      const [reviewMissions, setReviewMissions]             = useState([]);
+      const [currentReviewMission, setCurrentReviewMission] = useState('');
       const [stripHeight, setStripHeight] = useState(() => Math.round(window.innerHeight / 2.5));
       const [selectedKeys, setSelectedKeys] = useState(new Set());
       const [visibleClusterIds, setVisibleClusterIds] = useState(new Set());
@@ -1334,6 +1384,44 @@
         setVideos(vids);
         return state;
       }, []);
+
+      const fetchReviewMissions = useCallback(async () => {
+        try {
+          const ms = await get('/api/review/missions');
+          if (!Array.isArray(ms)) return;
+          setReviewMissions(ms);
+          const cur = ms.find(m => m.is_current);
+          if (cur) setCurrentReviewMission(cur.mission_id);
+        } catch (_) {}
+      }, []);
+
+      useEffect(() => {
+        if (view === 'review') fetchReviewMissions();
+      }, [view, fetchReviewMissions]);
+
+      const handleSwitchMission = useCallback(async (missionId) => {
+        if (!missionId || missionId === currentReviewMission) return;
+        await post('/api/select-review-mission', { mission_id: missionId });
+        setCurrentReviewMission(missionId);
+        setVideo(null);
+        setTracks([]);
+        setOpen(null);
+        await refresh();
+      }, [currentReviewMission, refresh]);
+
+      const handleGoToReview = useCallback(async (missionId) => {
+        if (missionId) {
+          try {
+            await post('/api/select-review-mission', { mission_id: missionId });
+            setCurrentReviewMission(missionId);
+          } catch (_) {}
+        }
+        setVideo(null);
+        setTracks([]);
+        setOpen(null);
+        await refresh();
+        setView('review');
+      }, [refresh]);
 
       useEffect(() => {
         refresh().then(s => { if (s.initialized && s.current_video) handleResume(s); });
@@ -1576,10 +1664,11 @@
 
           {/* ── View content ── */}
           {view === 'pipeline' ? (
-            <PipelineView />
+            <PipelineView onGoToReview={handleGoToReview} />
           ) : (
             <div className="flex flex-1 min-h-0 overflow-hidden" onClick={clearSelection}>
-              <VideoList videos={videos} selected={video} onSelect={handleVideoSelect} />
+              <VideoList videos={videos} selected={video} onSelect={handleVideoSelect}
+                missions={reviewMissions} currentMission={currentReviewMission} onMissionChange={handleSwitchMission} />
 
               <div className="flex flex-col flex-1 min-w-0">
                 {!appState?.initialized ? (
