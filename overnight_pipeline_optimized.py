@@ -44,11 +44,11 @@ APP_KEY        = os.environ["DROPBOX_APP_KEY"]
 APP_SECRET     = os.environ["DROPBOX_APP_SECRET"]
 REFRESH_TOKEN  = os.environ["DROPBOX_REFRESH_TOKEN"]
 
-MISSION_ID   = "PLW_dscm_33"          # ← only line to change between missions
+MISSION_ID   = "PLW_dscm_03"          # ← only line to change between missions
 MISSION_PATH = f"/DOEX0096_Palau/{MISSION_ID}/Video"   # ← and this one
 
 SELECTED_VIDEOS = None  # set to a list of filenames, or None for all
-START_FROM      = "PLW_dscm_33_c167.mp4"  # set to a filename to start from that video (inclusive)
+START_FROM      = "PLW_dscm_03_c011.mp4"  # set to a filename to start from that video (inclusive)
 
 CHECKPOINT_PATH = Path(__file__).parent / "checkpoints" / "best.pt"
 
