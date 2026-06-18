@@ -27,34 +27,42 @@ def _review_paths(mission_id=None):
 
 load_dotenv(BASE_DIR / ".env")
 
+_PROXY_FALLBACK_DIR = BASE_DIR / "processed_missions" / "mission_11" / "proxy_videos"
+_PROXY_FALLBACK_DIR.mkdir(exist_ok=True)
+
+# Keep for backwards compatibility but prefer the per-video helpers below
+PROXY_DIR = _PROXY_FALLBACK_DIR
 DROPBOX_MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_11/Video"
-PROXY_DIR = BASE_DIR / "processed_missions" / "mission_11" / "proxy_videos"
-PROXY_DIR.mkdir(exist_ok=True)
 
 _dbx_instance = None
 _proxy_status: dict[str, str] = {}  # video_name → "generating" | "ready" | "error"
 _proxy_lock = threading.Lock()
 
-DETECTIONS_CSV = BASE_DIR / "processed_missions" / "mission_11" / "mission_11_detections.csv"
-
-
 def _load_all_detections():
+    """Load detections CSVs from every mission under processed_missions/."""
     cache = {}
-    if not DETECTIONS_CSV.exists():
+    missions_root = BASE_DIR / "processed_missions"
+    if not missions_root.exists():
         return cache
-    with open(DETECTIONS_CSV, newline='') as f:
-        for row in csv.DictReader(f):
-            vid = row['media_id'].removesuffix('.mp4')
-            frame = int(row['frame'])
-            cache.setdefault(vid, {}).setdefault(frame, []).append({
-                'track_id': int(row['track_id']),
-                'class':    row['class'],
-                'x':        float(row['x']),
-                'y':        float(row['y']),
-                'w':        float(row['width']),
-                'h':        float(row['height']),
-                'conf':     round(float(row['confidence']), 3),
-            })
+    for mission_dir in sorted(missions_root.iterdir()):
+        if not mission_dir.is_dir():
+            continue
+        csv_file = next(mission_dir.glob("*_detections.csv"), None)
+        if not csv_file or not csv_file.exists():
+            continue
+        with open(csv_file, newline='') as f:
+            for row in csv.DictReader(f):
+                vid = row['media_id'].removesuffix('.mp4')
+                frame = int(row['frame'])
+                cache.setdefault(vid, {}).setdefault(frame, []).append({
+                    'track_id': int(row['track_id']),
+                    'class':    row['class'],
+                    'x':        float(row['x']),
+                    'y':        float(row['y']),
+                    'w':        float(row['width']),
+                    'h':        float(row['height']),
+                    'conf':     round(float(row['confidence']), 3),
+                })
     return cache
 
 
@@ -62,7 +70,7 @@ DETECTIONS_CACHE = _load_all_detections()
 
 
 def get_proxy_fps(video_name):
-    proxy = PROXY_DIR / f"{video_name.replace('.mp4', '')}_proxy.mp4"
+    proxy = _proxy_dir_for_video(video_name) / f"{video_name.replace('.mp4', '')}_proxy.mp4"
     if proxy.exists():
         try:
             out = subprocess.run(
@@ -80,7 +88,7 @@ def get_proxy_fps(video_name):
 
 
 def get_black_frame_offset(video_name):
-    proxy = PROXY_DIR / f"{video_name.replace('.mp4', '')}_proxy.mp4"
+    proxy = _proxy_dir_for_video(video_name) / f"{video_name.replace('.mp4', '')}_proxy.mp4"
     if proxy.exists():
         try:
             out = subprocess.run(
@@ -205,6 +213,30 @@ def _crops_dir_for_video(video):
         if candidate.exists():
             return candidate
     return CROPS_DIR
+
+
+def _proxy_dir_for_video(video_name: str) -> Path:
+    """Return (and create) the proxy_videos dir for the mission owning this video clip."""
+    parts = video_name.rsplit('_c', 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        mission_id = parts[0]
+        parent = BASE_DIR / "processed_missions" / mission_id
+        if parent.exists():
+            candidate = parent / "proxy_videos"
+            candidate.mkdir(exist_ok=True)
+            return candidate
+    return PROXY_DIR
+
+
+def _dropbox_mission_path_for(video_name: str) -> str:
+    """Return the Dropbox folder path for the mission owning this video clip."""
+    parts = video_name.rsplit('_c', 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        mission_prefix = parts[0]          # e.g. "plw_dscm_12"
+        segs = mission_prefix.split('_', 1)
+        mission_upper = segs[0].upper() + ('_' + segs[1] if len(segs) > 1 else '')
+        return f"/DOEX0096_Palau/{mission_upper}/Video"
+    return DROPBOX_MISSION_PATH
 
 
 def best_crop_path(video, track_id):
@@ -343,16 +375,17 @@ def get_dbx():
 
 
 def _generate_proxy(video_name: str):
-    proxy_path = PROXY_DIR / f"{video_name}_proxy.mp4"
+    proxy_dir = _proxy_dir_for_video(video_name)
+    proxy_path = proxy_dir / f"{video_name}_proxy.mp4"
     if proxy_path.exists():
         with _proxy_lock:
             _proxy_status[video_name] = "ready"
         return
-    # plw_dscm_11_c034 → PLW_dscm_11_c034.mp4
+    # plw_dscm_12_c001 → PLW_dscm_12_c001.mp4
     parts = video_name.split("_")
     filename = parts[0].upper() + "_" + "_".join(parts[1:]) + ".mp4"
-    dropbox_path = f"{DROPBOX_MISSION_PATH}/{filename}"
-    ffmpeg_tmp = PROXY_DIR / f"{video_name}_proxy.tmp.mp4"
+    dropbox_path = f"{_dropbox_mission_path_for(video_name)}/{filename}"
+    ffmpeg_tmp = proxy_dir / f"{video_name}_proxy.tmp.mp4"
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp_path = Path(tmp.name)
     try:
@@ -1052,7 +1085,7 @@ def api_crop(video, track_id):
 
 @app.route("/api/video/<video_name>/proxy-status")
 def api_proxy_status(video_name):
-    if (PROXY_DIR / f"{video_name}_proxy.mp4").exists():
+    if (_proxy_dir_for_video(video_name) / f"{video_name}_proxy.mp4").exists():
         return jsonify({"status": "ready"})
     with _proxy_lock:
         return jsonify({"status": _proxy_status.get(video_name, "missing")})
@@ -1060,7 +1093,7 @@ def api_proxy_status(video_name):
 
 @app.route("/api/video/<video_name>/proxy/start", methods=["POST"])
 def api_proxy_start(video_name):
-    if (PROXY_DIR / f"{video_name}_proxy.mp4").exists():
+    if (_proxy_dir_for_video(video_name) / f"{video_name}_proxy.mp4").exists():
         return jsonify({"status": "ready"})
     with _proxy_lock:
         if _proxy_status.get(video_name) in ("generating", "ready"):
@@ -1072,7 +1105,7 @@ def api_proxy_start(video_name):
 
 @app.route("/api/video/<video_name>/proxy")
 def api_proxy_serve(video_name):
-    proxy_path = PROXY_DIR / f"{video_name}_proxy.mp4"
+    proxy_path = _proxy_dir_for_video(video_name) / f"{video_name}_proxy.mp4"
     if not proxy_path.exists():
         return "Proxy not ready", 404
     return send_file(proxy_path, mimetype="video/mp4", conditional=True)
