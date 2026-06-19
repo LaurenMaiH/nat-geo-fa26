@@ -236,3 +236,7 @@ clustering-ui/state.json
 *.mp4
 
 **/state.json
+
+*.csv
+
+processed_missions/**/*_embeddings.json

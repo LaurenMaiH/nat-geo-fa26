@@ -121,6 +121,7 @@
               alt={trackKey}
               className="rounded-lg"
               style={{maxWidth: '80vw', maxHeight: '80vh', objectFit: 'contain', boxShadow: 'var(--shadow-modal)'}}
+              onError={e => { e.target.onerror = null; e.target.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'; e.target.style.cssText = 'width:200px;height:150px;background:var(--bg-surface-3);border-radius:8px;'; }}
             />
             <span className="font-mono text-[11px]" style={{color: 'var(--text-muted)'}}>{trackKey}</span>
           </div>
@@ -465,7 +466,7 @@
             alt={trackKey}
             draggable={false}
             style={{width: '100%', height: compact ? 69 : 76, objectFit: 'cover', display: 'block'}}
-            onError={e => { e.target.style.background = 'var(--bg-surface-3)'; e.target.style.height = compact ? '69px' : '76px'; }}
+            onError={e => { e.target.onerror = null; e.target.src = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'; e.target.style.background = 'var(--bg-surface-3)'; }}
           />
           {!compact && (
             <div className="px-1 py-0.5 font-mono text-[10px] truncate" style={{backgroundColor: 'var(--border-subtle)', color: 'var(--text-secondary)'}}>
