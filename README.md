@@ -12,44 +12,31 @@ Species classification for deep sea footage.
     cd <repo-name>
     ```
 
-## To run: 
+## To run (Docker — recommended)
 
-1. create env
-python -m venv venv
-source venv/bin/activate
+No Python or ffmpeg setup required. Just Docker Desktop.
 
-2. install deps
-pip install -r requirements.txt
+### First time setup
+1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/)
+2. Create a `.env` file in the `nat-geo/` folder using `.env.example` as a template and fill in the Dropbox credentials:
+    ```
+    DROPBOX_APP_KEY=your_app_key_here
+    DROPBOX_APP_SECRET=your_app_secret_here
+    DROPBOX_REFRESH_TOKEN=your_refresh_token_here
+    ```
+3. Place the `processed_missions/` data folder inside `nat-geo/`
+4. Build the Docker image **(first time only, or after code changes)**:
+    ```
+    docker compose build
+    ```
 
-3.  install ffmpeg (mac)
-brew install ffmpeg
-
-4. install default and finetuned model and place them into the seaanimals_proto folder
-    
-    Default Yolo-World model: https://drive.google.com/file/d/1hh576zOzpUqgWSjIdSkR4EwgYQ8kH406/view?usp=drive_link
-
-    Finetuned Yolo-World model (trained on JAMSTEC dataset on deep-sea animals): https://drive.google.com/file/d/1rCyq4GZcG5UCqrl2SNNjmaHkLOZbWgyv/view?usp=drive_link
-
-4. cd into seaanimals_proto
-
-5. run app
-streamlit run model_runner.py
-
-#### IF RUNNING INTO SSL ERROR ####
-1. 
-``` 
-python3 -m pip install --upgrade certifi requests urllib3 /Applications/Python\ 3.12/install\ Certificates.command 
+### Running the app
 ```
-
-2. 
-``` 
-mkdir -p ~/.cache/clipcurl -L --fail -o ~/.cache/clip/ViT-B-32.pt "https://openaipublic.azureedge.net/clip/models/40d365715913c9-da98579312b702a82c18be219c-c2a73407c4526f58eba950af/ViT-B-32.pt" 
+docker compose up
 ```
+Then open `http://localhost:5001` in your browser.
 
-3. 
-``` 
-ls -lh ~/.cache/clip/ViT-B-32.ptpython3 -c "import clip; print('before'); model, preprocess = clip.load ('ViT-B/32'); print('after')"
-```
+To stop: `docker compose down`
 
 
 ## 📁 Editing Code & Key Reminders

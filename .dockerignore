@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+processed_missions/
+misc_and_archive/
+.git/
+.gitignore
+.DS_Store
+.mplconfig/
+*.pyc
+*.pyo
+.env
