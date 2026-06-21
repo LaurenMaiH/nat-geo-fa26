@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file, render_template
 from pathlib import Path
 from collections import defaultdict
 import csv
@@ -14,9 +14,9 @@ from dotenv import load_dotenv
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).parent.parent  # nat-geo/ (clustering-ui lives inside nat-geo/)
-CROPS_DIR = BASE_DIR / "processed_missions" / "mission_11" / "mission_11_crops"
+CROPS_DIR = BASE_DIR / "processed_missions" / "PLW_dscm_11" / "PLW_dscm_11_crops"
 
-_FALLBACK_MISSION  = "mission_11"
+_FALLBACK_MISSION  = "PLW_dscm_11"
 _review_mission_id = _FALLBACK_MISSION
 
 
@@ -27,34 +27,42 @@ def _review_paths(mission_id=None):
 
 load_dotenv(BASE_DIR / ".env")
 
+_PROXY_FALLBACK_DIR = BASE_DIR / "processed_missions" / "PLW_dscm_11" / "proxy_videos"
+_PROXY_FALLBACK_DIR.mkdir(exist_ok=True)
+
+# Keep for backwards compatibility but prefer the per-video helpers below
+PROXY_DIR = _PROXY_FALLBACK_DIR
 DROPBOX_MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_11/Video"
-PROXY_DIR = BASE_DIR / "processed_missions" / "mission_11" / "proxy_videos"
-PROXY_DIR.mkdir(exist_ok=True)
 
 _dbx_instance = None
 _proxy_status: dict[str, str] = {}  # video_name → "generating" | "ready" | "error"
 _proxy_lock = threading.Lock()
 
-DETECTIONS_CSV = BASE_DIR / "processed_missions" / "mission_11" / "mission_11_detections.csv"
-
-
 def _load_all_detections():
+    """Load detections CSVs from every mission under processed_missions/."""
     cache = {}
-    if not DETECTIONS_CSV.exists():
+    missions_root = BASE_DIR / "processed_missions"
+    if not missions_root.exists():
         return cache
-    with open(DETECTIONS_CSV, newline='') as f:
-        for row in csv.DictReader(f):
-            vid = row['media_id'].removesuffix('.mp4')
-            frame = int(row['frame'])
-            cache.setdefault(vid, {}).setdefault(frame, []).append({
-                'track_id': int(row['track_id']),
-                'class':    row['class'],
-                'x':        float(row['x']),
-                'y':        float(row['y']),
-                'w':        float(row['width']),
-                'h':        float(row['height']),
-                'conf':     round(float(row['confidence']), 3),
-            })
+    for mission_dir in sorted(missions_root.iterdir()):
+        if not mission_dir.is_dir():
+            continue
+        csv_file = next(mission_dir.glob("*_detections.csv"), None)
+        if not csv_file or not csv_file.exists():
+            continue
+        with open(csv_file, newline='') as f:
+            for row in csv.DictReader(f):
+                vid = row['media_id'].removesuffix('.mp4')
+                frame = int(row['frame'])
+                cache.setdefault(vid, {}).setdefault(frame, []).append({
+                    'track_id': int(row['track_id']),
+                    'class':    row['class'],
+                    'x':        float(row['x']),
+                    'y':        float(row['y']),
+                    'w':        float(row['width']),
+                    'h':        float(row['height']),
+                    'conf':     round(float(row['confidence']), 3),
+                })
     return cache
 
 
@@ -62,7 +70,7 @@ DETECTIONS_CACHE = _load_all_detections()
 
 
 def get_proxy_fps(video_name):
-    proxy = PROXY_DIR / f"{video_name.replace('.mp4', '')}_proxy.mp4"
+    proxy = _proxy_dir_for_video(video_name) / f"{video_name.replace('.mp4', '')}_proxy.mp4"
     if proxy.exists():
         try:
             out = subprocess.run(
@@ -80,7 +88,7 @@ def get_proxy_fps(video_name):
 
 
 def get_black_frame_offset(video_name):
-    proxy = PROXY_DIR / f"{video_name.replace('.mp4', '')}_proxy.mp4"
+    proxy = _proxy_dir_for_video(video_name) / f"{video_name.replace('.mp4', '')}_proxy.mp4"
     if proxy.exists():
         try:
             out = subprocess.run(
@@ -191,8 +199,48 @@ def sorted_videos(emb_dict):
     return sorted({k.rsplit("__", 1)[0] for k in emb_dict})
 
 
+def _crops_dir_for_video(video):
+    """Resolve the crops directory for a video clip.
+
+    Supports the PLW_dscm_XX naming convention (missions 03, 33, etc.) where
+    the mission folder and crops subfolder are derived from the video name prefix.
+    Falls back to the global CROPS_DIR for legacy missions.
+    """
+    parts = video.rsplit('_c', 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        mission_id = parts[0]
+        candidate = BASE_DIR / "processed_missions" / mission_id / f"{mission_id}_crops"
+        if candidate.exists():
+            return candidate
+    return CROPS_DIR
+
+
+def _proxy_dir_for_video(video_name: str) -> Path:
+    """Return (and create) the proxy_videos dir for the mission owning this video clip."""
+    parts = video_name.rsplit('_c', 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        mission_id = parts[0]
+        parent = BASE_DIR / "processed_missions" / mission_id
+        if parent.exists():
+            candidate = parent / "proxy_videos"
+            candidate.mkdir(exist_ok=True)
+            return candidate
+    return PROXY_DIR
+
+
+def _dropbox_mission_path_for(video_name: str) -> str:
+    """Return the Dropbox folder path for the mission owning this video clip."""
+    parts = video_name.rsplit('_c', 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        mission_prefix = parts[0]          # e.g. "plw_dscm_12"
+        segs = mission_prefix.split('_', 1)
+        mission_upper = segs[0].upper() + ('_' + segs[1] if len(segs) > 1 else '')
+        return f"/DOEX0096_Palau/{mission_upper}/Video"
+    return DROPBOX_MISSION_PATH
+
+
 def best_crop_path(video, track_id):
-    video_dir = CROPS_DIR / video
+    video_dir = _crops_dir_for_video(video) / video
     if not video_dir.exists():
         return None
     try:
@@ -327,16 +375,17 @@ def get_dbx():
 
 
 def _generate_proxy(video_name: str):
-    proxy_path = PROXY_DIR / f"{video_name}_proxy.mp4"
+    proxy_dir = _proxy_dir_for_video(video_name)
+    proxy_path = proxy_dir / f"{video_name}_proxy.mp4"
     if proxy_path.exists():
         with _proxy_lock:
             _proxy_status[video_name] = "ready"
         return
-    # plw_dscm_11_c034 → PLW_dscm_11_c034.mp4
+    # plw_dscm_12_c001 → PLW_dscm_12_c001.mp4
     parts = video_name.split("_")
     filename = parts[0].upper() + "_" + "_".join(parts[1:]) + ".mp4"
-    dropbox_path = f"{DROPBOX_MISSION_PATH}/{filename}"
-    ffmpeg_tmp = PROXY_DIR / f"{video_name}_proxy.tmp.mp4"
+    dropbox_path = f"{_dropbox_mission_path_for(video_name)}/{filename}"
+    ffmpeg_tmp = proxy_dir / f"{video_name}_proxy.tmp.mp4"
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
         tmp_path = Path(tmp.name)
     try:
@@ -367,7 +416,7 @@ def _generate_proxy(video_name: str):
 
 @app.route("/")
 def index():
-    return send_file(Path(__file__).parent / "templates" / "index.html")
+    return render_template("index.html")
 
 
 @app.route("/api/state")
@@ -428,6 +477,87 @@ def api_video_tracks(video_name):
         for tid in track_ids
         if f"{video_name}__{tid}" not in trash_keys
     ])
+
+
+@app.route("/api/video/<video_name>/stats")
+def api_video_stats(video_name):
+    state = load_state()
+    detections = DETECTIONS_CACHE.get(video_name, {})
+
+    # Build track_id (int) → cluster_id for this video
+    track_to_cluster = {}
+    for track_key, cid in state.get("track_assignments", {}).items():
+        vid, tid = track_key.rsplit("__", 1)
+        if vid == video_name:
+            try:
+                track_to_cluster[int(tid)] = cid
+            except ValueError:
+                pass
+
+    cluster_objs = state.get("clusters", {})
+    all_cids = list(cluster_objs.keys())
+
+    # Per-frame accumulation
+    frame_cluster_tracks = {}   # frame → {cid → set of track_ids}
+    class_dist = defaultdict(int)
+    conf_by_frame = defaultdict(lambda: [0.0, 0])   # frame → [sum, count]
+    spatial_grid = defaultdict(int)                  # (gx, gy) → count
+    track_first = {}
+    track_last = {}
+    GRID = 10
+
+    for frame, boxes in detections.items():
+        fc = defaultdict(set)
+        for box in boxes:
+            tid = box["track_id"]
+            cid = track_to_cluster.get(tid, "noise")
+            fc[cid].add(tid)
+            class_dist[box["class"]] += 1
+            conf_by_frame[frame][0] += box["conf"]
+            conf_by_frame[frame][1] += 1
+            gx = min(int(box["x"] * GRID), GRID - 1)
+            gy = min(int(box["y"] * GRID), GRID - 1)
+            spatial_grid[(gx, gy)] += 1
+            if tid not in track_first:
+                track_first[tid] = frame
+            track_last[tid] = frame
+        frame_cluster_tracks[frame] = fc
+
+    # frames_data: one entry per frame, all cluster IDs present
+    frames_data = []
+    for frame in sorted(frame_cluster_tracks.keys()):
+        entry = {"frame": frame}
+        for cid in all_cids:
+            entry[cid] = len(frame_cluster_tracks[frame].get(cid, set()))
+        frames_data.append(entry)
+
+    # Confidence timeline (every frame, averaged)
+    confidence_timeline = [
+        {"frame": f, "avg_conf": round(s / c, 4)}
+        for f, (s, c) in sorted(conf_by_frame.items()) if c > 0
+    ]
+
+    # Track durations (in frames)
+    track_durations = [
+        track_last[tid] - track_first[tid] + 1
+        for tid in track_first
+    ]
+
+    cluster_meta = [
+        {"id": cid, "name": cluster_objs[cid].get("name", cid), "color": cluster_objs[cid].get("color", "#6B7280")}
+        for cid in all_cids
+    ]
+
+    return jsonify({
+        "frames_data": frames_data,
+        "cluster_meta": cluster_meta,
+        "class_distribution": dict(class_dist),
+        "confidence_timeline": confidence_timeline,
+        "spatial_heatmap": [{"gx": gx, "gy": gy, "count": cnt} for (gx, gy), cnt in spatial_grid.items()],
+        "track_durations": track_durations,
+        "total_detections": sum(len(b) for b in detections.values()),
+        "total_tracks": len(track_first),
+    })
 
 
 @app.route("/api/initialize", methods=["POST"])
@@ -888,7 +1018,7 @@ def api_trash_delete():
             del emb_dict[key]
             modified_emb = True
         video, track_id = key.rsplit("__", 1)
-        video_dir = CROPS_DIR / video
+        video_dir = _crops_dir_for_video(video) / video
         if video_dir.exists():
             try:
                 id_prefix = f"id{int(track_id):04d}"
@@ -955,7 +1085,7 @@ def api_crop(video, track_id):
 
 @app.route("/api/video/<video_name>/proxy-status")
 def api_proxy_status(video_name):
-    if (PROXY_DIR / f"{video_name}_proxy.mp4").exists():
+    if (_proxy_dir_for_video(video_name) / f"{video_name}_proxy.mp4").exists():
         return jsonify({"status": "ready"})
     with _proxy_lock:
         return jsonify({"status": _proxy_status.get(video_name, "missing")})
@@ -963,7 +1093,7 @@ def api_proxy_status(video_name):
 
 @app.route("/api/video/<video_name>/proxy/start", methods=["POST"])
 def api_proxy_start(video_name):
-    if (PROXY_DIR / f"{video_name}_proxy.mp4").exists():
+    if (_proxy_dir_for_video(video_name) / f"{video_name}_proxy.mp4").exists():
         return jsonify({"status": "ready"})
     with _proxy_lock:
         if _proxy_status.get(video_name) in ("generating", "ready"):
@@ -975,7 +1105,7 @@ def api_proxy_start(video_name):
 
 @app.route("/api/video/<video_name>/proxy")
 def api_proxy_serve(video_name):
-    proxy_path = PROXY_DIR / f"{video_name}_proxy.mp4"
+    proxy_path = _proxy_dir_for_video(video_name) / f"{video_name}_proxy.mp4"
     if not proxy_path.exists():
         return "Proxy not ready", 404
     return send_file(proxy_path, mimetype="video/mp4", conditional=True)
@@ -1004,6 +1134,7 @@ _pipeline_state = {
     "current_video":    None,
     "current_stage":    None,
     "frame_progress":   None,
+    "video_stage_pct":  0.0,
     "videos_done":      0,
     "videos_total":     0,
     "tracks_found":     0,
@@ -1011,6 +1142,14 @@ _pipeline_state = {
     "errors":           [],
     "started_at":       None,
     "finished_at":      None,
+}
+
+_STAGE_START_PCT = {
+    "downloading": 0.0,
+    "resizing":    0.0,
+    "detecting":   0.0,
+    "cropping":    1/3,
+    "embedding":   2/3,
 }
 
 
@@ -1029,16 +1168,25 @@ class PipelineReporter:
             _pipeline_state["current_stage"]  = "downloading"
             _pipeline_state["videos_total"]   = total
             _pipeline_state["frame_progress"] = None
+            _pipeline_state["video_stage_pct"] = 0.0
         self.log(f"▶ [{idx}/{total}] {video_name}")
 
     def stage(self, stage: str):
         with _pipeline_lock:
-            _pipeline_state["current_stage"] = stage
+            _pipeline_state["current_stage"]  = stage
+            _pipeline_state["video_stage_pct"] = _STAGE_START_PCT.get(stage, 0.0)
+            _pipeline_state["frame_progress"] = None
         self.log(f"  → {stage}")
 
     def frame_progress(self, current: int, total: int):
         with _pipeline_lock:
             _pipeline_state["frame_progress"] = {"current": current, "total": total}
+            if total > 0:
+                _pipeline_state["video_stage_pct"] = (current / total) * (1/3)
+
+    def set_video_pct(self, pct: float):
+        with _pipeline_lock:
+            _pipeline_state["video_stage_pct"] = round(min(max(pct, 0.0), 1.0), 4)
 
     def update_embeddings(self, total: int):
         with _pipeline_lock:
@@ -1050,6 +1198,7 @@ class PipelineReporter:
             _pipeline_state["tracks_found"]     += n_tracks
             _pipeline_state["embeddings_total"]  = n_embeddings
             _pipeline_state["frame_progress"]    = None
+            _pipeline_state["video_stage_pct"]   = 1.0
         self.log(f"  ✓ done — {n_tracks} tracks, {n_embeddings} total embeddings")
 
     def video_error(self, video_name: str, error: str):
@@ -1235,4 +1384,4 @@ def api_pipeline_missions():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, use_reloader=False, port=5000)
+    app.run(debug=True, use_reloader=False, port=5000, host='0.0.0.0')
