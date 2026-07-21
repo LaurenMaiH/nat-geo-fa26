@@ -1,4 +1,4 @@
-# nat-geo
+# [DSS x Pristine Seas] Benthic Species Clusterer
 Species classification for deep sea footage. 
 
 ## 🛠️ Setup Instructions
