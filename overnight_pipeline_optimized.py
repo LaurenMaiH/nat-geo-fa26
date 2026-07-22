@@ -45,7 +45,8 @@ APP_SECRET     = os.environ["DROPBOX_APP_SECRET"]
 REFRESH_TOKEN  = os.environ["DROPBOX_REFRESH_TOKEN"]
 
 MISSION_ID   = "PLW_dscm_03"          # ← only line to change between missions
-MISSION_PATH = f"/DOEX0096_Palau/{MISSION_ID}/Video"   # ← and this one
+DEPLOYMENT_ROOT = os.environ.get("DROPBOX_DEPLOYMENT_ROOT", "/DOEX0096_Palau")
+MISSION_PATH = f"{DEPLOYMENT_ROOT}/{MISSION_ID}/Video"   # ← and this one
 
 SELECTED_VIDEOS = None  # set to a list of filenames, or None for all
 START_FROM      = "PLW_dscm_03_c011.mp4"  # set to a filename to start from that video (inclusive)
