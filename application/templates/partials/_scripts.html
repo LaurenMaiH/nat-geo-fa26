@@ -1386,17 +1386,30 @@
       );
     }
 
-    function PipelineView({ onGoToReview }) {
+    function PipelineView({ onGoToReview, deployments, currentDeployment }) {
       const [status, setStatus]   = useState(null);
       const [log, setLog]         = useState([]);
       const [missions, setMissions] = useState([]);
       const [config, setConfig]   = useState({
+        deployment_id: '', new_deployment_id: '', dropbox_root: '',
         mission_id: '', mission_path: '', start_from: '',
         conf_threshold: 0.15, iou_threshold: 0.70,
         min_track_len: 3, crops_per_track: 3,
       });
       const logRef = useRef(null);
       const [stopRequested, setStopRequested] = useState(false);
+
+      // Default the form's deployment to whatever's currently being viewed,
+      // once it's known — the user can still pick a different one.
+      useEffect(() => {
+        if (currentDeployment && !config.deployment_id) {
+          setConfig(p => ({...p, deployment_id: currentDeployment}));
+        }
+      }, [currentDeployment]);
+
+      const isNewDeployment  = config.deployment_id === '__new__';
+      const effectiveDeploymentId = isNewDeployment ? config.new_deployment_id.trim() : config.deployment_id;
+      const selectedDeployment = deployments?.find(d => d.deployment_id === config.deployment_id);
 
       const refreshStatus = useCallback(async () => {
         const [s, l] = await Promise.all([
@@ -1409,8 +1422,13 @@
 
       useEffect(() => {
         refreshStatus();
-        fetch('/api/pipeline/missions').then(r => r.json()).then(setMissions);
       }, []);
+
+      useEffect(() => {
+        if (!effectiveDeploymentId) { setMissions([]); return; }
+        fetch(`/api/pipeline/missions?deployment_id=${encodeURIComponent(effectiveDeploymentId)}`)
+          .then(r => r.json()).then(setMissions);
+      }, [effectiveDeploymentId]);
 
       useEffect(() => {
         if (!status?.running) return;
@@ -1427,8 +1445,9 @@
       }, [log]);
 
       const handleStart = async () => {
-        if (!config.mission_id.trim()) return;
-        await post('/api/pipeline/start', config);
+        if (!config.mission_id.trim() || !effectiveDeploymentId) return;
+        const payload = {...config, deployment_id: effectiveDeploymentId};
+        await post('/api/pipeline/start', payload);
         refreshStatus();
       };
 
@@ -1464,6 +1483,37 @@
             <div className="label-caps">Mission Config</div>
 
             <div>
+              <label className="block label-caps mb-1.5">Deployment</label>
+              <select
+                value={config.deployment_id}
+                onChange={e => setConfig(p => ({...p, deployment_id: e.target.value}))}
+                disabled={running}
+                style={{...inputSty, cursor: running ? 'default' : 'pointer'}}
+              >
+                <option value="" disabled>Select a deployment…</option>
+                {deployments?.map(d => (
+                  <option key={d.deployment_id} value={d.deployment_id}>{d.deployment_id}</option>
+                ))}
+                <option value="__new__">+ New deployment…</option>
+              </select>
+            </div>
+
+            {isNewDeployment && (<>
+              <div>
+                <label className="block label-caps mb-1.5">Deployment name</label>
+                <input style={inputSty} value={config.new_deployment_id}
+                  onChange={e => setConfig(p => ({...p, new_deployment_id: e.target.value}))}
+                  placeholder="e.g. ACME_Reef_Survey" disabled={running} />
+              </div>
+              <div>
+                <label className="block label-caps mb-1.5">Dropbox root</label>
+                <input style={inputSty} value={config.dropbox_root}
+                  onChange={e => setConfig(p => ({...p, dropbox_root: e.target.value}))}
+                  placeholder="/SomeClientFolder" disabled={running} />
+              </div>
+            </>)}
+
+            <div>
               <label className="block label-caps mb-1.5">Mission ID</label>
               <input style={inputSty} value={config.mission_id}
                 onChange={e => setConfig(p => ({...p, mission_id: e.target.value}))}
@@ -1476,7 +1526,8 @@
               </label>
               <input style={inputSty} value={config.mission_path}
                 onChange={e => setConfig(p => ({...p, mission_path: e.target.value}))}
-                placeholder="/DOEX0096_Palau/{mission_id}/Video" disabled={running} />
+                placeholder={`${selectedDeployment?.dropbox_root || config.dropbox_root || '/DeploymentRoot'}/{mission_id}/Video`}
+                disabled={running} />
             </div>
 
             <div>
@@ -1522,7 +1573,7 @@
 
             <button
               onClick={running && !stopRequested ? handleStop : (!running ? handleStart : undefined)}
-              disabled={(!running && !config.mission_id.trim()) || stopRequested}
+              disabled={(!running && (!config.mission_id.trim() || !effectiveDeploymentId)) || stopRequested}
               className="w-full rounded-lg font-medium disabled:opacity-40"
               style={{
                 padding: '10px 16px',
@@ -1762,6 +1813,8 @@
       const [view, setView]               = useState('review');
       const [reviewMissions, setReviewMissions]           = useState([]);
       const [currentReviewMission, setCurrentReviewMission] = useState('');
+      const [deployments, setDeployments]           = useState([]);
+      const [currentDeployment, setCurrentDeployment] = useState('');
       const [stripHeight, setStripHeight] = useState(() => Math.round(window.innerHeight / 2.5));
       const [selectedKeys, setSelectedKeys] = useState(new Set());
       const [visibleClusterIds, setVisibleClusterIds] = useState(new Set());
@@ -1856,6 +1909,30 @@
       useEffect(() => {
         if (view === 'review') fetchReviewMissions();
       }, [view, fetchReviewMissions]);
+
+      const fetchDeployments = useCallback(async () => {
+        try {
+          const deps = await get('/api/deployments');
+          if (!Array.isArray(deps)) return;
+          setDeployments(deps);
+          const cur = deps.find(d => d.is_current);
+          if (cur) setCurrentDeployment(cur.deployment_id);
+        } catch (_) {}
+      }, []);
+
+      useEffect(() => { fetchDeployments(); }, [fetchDeployments]);
+
+      const handleSwitchDeployment = useCallback(async (deploymentId) => {
+        if (!deploymentId || deploymentId === currentDeployment) return;
+        const res = await post('/api/select-deployment', { deployment_id: deploymentId });
+        setCurrentDeployment(deploymentId);
+        setCurrentReviewMission(res.mission_id || '');
+        setVideo(null);
+        setTracks([]);
+        setOpen(null);
+        await fetchReviewMissions();
+        await refresh();
+      }, [currentDeployment, fetchReviewMissions, refresh]);
 
       const handleSwitchMission = useCallback(async (missionId) => {
         if (!missionId || missionId === currentReviewMission) return;
@@ -2106,6 +2183,31 @@
               </span>
             </div>
 
+            {/* Deployment switcher */}
+            {deployments.length > 0 && (
+              <div className="flex items-center gap-1.5 flex-shrink-0">
+                <span className="label-caps" style={{color: 'var(--text-faint)'}}>Deployment</span>
+                <select
+                  value={currentDeployment}
+                  onChange={e => handleSwitchDeployment(e.target.value)}
+                  style={{
+                    backgroundColor: 'var(--bg-surface-3)',
+                    border: '1px solid var(--border-moderate)',
+                    color: 'var(--text-primary)',
+                    borderRadius: 6,
+                    padding: '4px 8px',
+                    fontSize: 12,
+                    fontFamily: 'inherit',
+                    cursor: 'pointer',
+                  }}
+                >
+                  {deployments.map(d => (
+                    <option key={d.deployment_id} value={d.deployment_id}>{d.deployment_id}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
             {/* Pill tab switcher */}
             <div className="flex items-center rounded-full p-1 gap-0.5" style={{backgroundColor: 'var(--bg-surface-3)', border: '1px solid var(--border-subtle)'}}>
               {['pipeline', 'review'].map(v => (
@@ -2132,7 +2234,7 @@
 
           {/* ── View content ── */}
           {view === 'pipeline' ? (
-            <PipelineView onGoToReview={handleGoToReview} />
+            <PipelineView onGoToReview={handleGoToReview} deployments={deployments} currentDeployment={currentDeployment} />
           ) : (
             <div className="flex flex-1 min-h-0 overflow-hidden" onClick={clearSelection}>
               <VideoList videos={videos} selected={video} onSelect={handleVideoSelect}
@@ -2156,6 +2258,18 @@
                   </span>
                 )}
                 <span className="ml-auto font-mono text-[11px]" style={{color: 'var(--text-faint)'}}>{tracks.length} tracks</span>
+                <button
+                  onClick={() => window.location.href = '/api/export/tracks.csv'}
+                  className="btn-ghost"
+                >
+                  Export tracks
+                </button>
+                <button
+                  onClick={() => window.location.href = '/api/export/summary.csv'}
+                  className="btn-ghost"
+                >
+                  Export summary
+                </button>
                 <button
                   onClick={handleReset}
                   className="btn-ghost"

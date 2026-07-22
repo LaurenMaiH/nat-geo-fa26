@@ -1,50 +1,121 @@
-from flask import Flask, jsonify, request, send_file, render_template
+from flask import Flask, jsonify, request, send_file, render_template, Response
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, Counter
 import csv
 import json
+import os
+import re
 import numpy as np
 import hdbscan as hdbscan_lib
 import dropbox
 import threading
 import subprocess
 import tempfile
+from datetime import datetime
 from dotenv import load_dotenv
 
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).parent.parent  # nat-geo/ (clustering-ui lives inside nat-geo/)
-CROPS_DIR = BASE_DIR / "processed_missions" / "PLW_dscm_11" / "PLW_dscm_11_crops"
+load_dotenv(BASE_DIR / ".env")
 
-_FALLBACK_MISSION  = "PLW_dscm_11"
-_review_mission_id = _FALLBACK_MISSION
+_DEPLOYMENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+# ── Deployments ────────────────────────────────────────────────────────────────
+# processed_missions/<deployment_id>/deployment.json  → {"deployment_id", "dropbox_root", ...}
+# processed_missions/<deployment_id>/<mission_id>/     → unchanged per-mission data
+
+def _deployments_root() -> Path:
+    return BASE_DIR / "processed_missions"
+
+
+def _deployment_dir(deployment_id) -> Path:
+    # Falsy deployment_id happens when no deployment exists yet (fresh install) —
+    # return a path that's guaranteed not to exist rather than crashing.
+    return _deployments_root() / (deployment_id or "__none__")
+
+
+def _list_deployments():
+    root = _deployments_root()
+    if not root.exists():
+        return []
+    return sorted(
+        d.name for d in root.iterdir()
+        if d.is_dir() and (d / "deployment.json").exists()
+    )
+
+
+def _load_deployment(deployment_id):
+    if not deployment_id:
+        return None
+    path = _deployment_dir(deployment_id) / "deployment.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())
+
+
+def _ensure_deployment(deployment_id: str, dropbox_root: str):
+    """Create (or verify) a deployment folder + config. Called the first time
+    the pipeline targets a given deployment."""
+    if not _DEPLOYMENT_ID_RE.match(deployment_id or ""):
+        raise ValueError(f"Invalid deployment id: {deployment_id!r}")
+    d = _deployment_dir(deployment_id)
+    d.mkdir(parents=True, exist_ok=True)
+    config_path = d / "deployment.json"
+    if not config_path.exists():
+        config_path.write_text(json.dumps({
+            "deployment_id": deployment_id,
+            "dropbox_root": dropbox_root,
+            "created_at": datetime.now().isoformat(),
+        }, indent=2))
+    return _load_deployment(deployment_id)
+
+
+def _default_deployment_id():
+    deployments = _list_deployments()
+    return deployments[0] if deployments else None
+
+
+def _default_mission_id(deployment_id):
+    """First mission (by name) under a deployment that has an embeddings file."""
+    if not deployment_id:
+        return None
+    d = _deployment_dir(deployment_id)
+    if not d.exists():
+        return None
+    for mission_dir in sorted(d.iterdir()):
+        if mission_dir.is_dir() and next(mission_dir.glob("*_embeddings.json"), None):
+            return mission_dir.name
+    return None
+
+
+_current_deployment_id = _default_deployment_id()
+_review_mission_id      = _default_mission_id(_current_deployment_id)
 
 
 def _review_paths(mission_id=None):
-    m = mission_id or _review_mission_id
-    d = BASE_DIR / "processed_missions" / m
+    # Falsy m happens when the current deployment has no missions yet —
+    # fall back to a sentinel so load_state()/load_embeddings() see "doesn't
+    # exist" and return their empty defaults instead of crashing.
+    m = mission_id or _review_mission_id or "__none__"
+    d = _deployment_dir(_current_deployment_id) / m
     return d / f"{m}_embeddings.json", d / "state.json"
 
-load_dotenv(BASE_DIR / ".env")
-
-_PROXY_FALLBACK_DIR = BASE_DIR / "processed_missions" / "PLW_dscm_11" / "proxy_videos"
-_PROXY_FALLBACK_DIR.mkdir(exist_ok=True)
-
-# Keep for backwards compatibility but prefer the per-video helpers below
-PROXY_DIR = _PROXY_FALLBACK_DIR
-DROPBOX_MISSION_PATH = "/DOEX0096_Palau/PLW_dscm_11/Video"
 
 _dbx_instance = None
 _proxy_status: dict[str, str] = {}  # video_name → "generating" | "ready" | "error"
 _proxy_lock = threading.Lock()
 
-def _load_all_detections():
-    """Load detections CSVs from every mission under processed_missions/."""
+def _load_deployment_detections(deployment_id):
+    """Load detections CSVs from every mission under the given deployment."""
     cache = {}
-    missions_root = BASE_DIR / "processed_missions"
-    if not missions_root.exists():
+    if not deployment_id:
         return cache
-    for mission_dir in sorted(missions_root.iterdir()):
+    d = _deployment_dir(deployment_id)
+    if not d.exists():
+        return cache
+    for mission_dir in sorted(d.iterdir()):
         if not mission_dir.is_dir():
             continue
         csv_file = next(mission_dir.glob("*_detections.csv"), None)
@@ -66,7 +137,7 @@ def _load_all_detections():
     return cache
 
 
-DETECTIONS_CACHE = _load_all_detections()
+DETECTIONS_CACHE = _load_deployment_detections(_current_deployment_id)
 
 
 def get_proxy_fps(video_name):
@@ -199,44 +270,48 @@ def sorted_videos(emb_dict):
     return sorted({k.rsplit("__", 1)[0] for k in emb_dict})
 
 
-def _crops_dir_for_video(video):
-    """Resolve the crops directory for a video clip.
-
-    Supports the PLW_dscm_XX naming convention (missions 03, 33, etc.) where
-    the mission folder and crops subfolder are derived from the video name prefix.
-    Falls back to the global CROPS_DIR for legacy missions.
-    """
-    parts = video.rsplit('_c', 1)
+def _mission_id_for_video(video_name: str):
+    """Extract the owning mission id from a `<mission>_c<NNN>` video name."""
+    parts = video_name.rsplit('_c', 1)
     if len(parts) == 2 and parts[1].isdigit():
-        mission_id = parts[0]
-        candidate = BASE_DIR / "processed_missions" / mission_id / f"{mission_id}_crops"
+        return parts[0]
+    return None
+
+
+def _crops_dir_for_video(video):
+    """Resolve the crops directory for a video clip, within the current deployment."""
+    mission_id = _mission_id_for_video(video)
+    if mission_id:
+        candidate = _deployment_dir(_current_deployment_id) / mission_id / f"{mission_id}_crops"
         if candidate.exists():
             return candidate
-    return CROPS_DIR
+    return _deployment_dir(_current_deployment_id) / (_review_mission_id or "") / f"{_review_mission_id}_crops"
 
 
 def _proxy_dir_for_video(video_name: str) -> Path:
     """Return (and create) the proxy_videos dir for the mission owning this video clip."""
-    parts = video_name.rsplit('_c', 1)
-    if len(parts) == 2 and parts[1].isdigit():
-        mission_id = parts[0]
-        parent = BASE_DIR / "processed_missions" / mission_id
-        if parent.exists():
-            candidate = parent / "proxy_videos"
-            candidate.mkdir(exist_ok=True)
-            return candidate
-    return PROXY_DIR
+    mission_id = _mission_id_for_video(video_name) or _review_mission_id
+    parent = _deployment_dir(_current_deployment_id) / (mission_id or "")
+    parent.mkdir(parents=True, exist_ok=True)
+    candidate = parent / "proxy_videos"
+    candidate.mkdir(exist_ok=True)
+    return candidate
 
 
 def _dropbox_mission_path_for(video_name: str) -> str:
-    """Return the Dropbox folder path for the mission owning this video clip."""
-    parts = video_name.rsplit('_c', 1)
-    if len(parts) == 2 and parts[1].isdigit():
-        mission_prefix = parts[0]          # e.g. "plw_dscm_12"
-        segs = mission_prefix.split('_', 1)
+    """Return the Dropbox folder path for the mission owning this video clip.
+
+    Root comes from the current deployment's config, not a hardcoded string,
+    so this works regardless of which Dropbox account/folder a deployment uses.
+    """
+    mission_id = _mission_id_for_video(video_name) or _review_mission_id
+    deployment = _load_deployment(_current_deployment_id) or {}
+    root = deployment.get("dropbox_root", "")
+    if mission_id:
+        segs = mission_id.split('_', 1)
         mission_upper = segs[0].upper() + ('_' + segs[1] if len(segs) > 1 else '')
-        return f"/DOEX0096_Palau/{mission_upper}/Video"
-    return DROPBOX_MISSION_PATH
+        return f"{root}/{mission_upper}/Video"
+    return root
 
 
 def best_crop_path(video, track_id):
@@ -1043,6 +1118,194 @@ def api_reset():
     return jsonify(load_state())
 
 
+# ── Export ─────────────────────────────────────────────────────────────────────
+
+def _export_detection_aggregates():
+    """
+    One pass over the current review mission's detections CSV.
+    Returns (track_aggs, frame_tracks):
+      track_aggs:   video → track_id(str) → {n, first, last, classes, max_conf, sum_conf}
+      frame_tracks: video → frame(int) → set(track_id str)
+    Reads fresh from disk so exports reflect the CSV even if it changed
+    after app startup.
+    """
+    track_aggs   = defaultdict(dict)
+    frame_tracks = defaultdict(lambda: defaultdict(set))
+    emb_path, _ = _review_paths()
+    csv_file = next(emb_path.parent.glob("*_detections.csv"), None)
+    if not csv_file or not csv_file.exists():
+        return track_aggs, frame_tracks
+    with open(csv_file, newline='') as f:
+        for row in csv.DictReader(f):
+            try:
+                tid   = str(int(row['track_id']))
+                frame = int(row['frame'])
+                conf  = float(row['confidence'])
+            except (ValueError, TypeError):
+                continue
+            vid = row['media_id'].removesuffix('.mp4')
+            agg = track_aggs[vid].get(tid)
+            if agg is None:
+                agg = track_aggs[vid][tid] = {
+                    "n": 0, "first": frame, "last": frame,
+                    "classes": Counter(), "max_conf": 0.0, "sum_conf": 0.0,
+                }
+            agg["n"]        += 1
+            agg["first"]     = min(agg["first"], frame)
+            agg["last"]      = max(agg["last"], frame)
+            agg["max_conf"]  = max(agg["max_conf"], conf)
+            agg["sum_conf"] += conf
+            agg["classes"][row['class']] += 1
+            frame_tracks[vid][frame].add(tid)
+    return track_aggs, frame_tracks
+
+
+def _csv_response(header, rows, filename):
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(header)
+    writer.writerows(rows)
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
+@app.route("/api/export/tracks.csv")
+def api_export_tracks_csv():
+    state = load_state()
+    emb   = load_embeddings()
+    track_aggs, _ = _export_detection_aggregates()
+
+    trash_keys = set(state.get("trash", {}).get("track_keys", []))
+    trash_meta = state.get("trash", {}).get("metadata", {})
+    all_keys = sorted(
+        set(emb) | trash_keys,
+        key=lambda k: (k.rsplit("__", 1)[0], track_sort_key(k.rsplit("__", 1)[1])),
+    )
+
+    rows = []
+    for key in all_keys:
+        video, tid = key.rsplit("__", 1)
+        if key in trash_keys:
+            status = "trash"
+            cid    = trash_meta.get(key, {}).get("source_cluster_id", "")
+            cname  = trash_meta.get(key, {}).get("source_cluster_name", "")
+        else:
+            cid    = state["track_assignments"].get(key, "noise")
+            status = "unassigned" if cid == "noise" else "clustered"
+            cname  = state["clusters"].get(cid, {}).get("name", cid)
+
+        agg = track_aggs.get(video, {}).get(tid)
+        if agg:
+            n_det     = agg["n"]
+            first     = agg["first"]
+            last      = agg["last"]
+            duration  = last - first + 1
+            top_class = agg["classes"].most_common(1)[0][0]
+            max_conf  = round(agg["max_conf"], 4)
+            mean_conf = round(agg["sum_conf"] / agg["n"], 4)
+        else:
+            n_det = first = last = duration = top_class = max_conf = mean_conf = ""
+
+        rows.append([
+            _review_mission_id, video, tid, status, cid, cname,
+            n_det, first, last, duration, top_class, max_conf, mean_conf,
+            state.get("videos", {}).get(video, {}).get("status", ""),
+        ])
+
+    return _csv_response(
+        ["mission_id", "video", "track_id", "status", "cluster_id", "cluster_name",
+         "n_detections", "first_frame", "last_frame", "duration_frames",
+         "top_class", "max_confidence", "mean_confidence", "video_status"],
+        rows,
+        f"{_review_mission_id}_tracks_{datetime.now().strftime('%Y%m%d')}.csv",
+    )
+
+
+@app.route("/api/export/summary.csv")
+def api_export_summary_csv():
+    state = load_state()
+    track_aggs, frame_tracks = _export_detection_aggregates()
+    assignments = state.get("track_assignments", {})
+    clusters    = state.get("clusters", {})
+
+    # (video, cid) → counts; trashed tracks are already absent from assignments
+    per = defaultdict(lambda: {"n_tracks": 0, "n_detections": 0, "max_n": 0})
+    for key, cid in assignments.items():
+        video, tid = key.rsplit("__", 1)
+        entry = per[(video, cid)]
+        entry["n_tracks"] += 1
+        agg = track_aggs.get(video, {}).get(tid)
+        if agg:
+            entry["n_detections"] += agg["n"]
+
+    # MaxN: max simultaneous tracks of a cluster in any single frame
+    for video, frames in frame_tracks.items():
+        for frame, tids in frames.items():
+            counts = Counter(
+                cid for tid in tids
+                if (cid := assignments.get(f"{video}__{tid}")) is not None
+            )
+            for cid, n in counts.items():
+                entry = per[(video, cid)]
+                entry["max_n"] = max(entry["max_n"], n)
+
+    # Per-video rows, then mission totals as video=ALL
+    totals = defaultdict(lambda: {"n_tracks": 0, "n_detections": 0, "max_n": 0})
+    rows = []
+    for (video, cid) in sorted(per, key=lambda vc: (vc[0], vc[1] == "noise", vc[1])):
+        entry = per[(video, cid)]
+        cname = clusters.get(cid, {}).get("name", cid)
+        rows.append([_review_mission_id, video, cid, cname,
+                     entry["n_tracks"], entry["n_detections"], entry["max_n"]])
+        t = totals[cid]
+        t["n_tracks"]     += entry["n_tracks"]
+        t["n_detections"] += entry["n_detections"]
+        t["max_n"]         = max(t["max_n"], entry["max_n"])
+
+    for cid in sorted(totals, key=lambda c: (c == "noise", c)):
+        t = totals[cid]
+        rows.append([_review_mission_id, "ALL", cid, clusters.get(cid, {}).get("name", cid),
+                     t["n_tracks"], t["n_detections"], t["max_n"]])
+
+    return _csv_response(
+        ["mission_id", "video", "cluster_id", "cluster_name",
+         "n_tracks", "n_detections", "max_n"],
+        rows,
+        f"{_review_mission_id}_summary_{datetime.now().strftime('%Y%m%d')}.csv",
+    )
+
+
+@app.route("/api/deployments")
+def api_deployments():
+    result = []
+    for dep_id in _list_deployments():
+        dep = _load_deployment(dep_id) or {}
+        n_missions = sum(1 for d in _deployment_dir(dep_id).iterdir() if d.is_dir())
+        result.append({
+            "deployment_id": dep_id,
+            "dropbox_root":  dep.get("dropbox_root", ""),
+            "n_missions":    n_missions,
+            "is_current":    dep_id == _current_deployment_id,
+        })
+    return jsonify(result)
+
+
+@app.route("/api/select-deployment", methods=["POST"])
+def api_select_deployment():
+    global _current_deployment_id, _review_mission_id, DETECTIONS_CACHE
+    body = request.get_json()
+    deployment_id = body.get("deployment_id")
+    if not deployment_id or deployment_id not in _list_deployments():
+        return jsonify({"error": f"Unknown deployment {deployment_id!r}"}), 404
+    _current_deployment_id = deployment_id
+    _review_mission_id     = _default_mission_id(deployment_id)
+    DETECTIONS_CACHE        = _load_deployment_detections(deployment_id)
+    return jsonify({"ok": True, "deployment_id": deployment_id, "mission_id": _review_mission_id})
+
+
 @app.route("/api/select-review-mission", methods=["POST"])
 def api_select_review_mission():
     global _review_mission_id
@@ -1059,11 +1322,11 @@ def api_select_review_mission():
 
 @app.route("/api/review/missions")
 def api_review_missions():
-    missions_root = BASE_DIR / "processed_missions"
-    if not missions_root.exists():
+    dep_dir = _deployment_dir(_current_deployment_id) if _current_deployment_id else None
+    if not dep_dir or not dep_dir.exists():
         return jsonify([])
     result = []
-    for d in sorted(missions_root.iterdir()):
+    for d in sorted(dep_dir.iterdir()):
         if not d.is_dir():
             continue
         if not any(d.glob("*_crops")):
@@ -1120,7 +1383,6 @@ def api_proxy_serve(video_name):
 import sys
 import io
 from collections import deque
-from datetime import datetime
 
 # ── Pipeline shared state ─────────────────────────────────────────────────────
 
@@ -1261,10 +1523,11 @@ def _run_pipeline(config: dict):
         spec = importlib.util.spec_from_file_location("pipeline", pipeline_path)
         mod  = importlib.util.module_from_spec(spec)
 
+        deployment = _load_deployment(config["deployment_id"]) or {}
         overrides = {
             "MISSION_ID":      config["mission_id"],
             "MISSION_PATH":    config.get("mission_path") or
-                               f"/DOEX0096_Palau/{config['mission_id']}/Video",
+                               f"{deployment.get('dropbox_root', '')}/{config['mission_id']}/Video",
             "START_FROM":      config.get("start_from") or None,
             "SELECTED_VIDEOS": config.get("selected_videos") or None,
             "CONF_THRESHOLD":  float(config.get("conf_threshold",  0.15)),
@@ -1282,7 +1545,7 @@ def _run_pipeline(config: dict):
         for k, v in overrides.items():
             setattr(mod, k, v)
 
-        mission_dir = BASE_DIR / "processed_missions" / config["mission_id"]
+        mission_dir = _deployment_dir(config["deployment_id"]) / config["mission_id"]
         mission_dir.mkdir(parents=True, exist_ok=True)
         mod.OUTPUT_CSV_PATH   = mission_dir / f"{config['mission_id']}_detections.csv"
         mod.OUTPUT_CROPS_DIR  = mission_dir / f"{config['mission_id']}_crops"
@@ -1326,6 +1589,19 @@ def api_pipeline_start():
     if not config.get("mission_id"):
         return jsonify({"error": "mission_id required"}), 400
 
+    deployment_id = config.get("deployment_id")
+    if not deployment_id:
+        return jsonify({"error": "deployment_id required"}), 400
+
+    if deployment_id not in _list_deployments():
+        dropbox_root = config.get("dropbox_root")
+        if not dropbox_root:
+            return jsonify({"error": f"New deployment {deployment_id!r} needs a dropbox_root"}), 400
+        try:
+            _ensure_deployment(deployment_id, dropbox_root)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
     with _pipeline_lock:
         if _pipeline_state["running"]:
             return jsonify({"error": "Pipeline already running"}), 409
@@ -1359,8 +1635,9 @@ def api_pipeline_stop():
 
 @app.route("/api/pipeline/missions")
 def api_pipeline_missions():
-    missions_root = BASE_DIR / "processed_missions"
-    if not missions_root.exists():
+    deployment_id = request.args.get("deployment_id") or _current_deployment_id
+    missions_root = _deployment_dir(deployment_id) if deployment_id else None
+    if not missions_root or not missions_root.exists():
         return jsonify([])
     missions = []
     for d in sorted(missions_root.iterdir()):
@@ -1384,4 +1661,5 @@ def api_pipeline_missions():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, use_reloader=False, port=5000, host='0.0.0.0')
+    debug = os.environ.get("FLASK_DEBUG") == "1"
+    app.run(debug=debug, use_reloader=False, port=5000, host='0.0.0.0')
