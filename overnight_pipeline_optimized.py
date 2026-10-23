@@ -185,10 +185,16 @@ def load_embedding_model():
         if CHECKPOINT_PATH and not Path(CHECKPOINT_PATH).exists():
             print(f"Finetuned weights not found at {CHECKPOINT_PATH}, downloading...")
             Path(CHECKPOINT_PATH).parent.mkdir(parents=True, exist_ok=True)
-            gdown.download(
-                "https://drive.google.com/file/d/1Qec1Gzxl8zAazuLof8a2LUSrbOR7GmtT/view?usp=drive_link",
-                str(CHECKPOINT_PATH), quiet=False, fuzzy=True,
-            )
+            try:
+                gdown.download(
+                    "https://drive.google.com/file/d/1Qec1Gzxl8zAazuLof8a2LUSrbOR7GmtT/view?usp=drive_link",
+                    str(CHECKPOINT_PATH), quiet=False, fuzzy=True,
+                )
+            except Exception as dl_err:
+                # A checkpoint-download failure (gdown API change, private/expired link, etc.)
+                # must NOT abort the whole embedding model. Fall through to pretrained
+                # BioCLIP-2 weights, which still produce real embeddings.
+                print(f"Finetuned checkpoint download failed ({dl_err}); using pretrained BioCLIP-2.")
 
         model, _, preprocess = open_clip.create_model_and_transforms(
             "hf-hub:imageomics/bioclip-2", device=INFERENCE_DEVICE

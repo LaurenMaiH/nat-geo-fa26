@@ -1,4 +1,5 @@
 ultralytics
+lap  # linear-assignment solver required by ByteTrack; without it ultralytics auto-installs mid-run and tracking silently fails
 opencv-python
 numpy
 scipy
@@ -8,6 +9,9 @@ pandas
 PyYAML
 tqdm
 open-clip-torch
+# OpenAI CLIP: required by ultralytics YOLO-World set_classes() (open-vocabulary text encoding).
+# Installed from git, so the Dockerfile must have `git` available at build time.
+clip @ git+https://github.com/openai/CLIP.git
 hdbscan
 umap-learn
 matplotlib
