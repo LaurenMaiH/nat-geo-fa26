@@ -1,222 +1,104 @@
-# [DSS x Pristine Seas] Benthic Species Clusterer
-Species classification for deep sea footage.
+# laurenmaih.github.io
 
-A dark-themed web app that runs a computer-vision pipeline (detection → tracking → embeddings → clustering) over deep-sea video pulled from Dropbox, then lets you review and export the results.
+My personal site. Plain HTML and CSS, no build step, hosted free on GitHub Pages.
+
+Everything sits in one folder, with no subfolders, so drag-and-drop uploads to GitHub keep every link working.
+Keep it that way: put new files (posts, images, PDFs) next to `index.html`.
+
+```
+index.html               Home: intro, selected work, writing, contact
+projects.html            All projects, with a copy-paste template for new ones
+persona-vectors.html     Research write-up, hosted on the site
+post-template.html       Starting point for new on-site posts
+style.css                All styling. Colors and fonts are at the top.
+favicon.svg              Browser tab icon
+og.png                   Preview image shown when the link is shared
+Lauren_Henderson_CV.pdf  The CV every "CV" link points to
+```
 
 ---
 
-## 🛠️ Setup
+## Deploy to GitHub Pages (about 10 minutes, no command line)
 
-Works on **Windows 10/11** and **macOS**. The setup is the same on both — only a few commands differ, and those are shown side by side. No Python, ffmpeg, or machine-learning setup is required: Docker handles all of it.
+1. **Sign in** to GitHub as `LaurenMaiH`.
+2. **Create the repo.** Click **+** (top right) → **New repository**.
+   - Repository name: `LaurenMaiH.github.io` (exactly this; it's what makes the URL `laurenmaih.github.io`)
+   - Visibility: **Public**
+   - Leave "Add a README" unchecked (one is included here)
+   - Click **Create repository**
+3. **Upload the files.** On the new empty repo page, click **uploading an existing file**.
+   Open the `site` folder on your computer, select **every file inside it** (Cmd+A / Ctrl+A), and drag them all into the browser.
+   Drag the files, not the `site` folder itself.
+   Click **Commit changes**.
+4. **Turn on Pages.** Go to **Settings** → **Pages** (left sidebar).
+   Under **Build and deployment**, set Source to **Deploy from a branch**, Branch to **main** and folder **/ (root)**, then **Save**.
+   For a `username.github.io` repo this is often already set; if so, you're done here.
+5. **Wait 1–2 minutes.** The **Actions** tab shows a "pages build and deployment" run; when it's green, open
+   **https://laurenmaih.github.io**
+6. **Check it**: open it on your phone, click every link, and download the CV once.
+   To test the link preview, paste the URL into a message to yourself (Slack, iMessage).
 
-Follow the four steps in order. Budget ~20 minutes the first time (most of it is Docker downloading in the background).
+### Prefer the command line?
 
-> **New to the terminal?** You'll type commands into one app:
-> - **Windows:** press `Start`, type **PowerShell**, open it.
-> - **macOS:** press `Cmd+Space`, type **Terminal**, open it.
->
-> Copy a command, paste it in (right-click to paste in PowerShell; `Cmd+V` in Terminal), press `Enter`.
-
-### Step 0 — Install the two required tools
-
-| Tool | Why | Install |
-|---|---|---|
-| **Git** | To download the code | **Windows:** [git-scm.com/download/win](https://git-scm.com/download/win) (accept all defaults). **macOS:** run `git --version` — if it's missing, macOS will offer to install it. |
-| **Docker Desktop** | Runs the app in a self-contained box | Download for your OS from [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/), install, then **launch it**. On Windows, accept the WSL 2 prompt if asked. |
-
-**Before continuing, start Docker Desktop and wait until the whale icon stops animating** (menu bar on macOS, system tray on Windows). Docker must be running for every command below. Verify with:
+```bash
+cd site
+git init -b main
+git add .
+git commit -m "First version of my site"
+git remote add origin https://github.com/LaurenMaiH/LaurenMaiH.github.io.git
+git push -u origin main
 ```
-docker --version
-```
-If that prints a version number, you're ready.
-
-### Step 1 — Download the code
-
-In your terminal, go to the folder where you want the project to live, then clone it. Replace `<repo-url>` with the HTTPS or SSH URL from the repository's green **Code** button on GitHub.
-
-```
-git clone <repo-url>
-cd nat-geo-fa26
-```
-
-> **Already have the repo?** Skip cloning — just `cd` into the folder and grab the latest changes:
-> ```
-> git pull origin main
-> ```
-
-Everything from here on is run from **inside this project folder** (the one containing `docker-compose.yml`).
-
-### Step 2 — Add your Dropbox credentials (`.env`)
-
-The app reads mission videos from Dropbox, so it needs three secret values. First, copy the template:
-
-| | Command |
-|---|---|
-| **Windows (PowerShell)** | `copy .env.example .env` |
-| **macOS** | `cp .env.example .env` |
-
-Then open the new `.env` file in a text editor (**Notepad** on Windows, **TextEdit** or VS Code on macOS) and fill in the three values:
-```
-DROPBOX_APP_KEY=your_app_key_here
-DROPBOX_APP_SECRET=your_app_secret_here
-DROPBOX_REFRESH_TOKEN=your_refresh_token_here
-```
-
-<details>
-<summary><b>Don't have these yet? Click to expand — one-time setup for your own Dropbox account.</b></summary>
-
-1. Go to the [Dropbox App Console](https://www.dropbox.com/developers/apps) and click **Create app**.
-2. Choose **Scoped access**, then **Full Dropbox** access (not "App folder" — the app needs to read mission video folders wherever they live, not just inside a dedicated app folder). Name the app and create it.
-3. On the app's **Permissions** tab, enable `files.metadata.read` and `files.content.read`, then click **Submit**. The app only ever reads videos — no write scopes are needed.
-4. On the app's **Settings** tab, copy the **App key** and **App secret** into `.env` as `DROPBOX_APP_KEY` / `DROPBOX_APP_SECRET`.
-5. Get the refresh token (once per app). Visit this URL in your browser, swapping in your App key:
-   ```
-   https://www.dropbox.com/oauth2/authorize?client_id=YOUR_APP_KEY&response_type=code&token_access_type=offline
-   ```
-   Click **Allow**, then copy the authorization code it shows you.
-6. Exchange that code for a refresh token by running this **one-line** command, filling in your values:
-
-   | | Command |
-   |---|---|
-   | **Windows (PowerShell)** | `curl.exe https://api.dropbox.com/oauth2/token -d code=THE_CODE -d grant_type=authorization_code -d client_id=YOUR_APP_KEY -d client_secret=YOUR_APP_SECRET` |
-   | **macOS** | `curl https://api.dropbox.com/oauth2/token -d code=THE_CODE -d grant_type=authorization_code -d client_id=YOUR_APP_KEY -d client_secret=YOUR_APP_SECRET` |
-
-   > ⚠️ **Windows:** use `curl.exe`, not `curl`. In PowerShell, plain `curl` is a different, incompatible command and will fail.
-
-   The JSON response includes a `refresh_token` field — that's your `DROPBOX_REFRESH_TOKEN`. It doesn't expire, so this is a one-time step.
-
-</details>
-
-### Step 3 — Add the sample mission data
-
-This gives the app a deployment and mission to open by default.
-
-1. Download the `DOEX0096_Palau` folder from [this Google Drive link](https://drive.google.com/drive/folders/1BD5iZZIn2RrYc0OxrK8cHqs3ObZ5Eu95?usp=sharing). It contains `deployment.json` and the `PLW_dscm_11` mission (crops, proxy videos, detections CSV, embeddings, and `state.json`).
-2. Inside the project folder, make sure there's a folder named `processed_missions` (create it if missing).
-3. Place the downloaded `DOEX0096_Palau` folder inside it, so **both** of these paths exist:
-   ```
-   processed_missions/DOEX0096_Palau/deployment.json
-   processed_missions/DOEX0096_Palau/PLW_dscm_11/
-   ```
-
-> A **deployment** is one Dropbox root you pull videos from (e.g. one client's account, or one expedition). Each mission lives in its own folder under `processed_missions/DOEX0096_Palau/`. To add more missions to this deployment, download or process them the same way. See [Connecting a different deployment](#connecting-a-different-deployment) for adding a separate one.
-
-### Step 4 — Build and run
-
-With Docker Desktop running, from inside the project folder:
-
-```
-docker compose build
-```
-*(First time only, or after code changes. This downloads and compiles everything — it can take several minutes.)*
-
-Then start the app:
-```
-docker compose up
-```
-
-Open **http://localhost:5001** in your browser. You should see the dark-themed interface with a **Pipeline** tab and a **Cluster Review** tab.
-
-To stop the app: press `Ctrl+C` in the terminal, then run `docker compose down`.
+Then do step 4 above.
 
 ---
 
-<details>
-<summary><b>Alternative: run without Docker (advanced)</b></summary>
+## Editing
 
-If you prefer not to use Docker, you can run the app directly with Python 3.12+ and [ffmpeg](https://ffmpeg.org/) installed.
+**Preview locally:** double-click `index.html` to open it in your browser. Refresh after each change.
+(Fonts load from Google, so you need to be online for them to look right.)
 
-```
-python -m venv venv
-```
-Activate it:
+**Find content fast:** search the HTML for `EDIT:`. Those comments mark the tagline, bio, interests, and contact note.
 
-| | Command |
-|---|---|
-| **Windows (PowerShell)** | `venv\Scripts\Activate.ps1` |
-| **macOS** | `source venv/bin/activate` |
+**Publish a change:** either
+- on github.com, open the file → pencil icon → edit → **Commit changes**, or
+- drag the updated file into the repo with **Add file → Upload files** (it replaces the old one).
 
-Then install dependencies and run:
-```
-pip install -r requirements.txt
-python application/app.py
-```
-This serves the app on **http://localhost:5000** (note: **5000**, not 5001 — the 5001 mapping is Docker-only).
+The live site updates within a minute or two.
 
-> **macOS note:** port 5000 is used by the built-in *AirPlay Receiver*. If the app won't start, either turn AirPlay Receiver off in **System Settings → General → AirDrop & Handoff**, or run on another port: `PORT=5001 python application/app.py`.
+### Swap in a new CV
+Name your new PDF exactly `Lauren_Henderson_CV.pdf` and upload it, replacing the old one.
+Every CV link on the site points to that file, so nothing else changes.
 
-Unlike Docker, this server does **not** auto-reload — stop it (`Ctrl+C`) and start it again after any code change.
+The current file is the one-page LaTeX version. Recompile, rename, re-upload.
 
-</details>
+### Add a project
+1. Open `projects.html` and find the comment **HOW TO ADD A PROJECT**.
+2. Copy the template inside it, paste it where it belongs in the list (newest first), and fill it in.
+   Give it an `id` like `id="spotify-recs"` so you can link straight to it (`projects.html#spotify-recs`).
+3. To feature it on the home page too, copy one of the `<li class="entry">` blocks under **SELECTED WORK** in `index.html` and edit it.
 
----
+### Add a piece of writing
+In `index.html`, find **WRITING**, copy one `<li class="post">` block to the top of the list, and change the link, title, one-line description, publication, and date.
 
-## Connecting a different deployment
+- **Published elsewhere (Medium, etc.)?** Link straight to it.
+- **Want it on your site?** Copy `post-template.html`, rename it (e.g. `my-post.html`), and follow the steps at the top of the file. Link the list entry to `my-post.html`. Images go next to it, too.
+  Writing in Markdown is easier: ask Claude to convert it, or run `pandoc my-post.md -o body.html` and paste the result into the template.
 
-A "deployment" is a Dropbox root folder you're pulling mission videos from — e.g. a different client, or a different expedition. Each deployment keeps its own missions, crops, and clustering results completely separate.
-
-- **Switching between deployments already set up:** use the **Deployment** dropdown in the app's top bar. Everything below it — missions, review, export — scopes to whichever deployment is selected.
-- **Adding a brand-new deployment:** go to the **Pipeline** tab, and in the Deployment dropdown pick **"+ New deployment…"**. Give it a name and the Dropbox root path (e.g. `/SomeClientFolder`), fill in Mission ID as usual, and start the pipeline. The app creates the deployment's folder automatically the first time it runs — no manual setup needed.
-
-## Exporting results
-
-In the **Cluster Review** tab, once a mission is initialized, two buttons in the header download the clustering results as CSV:
-
-**Export tracks** — one row per track (every animal detected and tracked, whether it ended up in a named cluster, left unassigned, or was trashed):
-
-| Column | Meaning |
-|---|---|
-| `mission_id`, `video`, `track_id` | Which mission/video/track this row is |
-| `status` | `clustered`, `unassigned`, or `trash` |
-| `cluster_id`, `cluster_name` | Which cluster it's in (if any) |
-| `n_detections` | How many frames this track was detected in |
-| `first_frame`, `last_frame`, `duration_frames` | Where in the video it appears |
-| `top_class` | Most common raw detector label for this track (e.g. "fish") |
-| `max_confidence`, `mean_confidence` | Detector confidence for this track |
-| `video_status` | Review status of the video (`pending` / `processed` / `approved`) |
-
-**Export summary** — one row per video × cluster, plus mission-wide totals as `video=ALL`:
-
-| Column | Meaning |
-|---|---|
-| `mission_id`, `video`, `cluster_id`, `cluster_name` | Which mission/video/cluster this row is |
-| `n_tracks` | Number of tracks in this cluster for this video (or mission-wide, for `ALL` rows) |
-| `n_detections` | Total detections across those tracks |
-| `max_n` | **MaxN** — the peak number of individuals from this cluster seen simultaneously in a single frame. This is the standard abundance metric used in baited/remote underwater video (BRUV) surveys. |
-
-## Troubleshooting
-
-- **`docker: command not found` / `Cannot connect to the Docker daemon`** — Docker Desktop isn't running. Launch it (Start menu on Windows, Applications on macOS — or `open -a Docker` on macOS) and wait ~30–60s for the whale icon to stop animating, then retry.
-- **`docker compose build` is very slow the first time** — that's normal; it's downloading the base image and machine-learning libraries. Later builds are much faster.
-- **Port is already in use / app won't start** — another program is using the port. On Docker the app uses **5001**; without Docker it uses **5000** (which macOS AirPlay Receiver also uses — see the no-Docker note above).
-- **Windows: `curl` behaves strangely** — in PowerShell, `curl` is an alias for a different command. Use `curl.exe` for the Dropbox token step.
-- **Code changes don't take effect** — with Docker, re-run `docker compose build` before `docker compose up`. Running directly (`python application/app.py`), the server doesn't auto-reload — stop it (`Ctrl+C`) and start it again.
-- **A deployment/mission isn't showing up in the dropdowns** — confirm its folder has a `deployment.json` (for deployments) or an `*_embeddings.json` file (for missions to appear in Cluster Review); then restart the app so it picks up the new folder.
-- **A video won't play in Cluster Review** — the app downloads and transcodes a low-res proxy from Dropbox the first time you open a video, which can take a few seconds. If it stays stuck on "generating" or errors out, double-check the deployment's Dropbox root and credentials — that download happens in the background and fails silently if the path is wrong.
+### Change colors or fonts
+Everything is in the **THEME** block at the top of `style.css`.
+- Recolor accents: change `--accent` and `--link`.
+- Dark mode only: delete the `@media (prefers-color-scheme: light)` block right below the theme.
+  Right now the site follows the visitor's device setting (gruvbox dark or gruvbox light).
+- New fonts: pick them on [Google Fonts](https://fonts.google.com), replace the `<link href="https://fonts.googleapis.com/...">` line in every HTML file, and update the `--font-*` lines.
 
 ---
 
-## 📁 Editing code & key reminders
+## If you get a custom domain later
 
-### First-time editor setup
-1. Create and activate a virtual environment:
-   ```
-   python -m venv venv
-   ```
-   | | Activate | Deactivate |
-   |---|---|---|
-   | **Windows (PowerShell)** | `venv\Scripts\Activate.ps1` | `deactivate` |
-   | **macOS** | `source venv/bin/activate` | `deactivate` |
-2. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
+1. Buy the domain (Namecheap, Porkbun, Cloudflare, roughly $10–15/year for a `.com`).
+2. In the repo: **Settings → Pages → Custom domain**, enter it, and follow GitHub's DNS instructions.
+3. Tick **Enforce HTTPS** once it's available.
+4. Update the site URL in the `og:url` and `og:image` lines of every HTML file.
+   (`og.png` also shows `laurenmaih.github.io` in its text.)
 
-### Making changes
-1. Pull the latest: `git pull origin main`
-2. Create a branch: `git checkout -b <branch-name>` (switch branches with `git checkout <branch-name>`)
-3. Activate your virtual environment (if not already active — see above).
-4. Make your edits.
-5. Stage and commit: `git commit -a -m "<message>"`
-6. Push: `git push`
-7. On GitHub, open the **Pull requests** tab → **New pull request**, select your branch, describe your changes, and request reviews from your teammates.
+The old `laurenmaih.github.io` link keeps working and redirects, so nothing you've already sent breaks.

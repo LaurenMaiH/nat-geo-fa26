@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+
+  <title>Are Persona Vectors Language-Invariant? · Lauren Henderson</title>
+  <meta name="description" content="Do persona vectors transfer across languages? Extracting trait directions in English and Spanish from Qwen2.5-3B-Instruct and testing cross-lingual steering.">
+
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="Are Persona Vectors Language-Invariant?">
+  <meta property="og:description" content="Cross-lingual transfer of trait-suppression steering vectors, by Lauren Henderson.">
+  <meta property="og:url" content="https://laurenmaih.github.io/persona-vectors.html">
+  <meta property="og:image" content="https://laurenmaih.github.io/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+
+  <link rel="icon" href="favicon.svg?v=2" type="image/svg+xml"> <!-- bump ?v= when you change the favicon so browsers fetch the new one -->
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&family=IBM+Plex+Sans:ital,wght@0,400;0,500;1,400&family=Space+Grotesk:wght@500&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <!-- ============ HEADER (same on every page) ============ -->
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="index.html">Lauren Henderson</a>
+      <nav class="nav" aria-label="Main">
+        <a href="index.html">Home</a>
+        <a href="projects.html">Projects</a>
+        <a href="index.html#writing" aria-current="page">Writing</a>
+        <a href="Lauren_Henderson_CV.pdf">CV</a>
+        <a href="index.html#contact">Contact</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <article class="article wrap">
+
+      <!-- ============ ARTICLE HEADER ============ -->
+      <header class="article-head">
+        <p class="mono article-meta"><span>April 2026</span><span>13 min read</span></p>
+        <h1>Are Persona Vectors Language-Invariant?</h1>
+        <p class="article-subtitle">Cross-lingual transfer of trait-suppression steering vectors</p>
+        <p class="article-links">
+          <a href="https://github.com/LaurenMaiH/persona_vectors_language_variance">Code</a>
+          <a href="https://docs.google.com/document/d/e/2PACX-1vQaG10gEyraIGVt2Kj4s3BUQMbuP7l8yhpGz8kr6k1eJNKP3SfmWTX93_Oq9KEjcfGSx9VqyDfWopQo/pub">Original Google Doc</a>
+        </p>
+      </header>
+
+      <!-- ============ ARTICLE BODY ============ -->
+      <div class="prose">
+        <h2 id="abstract">Abstract</h2>
+        <p>Recent research by Anthropic has shown that persona vectors — linear directions in activation space corresponding to certain behavioral traits — can be used to measure and steer trait expression in large language models. Chen et al. showed that a given final prompt-token activation’s projection onto the persona vector correlates with the expected strength of trait expression in the model’s output. However, such research has only thus far been conducted in English. Concurrently, a growing body of evidence shows that other aspects of large language model behaviour, such as model reasoning and stylistic expression, vary across different languages. These results beg the question: to what extent are persona vectors, and their effect on trait expression, conditioned by the language used to elicit and apply them? In this document I present a minimal, efficient extension of Chen et al.’s work probing how the persona-vector framework generalizes in a cross-lingual setting. The results support the hypothesis that persona vectors are approximately language-invariant: same-trait cross-language cosine similarities (0.84–0.92) substantially exceed all cross-trait baselines, and cross-language steering suppresses trait expression as effectively as — and in several cases more effectively than — same-language steering.</p>
+        <h2 id="motivation-background">1. Motivation &amp; Background</h2>
+        <h3 id="persona-vectors">1.1 Persona Vectors</h3>
+        <p>Persona vectors are linear directions in the activation space of a large language model corresponding to a certain trait; they exist for a wide variety of traits, from concrete concepts such as “evil” to more abstract behaviours like “hallucination.” To obtain a persona vector, Chen et al. first obtained two sets of model responses — the first being the subject model’s responses when fed prompts designed to elicit the target trait, and the second being responses to prompts intended to suppress the target trait. For every response, the researchers extracted residual stream activations at every layer, averaged over them, and subtracted the “trait-negative” activations from the “trait-positive” activations, resulting in a vector for each layer. The vector that responded the most to steering (essentially by trying to elicit the trait and looking at which layer trait expression peaked) is selected as the persona vector.</p>
+        <p>Once the researchers obtained the persona vector, they found that they could use it to steer the model towards or away from the expression of the target trait; furthermore, that computing the final pre-generation hidden state’s projection onto the persona vector was a reliable predictor of the expression of the associated trait in the final output.</p>
+        <h3 id="large-language-models-in-cross-lingual-settings">1.2 Large Language Models in Cross-Lingual Settings</h3>
+        <p>A growing body of research suggests that large language models express systematic behavioral differences when queried across different languages. Zhong, Yun and Sun’s “Cultural Value Differences of LLMs” found that while LLMs demonstrate relatively consistent cultural values when prompted consistently in a single language, prompting across different languages (e.g. Chinese versus English) can significantly shift expressed cultural patterns. Relatedly, Jang et al. published research indicating that LLMs’ moral value frameworks exhibited cross-linguistic divergence, suggesting that LLM expression is sensitive to the language of interaction.</p>
+        <h3 id="research-question">1.3 Research Question</h3>
+        <p>Persona vectors are intimately tied to behavioral trait expression. If we know that model expression can vary with language, does this indicate underlying divergence in trait-encoding linear directions in a model’s activation space across languages? In other words, do persona vectors exhibit consistent direction, predictive salience, and steering capability across languages, or are these too affected by changes in the language of interaction?</p>
+        <h2 id="related-work">2. Related Work</h2>
+        <p>This work builds on Anthropic’s foundational research with persona vectors, and draws from Jang et al.’s and Zhong et al.’s prior work on LLMs in cross-linguistic settings.</p>
+        <h2 id="experimental-design">3. Experimental Design</h2>
+        <p>Due to the limitations of being a single individual with limited access to models and compute power, this is a minimal but self-contained experiment. Persona vectors are extracted and examined across one language pair — Spanish and English — within a single open-weight model, Qwen2.5-3B-Instruct. What could be done to strengthen the rigor and generalizability of these findings is explored in the Limitations section.</p>
+        <h3 id="model-and-resources">3.1 Model and Resources</h3>
+        <p>This experiment uses Qwen2.5-3B-Instruct (36 transformer layers, hidden dimension 2048). It is powerful but small enough to work with limited compute, and as an open-source model provides the necessary access to its activations and hidden states. The model is loaded via nnsight for activation extraction and as a plain HuggingFace model for steered inference; these are kept separate because nnsight holds model weights on the meta device outside its context managers, preventing direct <code>.generate()</code> calls.</p>
+        <p>The code consists of a modified version of Anthropic’s public persona vectors repository. Modifications include the addition of translated Spanish prompts, a steering evaluation pipeline, and a projection computation pass.</p>
+        <h3 id="trait-selection">3.2 Trait Selection</h3>
+        <p>Three traits are studied — evil, sycophantic, and hallucinating — matching those emphasised in the original Anthropic paper, for which extraction and evaluation prompts were already available in English and could be readily translated into Spanish.</p>
+        <h3 id="persona-vector-extraction">3.3 Persona Vector Extraction</h3>
+        <p>Persona vectors are computed as the mean difference in hidden states between positive examples (model responding under a trait-eliciting system prompt, e.g. “You are an evil assistant…”) and negative examples (model responding under a neutral system prompt). Only high-quality contrastive pairs are used: positive trait score ≥ 50, negative trait score &lt; 50, and coherence ≥ 50 for both. The vector at each layer is:</p>
+        <pre class="formula"><code>vec[layer] = mean(pos_hidden[layer]) − mean(neg_hidden[layer])</code></pre>
+        <p>The <code>response_avg_diff</code> variant — averaging over response token activations rather than prompt tokens — is used for all steering. Vectors are saved as tensors of shape <code>[37, 2048]</code> (36 transformer layers plus the embedding layer). The layer 15 vector (output of transformer layer 14, 0-indexed) is used for all steering and similarity comparisons.</p>
+        <p>Extraction is run separately for English and Spanish, yielding six vectors in total (3 traits × 2 languages).</p>
+        <h3 id="evaluation-languages">3.4 Evaluation Languages</h3>
+        <p>English and Spanish are the evaluation languages. Spanish is a suitable candidate due to its high-resource status, Roman orthography (simplifying tokenization), and the relative ease of obtaining high-quality translations. Choosing Spanish minimises confounds related to script and tokenizer coverage while allowing us to probe how persona vectors behave across linguistic contexts.</p>
+        <h3 id="evaluation-prompt-set-and-translation">3.5 Evaluation Prompt Set and Translation</h3>
+        <p>The English extraction and evaluation questions are non-overlapping sets of 20 distinct questions per trait, verified to have zero overlap. The Spanish sets are independent translations of these English sets (extraction and evaluation translated separately). Translations were produced by Claude and validated using a 5-judge consensus method adapted from Jang et al.: five separate model instances evaluated each translation for semantic accuracy, cultural appropriateness, preservation of framing, and domain-specific terminology, providing a binary accept/reject vote with justification. Translations were regenerated until a majority accepted.</p>
+        <h3 id="baseline-and-steered-evaluation">3.6 Baseline and Steered Evaluation</h3>
+        <p>The unsteered model is evaluated on 20 questions per trait × 10 paraphrases each = 200 responses per condition, scored 0–100 by Claude Haiku (<code>claude-haiku-4-5-20251001</code>) on both trait expression and coherence. Separate baselines are computed for English and Spanish evaluation questions.</p>
+        <p>Steering is applied via a PyTorch forward hook on <code>model.model.layers[14]</code> during generation:</p>
+        <pre class="formula"><code>hidden_state += coeff × vec[15]</code></pre>
+        <p>with <code>coeff = −1.5</code> (negative = suppression) and <code>steering_type = response</code> (hook fires at the last token position during each decode step).</p>
+        <h3 id="experimental-conditions">3.7 Experimental Conditions</h3>
+        <p>For each trait, six conditions are evaluated (plus two baselines):</p>
+        <div class="table-wrap">
+        <table>
+        <thead>
+        <tr class="header">
+        <th>Eval language</th>
+        <th>Vector language</th>
+        <th>Interpretation</th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr class="odd">
+        <td>en</td>
+        <td>baseline</td>
+        <td>Unsteered English</td>
+        </tr>
+        <tr class="even">
+        <td>es</td>
+        <td>baseline</td>
+        <td>Unsteered Spanish</td>
+        </tr>
+        <tr class="odd">
+        <td>en</td>
+        <td>en</td>
+        <td>Same-language control</td>
+        </tr>
+        <tr class="even">
+        <td>en</td>
+        <td>es</td>
+        <td>Cross-language: es → en</td>
+        </tr>
+        <tr class="odd">
+        <td>es</td>
+        <td>en</td>
+        <td>Cross-language: en → es</td>
+        </tr>
+        <tr class="even">
+        <td>es</td>
+        <td>es</td>
+        <td>Same-language control</td>
+        </tr>
+        </tbody>
+        </table>
+        </div>
+        <h3 id="metrics">3.8 Metrics</h3>
+        <p>Cosine similarity between analogous English and Spanish vectors at layer 15:</p>
+        <pre class="formula"><code>cos_sim(v_en, v_es) = (v_en · v_es) / (‖v_en‖₂ × ‖v_es‖₂)</code></pre>
+        <p>Cross-trait cosine similarities (e.g. English-evil vs. Spanish-sycophantic) are also computed as a sanity check baseline.</p>
+        <p>Trait expression scores (0–100, lower = less trait expressed) are assigned by Claude Haiku and averaged over 200 responses per condition. Coherence scores (0–100) are collected alongside.</p>
+        <p>Projections of the last prompt-token hidden state onto each persona vector are computed by running the unsteered model on each (prompt, answer) pair and extracting the layer-15 activation at the last prompt token position. These are a sanity check — they confirm that neutral evaluation prompts do not themselves activate trait directions — and do not vary across steering conditions within the same eval language, since the prompt text is constant.</p>
+        <h2 id="results">4. Results</h2>
+        <h3 id="cosine-similarity">4.1 Cosine Similarity</h3>
+        <p>Same-trait cross-language cosine similarities at layer 15 are high across all three traits:</p>
+        <div class="table-wrap">
+        <table>
+        <thead>
+        <tr class="header">
+        <th>Trait</th>
+        <th>en ↔︎ es cosine similarity</th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr class="odd">
+        <td>evil</td>
+        <td>0.922</td>
+        </tr>
+        <tr class="even">
+        <td>sycophantic</td>
+        <td>0.907</td>
+        </tr>
+        <tr class="odd">
+        <td>hallucinating</td>
+        <td>0.835</td>
+        </tr>
+        </tbody>
+        </table>
+        </div>
+        <p>Cross-trait similarities span −0.131 to 0.448, with the evil–sycophantic pair highest (0.365–0.448) and sycophantic–hallucinating lowest (−0.131 to 0.022). All three same-trait cross-language similarities substantially exceed this range, particularly for hallucinating, whose cross-trait similarities are all below 0.06 in magnitude. This provides strong evidence that the model encodes these traits in approximately language-invariant directions in activation space at layer 15.</p>
+        <p>The evil–sycophantic cross-trait similarity being non-trivially positive (up to 0.45) suggests some geometric overlap between those two trait directions, which is worth noting when interpreting the evil results below.</p>
+        <h3 id="evil-floor-effect">4.2 Evil — Floor Effect</h3>
+        <p>Baseline trait expression scores for evil are 0.30 (English) and 1.00 (Spanish). The instruction-tuned model essentially never produces evil content in response to neutral evaluation prompts, leaving nothing to suppress. This condition is uninformative about steering effectiveness and is excluded from further interpretation.</p>
+        <h3 id="sycophantic">4.3 Sycophantic</h3>
+        <p>English baseline: 22.86 (coherence: 82.35). Spanish baseline: 31.49 (coherence: 65.28).</p>
+        <div class="table-wrap">
+        <table>
+        <thead>
+        <tr class="header">
+        <th>Eval lang</th>
+        <th>Vec lang</th>
+        <th>Trait score</th>
+        <th>Δ vs baseline</th>
+        <th>Coherence</th>
+        <th>Δ coherence</th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr class="odd">
+        <td>en</td>
+        <td>en (same-lang)</td>
+        <td>17.56</td>
+        <td>−5.30 (−23.2%)</td>
+        <td>85.68</td>
+        <td>+3.33</td>
+        </tr>
+        <tr class="even">
+        <td>en</td>
+        <td>es (cross-lang)</td>
+        <td>18.995</td>
+        <td>−3.87 (−16.9%)</td>
+        <td>86.14</td>
+        <td>+3.79</td>
+        </tr>
+        <tr class="odd">
+        <td>es</td>
+        <td>en (cross-lang)</td>
+        <td>24.89</td>
+        <td>−6.60 (−21.0%)</td>
+        <td>76.10</td>
+        <td>+10.82</td>
+        </tr>
+        <tr class="even">
+        <td>es</td>
+        <td>es (same-lang)</td>
+        <td>25.54</td>
+        <td>−5.95 (−18.9%)</td>
+        <td>76.69</td>
+        <td>+11.41</td>
+        </tr>
+        </tbody>
+        </table>
+        </div>
+        <p>Cross-language transfer is effective in both directions and nearly matches same-language steering. In the English-eval direction, the same-language vector achieves a somewhat stronger reduction (−23.2% vs −16.9%), though both suppress meaningfully. In the Spanish-eval direction, the cross-language vector (en→es) actually outperforms the same-language one (−21.0% vs −18.9%), suggesting no degradation at all in that direction.</p>
+        <p>Coherence improves under all steering conditions, mildly on English evals (+3–4 points) and more substantially on Spanish evals (+10–11 points). This consistent improvement suggests the steering is cleaning up responses — suppressing meandering, approval-seeking verbiage — rather than simply degrading fluency.</p>
+        <h3 id="hallucinating">4.4 Hallucinating</h3>
+        <p>English baseline: 20.87 (coherence: 71.14). Spanish baseline: 41.36 (coherence: 49.37).</p>
+        <p>The Spanish baseline is striking: a trait score of 41.36 versus 20.87 for English, with coherence nearly 22 points lower. This suggests the model operates in a qualitatively different and lower-quality regime on Spanish hallucination prompts under neutral conditions.</p>
+        <div class="table-wrap">
+        <table>
+        <thead>
+        <tr class="header">
+        <th>Eval lang</th>
+        <th>Vec lang</th>
+        <th>Trait score</th>
+        <th>Δ vs baseline</th>
+        <th>Coherence</th>
+        <th>Δ coherence</th>
+        </tr>
+        </thead>
+        <tbody>
+        <tr class="odd">
+        <td>en</td>
+        <td>en (same-lang)</td>
+        <td>11.45</td>
+        <td>−9.42 (−45.1%)</td>
+        <td>80.10</td>
+        <td>+8.96</td>
+        </tr>
+        <tr class="even">
+        <td>en</td>
+        <td>es (cross-lang)</td>
+        <td>10.92</td>
+        <td>−9.96 (−47.7%)</td>
+        <td>80.57</td>
+        <td>+9.43</td>
+        </tr>
+        <tr class="odd">
+        <td>es</td>
+        <td>en (cross-lang)</td>
+        <td>20.99</td>
+        <td>−20.38 (−49.3%)</td>
+        <td>67.76</td>
+        <td>+18.39</td>
+        </tr>
+        <tr class="even">
+        <td>es</td>
+        <td>es (same-lang)</td>
+        <td>24.42</td>
+        <td>−16.94 (−41.0%)</td>
+        <td>64.96</td>
+        <td>+15.59</td>
+        </tr>
+        </tbody>
+        </table>
+        </div>
+        <p>Several things stand out here.</p>
+        <p>First, the suppression effect is large in both eval languages and in all four steering conditions. On English evals, both vectors reduce hallucination scores by roughly 45–48%, with the Spanish vector marginally outperforming the English one (10.92 vs 11.45). On Spanish evals, the reduction is even larger in absolute and percentage terms: both vectors bring the trait score from 41.36 down to roughly 21–24, a decrease of 41–49%.</p>
+        <p>Second, the cross-language vectors are competitive with or better than the same-language vectors in both directions. The Spanish vector marginally edges out the English vector on English evals; the English vector more substantially outperforms the Spanish vector on Spanish evals (20.99 vs 24.42, −49.3% vs −41.0%).</p>
+        <p>Third, coherence improves substantially under all conditions, and most dramatically on Spanish evals (+15–18 points). Despite this improvement, Spanish coherence under steering (65–68) remains below the English baseline (71.14), and the steered Spanish trait scores (21–24) remain somewhat above the steered English scores (11–15). This is consistent with the model being in a genuinely harder-to-steer regime on Spanish hallucination prompts, though the steering is clearly not ineffective — it is recovering a substantial portion of the performance gap between the two languages.</p>
+        <h3 id="projections">4.5 Projections</h3>
+        <p>All projection values are negative, ranging from approximately −5.0 to −11.4 (onto the English vector) and −6.4 to −9.5 (onto the Spanish vector) across all traits and conditions. Projections are nearly identical across steering conditions within the same eval language, as expected: since the prompt text is constant across conditions, the unsteered hidden state at the last prompt token does not change. This confirms that neutral evaluation prompts do not activate trait directions, and that baseline negativity in projections is not driving differences in trait expression across conditions.</p>
+        <h2 id="discussion">5. Discussion</h2>
+        <p>The results broadly support the hypothesis that persona vectors are approximately language-invariant, at least for this model and language pair. The geometric evidence is clear: same-trait cross-language cosine similarities of 0.84–0.92 are well above the cross-trait ceiling of ~0.45. The behavioral evidence is equally consistent: in all informative steering conditions (sycophantic and hallucinating, both eval languages), cross-language vectors suppress trait expression at rates comparable to same-language vectors, and in several conditions they marginally outperform them.</p>
+        <p>The original expectation was that cross-language transfer would show “minor but significant divergence.” The actual result is stronger: there is no meaningful divergence in steering effectiveness. This is a notable finding. It suggests that at layer 15 of Qwen2.5-3B-Instruct, trait representations are encoded in a shared direction across English and Spanish, and that the steering mechanism acts on this shared direction regardless of which language the vector was extracted from.</p>
+        <p>The sycophantic coherence gains (+10–11 points on Spanish evals) and hallucinating coherence gains (+15–18 points on Spanish evals) are a secondary finding worth noting. Suppression steering here appears to produce not just less sycophantic or less hallucinatory responses, but more coherent ones — consistent with the idea that traits like sycophancy and hallucination partly manifest as degraded or incoherent generation that the suppression vector corrects.</p>
+        <p>The hallucinating asymmetry between English and Spanish baselines (20.87 vs 41.36, coherence 71.14 vs 49.37) is not resolved by steering but is substantially reduced. Whether this gap reflects a genuine difference in how the model processes Spanish hallucination prompts, or is partly a measurement artifact of how Claude Haiku evaluates Spanish responses, is an open question.</p>
+        <h2 id="limitations">6. Limitations</h2>
+        <p>This experiment involves a single language pair (English and Spanish) within a single model. Nothing here can be generalized in good faith to LLM cross-linguistic behaviour as a whole.</p>
+        <p>Spanish is a high-resource, Roman-script language with substantial representation in Qwen’s training data. More linguistically distant language pairs — particularly those with non-Roman scripts, different morphological typologies, or less training data — may yield different results. The experiment also uses a single small model (3B parameters). Zhong et al. found that model size was a major factor in cross-linguistic divergence of cultural value expression; it is plausible that larger models have more or less language-invariant trait representations.</p>
+        <p>The evil trait is entirely uninformative due to the instruction tuning of the model producing a near-zero baseline. A model less strongly instruction-tuned, or a different set of trait-eliciting prompts, would be needed to study this trait meaningfully.</p>
+        <p>Finally, the judge model (Claude Haiku) may evaluate English and Spanish responses differently, introducing measurement bias that is difficult to disentangle from genuine behavioral differences.</p>
+        <h2 id="broader-implications">7. Broader Implications</h2>
+        <p>The approximate language-invariance of persona vectors at layer 15 of Qwen2.5-3B-Instruct suggests that some behavioral traits are encoded in shared directions across languages in this model’s activation space, rather than being represented in language-specific subspaces. This has practical implications for steering-based safety interventions: a vector extracted from one language may generalize to others without re-extraction, at least within related high-resource language pairs.</p>
+        <p>Whether this generalizes to more distant language pairs, larger models, or more subtle traits remains to be tested. The experimental framework here is lightweight enough to replicate across a range of models and language pairs, which is the natural next step.</p>
+        <h2 id="planned-extensions">8. Planned Extensions</h2>
+        <ul>
+        <li>Repeating this framework with additional models (e.g. LLaMA-3-8B) and larger variants of the same model (e.g. Qwen2.5-7B-Instruct)<br />
+        </li>
+        <li>Extending to more linguistically distant language pairs: Japanese, Korean, Arabic<br />
+        </li>
+        <li>Extending to additional high-resource languages similar to English: French, Italian<br />
+        </li>
+        <li>Probing additional layers beyond layer 15 to assess whether language-invariance holds uniformly across depth</li>
+        </ul>
+
+      </div>
+
+      <p class="article-end"><a href="index.html#writing">Back to all writing</a></p>
+    </article>
+  </main>
+
+  <!-- ============ FOOTER (same on every page) ============ -->
+  <footer class="site-footer">
+    <div class="wrap">
+      <span class="mono">© 2026 Lauren Henderson</span>
+      <span class="mono">Plain HTML and CSS, hosted on GitHub Pages</span>
+    </div>
+  </footer>
+</body>
+</html>

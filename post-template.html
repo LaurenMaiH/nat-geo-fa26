@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<!-- =====================================================================
+     POST TEMPLATE
+     1. Copy this file and rename it, e.g. my-new-post.html
+        (lowercase, hyphens, no spaces; this becomes the URL).
+     2. Fill in everything marked EDIT.
+     3. Delete the <meta name="robots"...> line in your copy
+        (it only stops search engines from listing this template).
+     4. Add the post to the WRITING list in index.html, linking to
+        my-new-post.html
+     ===================================================================== -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+
+  <!-- EDIT: tab title and description -->
+  <title>Post title · Lauren Henderson</title>
+  <meta name="description" content="One sentence about the post.">
+
+  <!-- EDIT: link preview (title, description, and this page's URL) -->
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="Post title">
+  <meta property="og:description" content="One sentence about the post.">
+  <meta property="og:url" content="https://laurenmaih.github.io/my-new-post.html">
+  <meta property="og:image" content="https://laurenmaih.github.io/og.png">
+  <meta name="twitter:card" content="summary_large_image">
+
+  <link rel="icon" href="favicon.svg?v=2" type="image/svg+xml"> <!-- bump ?v= when you change the favicon so browsers fetch the new one -->
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono&family=IBM+Plex+Sans:ital,wght@0,400;0,500;1,400&family=Space+Grotesk:wght@500&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+
+  <!-- ============ HEADER (same on every page) ============ -->
+  <header class="site-header">
+    <div class="wrap">
+      <a class="brand" href="index.html">Lauren Henderson</a>
+      <nav class="nav" aria-label="Main">
+        <a href="index.html">Home</a>
+        <a href="projects.html">Projects</a>
+        <a href="index.html#writing" aria-current="page">Writing</a>
+        <a href="Lauren_Henderson_CV.pdf">CV</a>
+        <a href="index.html#contact">Contact</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <article class="article wrap">
+
+      <header class="article-head">
+        <!-- EDIT: date and reading time (about 230 words per minute) -->
+        <p class="mono article-meta"><span>Month 2026</span><span>5 min read</span></p>
+        <!-- EDIT: title and optional subtitle (delete the subtitle line if you don't want one) -->
+        <h1>Post title</h1>
+        <p class="article-subtitle">Optional subtitle</p>
+        <!-- EDIT: links, or delete this whole <p> -->
+        <p class="article-links">
+          <a href="https://github.com/LaurenMaiH">Code</a>
+        </p>
+      </header>
+
+      <!-- EDIT: the post itself. Building blocks you can copy: -->
+      <div class="prose">
+        <h2>Section heading</h2>
+        <p>A paragraph. <a href="https://example.com">A link</a>. Some <code>inline_code</code>.</p>
+
+        <h3>Smaller heading</h3>
+        <ul>
+          <li>A bullet point</li>
+          <li>Another one</li>
+        </ul>
+
+        <!-- a formula or code line, shown in its own box -->
+        <pre class="formula"><code>loss = mean(cross_entropy(y, ŷ))</code></pre>
+
+        <!-- a table (scrolls sideways on phones) -->
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Column</th><th>Column</th></tr></thead>
+            <tbody>
+              <tr><td>Value</td><td>Value</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- an image: upload the file next to this page (same place as index.html) -->
+        <!-- <img src="my-figure.png" alt="Describe what the figure shows" style="max-width:100%"> -->
+      </div>
+
+      <p class="article-end"><a href="index.html#writing">Back to all writing</a></p>
+    </article>
+  </main>
+
+  <!-- ============ FOOTER (same on every page) ============ -->
+  <footer class="site-footer">
+    <div class="wrap">
+      <span class="mono">© 2026 Lauren Henderson</span>
+      <span class="mono">Plain HTML and CSS, hosted on GitHub Pages</span>
+    </div>
+  </footer>
+</body>
+</html>
