@@ -240,3 +240,7 @@ clustering-ui/state.json
 *.csv
 
 processed_missions/**/*_embeddings.json
+# Docker host folders (see SCRATCH_DIR / VIDEO_DIR / MODEL_DIR in .env.example)
+/scratch/
+/videos/
+/model_cache/

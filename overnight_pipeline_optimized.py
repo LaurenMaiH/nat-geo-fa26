@@ -2,7 +2,7 @@
 """
 Overnight Detection + Extraction + Embedding
 
-For each video in a Dropbox mission folder:
+For each video in a mission folder (Dropbox or a local drive — see application/video_sources.py):
   1. YOLO-World + ByteTrack detection (conf threshold configurable)
   2. Append ALL detections to one shared CSV
   3. Filter out short tracks (noise reduction, configurable)
@@ -17,6 +17,7 @@ Optimizations over previous version:
 """
 
 import os
+import sys
 import csv
 import json
 import shutil
@@ -31,22 +32,24 @@ import numpy as np
 import torch
 import yaml
 import gdown
-import dropbox
 import ultralytics
 from ultralytics import YOLOWorld, settings
 from tqdm import tqdm
 from dotenv import load_dotenv
 
+sys.path.insert(0, str(Path(__file__).parent / "application"))
+from video_sources import DropboxSource, load_manifest, write_manifest, manifest_entry
+
 load_dotenv()
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-APP_KEY        = os.environ["DROPBOX_APP_KEY"]
-APP_SECRET     = os.environ["DROPBOX_APP_SECRET"]
-REFRESH_TOKEN  = os.environ["DROPBOX_REFRESH_TOKEN"]
-
 MISSION_ID   = "PLW_dscm_03"          # ← only line to change between missions
 DEPLOYMENT_ROOT = os.environ.get("DROPBOX_DEPLOYMENT_ROOT", "/DOEX0096_Palau")
 MISSION_PATH = f"{DEPLOYMENT_ROOT}/{MISSION_ID}/Video"   # ← and this one
+
+# Video source (video_sources.LocalSource / DropboxSource). The app sets this;
+# None means Dropbox at DEPLOYMENT_ROOT, with MISSION_PATH as the Dropbox folder.
+SOURCE = None
 
 SELECTED_VIDEOS = None  # set to a list of filenames, or None for all
 START_FROM      = "PLW_dscm_03_c011.mp4"  # set to a filename to start from that video (inclusive)
@@ -58,6 +61,7 @@ _MISSION_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_CSV_PATH   = _MISSION_DIR / f"{MISSION_ID}_detections.csv"
 OUTPUT_CROPS_DIR  = _MISSION_DIR / f"{MISSION_ID}_crops"
 OUTPUT_EMBEDDINGS = _MISSION_DIR / f"{MISSION_ID}_embeddings.json"
+OUTPUT_MANIFEST   = _MISSION_DIR / f"{MISSION_ID}_manifest.json"
 
 CONF_THRESHOLD  = 0.15
 IOU_THRESHOLD   = 0.70
@@ -467,26 +471,15 @@ def process_video(
     return track_crop_paths
 
 
-# ──────── DROPBOX ────────────────────────────────────────────────────────────
-def connect_dropbox():
-    dbx = dropbox.Dropbox(
-        app_key=APP_KEY,
-        app_secret=APP_SECRET,
-        oauth2_refresh_token=REFRESH_TOKEN,
-    )
-    try:
-        dbx.files_list_folder("")
-        print("Dropbox connection OK")
-    except Exception as e:
-        raise RuntimeError(f"Dropbox connection failed: {e}")
-    return dbx
-
-
 # ──────── MAIN ───────────────────────────────────────────────────────────────
 def main(reporter=None):
     print(f"Using device: {INFERENCE_DEVICE}")
 
-    dbx            = connect_dropbox()
+    # List videos first so a bad path / missing credentials fails before model load
+    source      = SOURCE or DropboxSource(DEPLOYMENT_ROOT)
+    all_entries = source.list_videos(MISSION_PATH)
+    print(f"Found {len(all_entries)} videos in {source.describe(MISSION_PATH)}")
+
     model, tracker = load_model_and_config()
     embed_info     = load_embedding_model()
 
@@ -498,16 +491,14 @@ def main(reporter=None):
             all_embeddings = json.load(f)
         print(f"Loaded {len(all_embeddings)} existing embeddings from {OUTPUT_EMBEDDINGS}")
 
-    all_entries = sorted(
-        [e for e in dbx.files_list_folder(MISSION_PATH).entries if e.name.endswith(".mp4")],
-        key=lambda e: e.name,
-    )
+    manifest = load_manifest(OUTPUT_MANIFEST)
+
     if SELECTED_VIDEOS is not None:
         sel     = set(SELECTED_VIDEOS)
         entries = [e for e in all_entries if e.name in sel]
         missing = sel - {e.name for e in entries}
         if missing:
-            print(f"Warning: not found in Dropbox: {missing}")
+            print(f"Warning: not found in source folder: {missing}")
         print(f"Selected {len(entries)}/{len(all_entries)} videos")
     else:
         entries = all_entries
@@ -534,27 +525,33 @@ def main(reporter=None):
                 print("Stop signal received — exiting after current video.")
                 break
 
-            video_name = Path(entry.name).stem
+            video_name = entry.stem
             media_id   = entry.name
-            local_path = tmpdir / entry.name
 
             if reporter:
                 reporter.begin_video(video_name, idx + 1, total)
-                reporter.stage("downloading")
 
             print(f"\n{'='*60}")
-            print(f"Downloading: {entry.name}")
-            dbx.files_download_to_file(str(local_path), f"{MISSION_PATH}/{entry.name}")
-
             try:
-                if reporter:
-                    reporter.stage("detecting")
-                track_crops = process_video(
-                    local_path, media_id, video_name, model, tracker,
-                    OUTPUT_CSV_PATH, OUTPUT_CROPS_DIR,
-                    tmpdir=tmpdir,
-                    reporter=reporter,
-                )
+                manifest[video_name] = manifest_entry(source, entry)
+                write_manifest(OUTPUT_MANIFEST, manifest)
+
+                if source.type == "dropbox":
+                    print(f"Downloading: {entry.name}")
+                    if reporter:
+                        reporter.stage("downloading")
+                else:
+                    print(f"Reading: {entry.rel_path}")
+
+                with source.local_copy(entry) as local_path:
+                    if reporter:
+                        reporter.stage("detecting")
+                    track_crops = process_video(
+                        local_path, media_id, video_name, model, tracker,
+                        OUTPUT_CSV_PATH, OUTPUT_CROPS_DIR,
+                        tmpdir=tmpdir,
+                        reporter=reporter,
+                    )
 
                 # ── Batch embedding per track ─────────────────────────────────
                 total_crops = sum(len(v) for v in track_crops.values())
@@ -594,8 +591,6 @@ def main(reporter=None):
                 print(f"✗  {entry.name} failed: {e}")
                 if reporter:
                     reporter.video_error(video_name, str(e))
-            finally:
-                local_path.unlink(missing_ok=True)
 
     clean_csv(OUTPUT_CSV_PATH)
     print(f"\nDone! Processed {counter} videos this session.")
