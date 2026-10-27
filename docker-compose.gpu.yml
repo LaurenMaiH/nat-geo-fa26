@@ -1,0 +1,23 @@
+# Optional NVIDIA GPU mode. Use together with the main file:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+#
+# Requires: Windows + Docker Desktop (WSL 2 backend), an NVIDIA GPU, and a current NVIDIA
+# driver installed on Windows (nothing to install inside WSL or the container).
+# Docker on macOS cannot use a GPU at all; Mac users should run the default (CPU) setup.
+#
+# The pipeline picks the GPU automatically (torch.cuda.is_available()); the log prints
+# "Using device: cuda" when it worked.
+services:
+  app:
+    build:
+      args:
+        # CUDA 13.0 build of torch: RTX 20-series and newer, driver 580 or newer.
+        # For older GPUs (GTX 10-series) set TORCH_CUDA_VARIANT=cu126 in .env.
+        TORCH_VARIANT: ${TORCH_CUDA_VARIANT:-cu130}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

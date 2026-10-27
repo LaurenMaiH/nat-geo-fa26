@@ -14,6 +14,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
+# torch/torchvision are installed BEFORE requirements.txt so that ultralytics / open-clip
+# find them already satisfied. Otherwise pip pulls the default CUDA build from PyPI
+# (several GB of NVIDIA libraries) even though the container has no GPU.
+#   TORCH_VARIANT=cpu    (default) small CPU-only build
+#   TORCH_VARIANT=cu130  CUDA build, set by docker-compose.gpu.yml
+# Any index under https://download.pytorch.org/whl/ works (cpu, cu126, cu130, ...).
+ARG TORCH_VARIANT=cpu
+RUN pip install --no-cache-dir torch torchvision \
+    --index-url https://download.pytorch.org/whl/${TORCH_VARIANT}
+
+# Dependencies are installed before the code is copied, so editing application/ or the
+# pipeline only rebuilds the last few layers below (seconds), not the pip installs above.
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

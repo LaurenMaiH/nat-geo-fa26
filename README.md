@@ -54,7 +54,13 @@ No Python or ffmpeg setup required. Just Docker Desktop.
     - Place the downloaded `DOEX0096_Palau` folder inside it, so the paths `nat-geo/processed_missions/DOEX0096_Palau/deployment.json` and `nat-geo/processed_missions/DOEX0096_Palau/PLW_dscm_11/` both exist
 
     This gives the app a deployment and mission to open by default. Missions are grouped under a "deployment" folder — a deployment is one Dropbox root you're pulling videos from (e.g. one client's account, or one expedition). To add more missions to this same deployment, download or process them the same way — each one gets its own folder under `processed_missions/DOEX0096_Palau/`. See "Connecting a different deployment" below for adding a separate one.
-4. Build the Docker image **(first time only, or after code changes)**:
+4. **(Windows — strongly recommended)** Choose where large files go. In `.env`, add these three lines, pointing at a drive with lots of free space (see [Disk space (Windows)](#disk-space-windows) for why):
+    ```
+    SCRATCH_DIR=D:/PristineSeas/scratch
+    VIDEO_DIR=D:/PristineSeas/videos
+    MODEL_DIR=D:/PristineSeas/model_cache
+    ```
+5. Build the Docker image **(first time, and again after every code change or `git pull`)**:
     ```
     docker compose build
     ```
@@ -66,6 +72,103 @@ docker compose up
 Then open `http://localhost:5001` in your browser.
 
 To stop: `docker compose down`
+
+> **Docker does not pick up code changes on its own.** The code is copied into the image when it's built, so after editing code or running `git pull`, rebuild before starting: `docker compose up --build`. Only the code layers are rebuilt (seconds); the Python packages are reinstalled only if `requirements.txt` changes.
+
+### Where files are stored
+
+Everything large lives in ordinary folders on your computer, not inside Docker:
+
+| Folder | Set with | Default | What's in it |
+|---|---|---|---|
+| Results | — | `processed_missions/` | Crops, detections CSV, embeddings, review state, video proxies |
+| Scratch | `SCRATCH_DIR` | `scratch/` | Videos being downloaded and re-encoded. Emptied automatically after each video. |
+| Videos | `VIDEO_DIR` | `videos/` | Local copies of mission videos (read-only to the app) |
+| Models | `MODEL_DIR` | `model_cache/` | ~6 GB of model weights, downloaded on the first pipeline run and reused after that |
+
+On Windows, write paths in `.env` with forward slashes (`D:/PristineSeas/scratch`), without quotes. Folders that don't exist yet are created automatically.
+
+### Optional: use an NVIDIA GPU (Windows)
+
+By default everything runs on the CPU. If the computer has an NVIDIA graphics card, the pipeline can use it and run much faster:
+
+1. Install the latest NVIDIA driver for Windows from [nvidia.com/drivers](https://www.nvidia.com/drivers). Nothing else needs to be installed; Docker Desktop (WSL 2) passes the GPU through automatically.
+2. Start the app with the GPU file added (the first build downloads a GPU version of PyTorch, which is several GB larger):
+    ```
+    docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+    ```
+3. Run the pipeline and check the log: it should say `Using device: cuda`. If it says `cpu`, the GPU wasn't found. Update the driver and restart Docker Desktop.
+
+The GPU build is for RTX 20-series cards and newer. For older cards (e.g. GTX 1080), add `TORCH_CUDA_VARIANT=cu126` to `.env` first. **Macs:** Docker on macOS cannot use the GPU at all, so use the normal `docker compose up`.
+
+Switching between GPU and CPU mode rebuilds the image. Afterwards, run `docker image prune` to delete the old copy.
+
+## Disk space (Windows)
+
+Docker Desktop stores everything it keeps internally in a single file on `C:\`:
+
+```
+C:\Users\<your-username>\AppData\Local\Docker\wsl\disk\docker_data.vhdx
+```
+
+That file **grows but never shrinks on its own**, even after Docker deletes things. The steps below keep it small and get back space it has already used.
+
+### 1. Send large files to D:\
+
+Do step 4 of [First time setup](#first-time-setup): set `SCRATCH_DIR`, `VIDEO_DIR` and `MODEL_DIR` in `.env` to folders on `D:\`. Then the video downloads, temporary re-encodes and model weights are written to `D:\` instead of into Docker's file. Rebuild and restart afterwards (`docker compose up --build`).
+
+### 2. (Optional) Move Docker's own file to D:\
+
+In Docker Desktop: **Settings (gear icon) → Resources → Advanced → Disk image location**. Choose a folder on `D:\` (e.g. `D:\DockerData`), then click **Apply & restart**. Docker moves the file there, which can take a few minutes. The app's Docker image (a few GB) and Docker's other internal data will then live on `D:\`.
+
+### 3. Get back space that's already used
+
+Do this once now to recover the space from earlier runs, and again whenever `C:\` gets tight.
+
+1. Open **PowerShell** and delete Docker's unused images, stopped containers and build cache:
+    ```
+    docker system prune -a
+    ```
+    Type `y` to confirm. This does **not** touch your results, videos or model weights, because those are in normal folders. The next `docker compose up --build` rebuilds the image (about 5–10 minutes).
+2. Quit Docker Desktop: right-click the whale icon in the taskbar (near the clock), then click **Quit Docker Desktop**.
+3. In PowerShell, run:
+    ```
+    wsl --shutdown
+    ```
+4. Shrink the file. This needs an **administrator** PowerShell: click Start, type `PowerShell`, right-click it, then click **Run as administrator**. Replace `<your-username>` with your Windows user name in the commands below. If you moved the disk image in step 2, use that folder instead.
+
+    **Windows Pro / Enterprise / Education:**
+    ```
+    Optimize-VHD -Path "C:\Users\<your-username>\AppData\Local\Docker\wsl\disk\docker_data.vhdx" -Mode Full
+    ```
+    **Windows Home**, or if `Optimize-VHD` says it isn't recognized, run these lines one at a time:
+    ```
+    diskpart
+    select vdisk file="C:\Users\<your-username>\AppData\Local\Docker\wsl\disk\docker_data.vhdx"
+    attach vdisk readonly
+    compact vdisk
+    detach vdisk
+    exit
+    ```
+    Shrinking a large file can take 10+ minutes. When it finishes, check the file's size in File Explorer, then start Docker Desktop again.
+
+    *Can't find the file?* Older Docker Desktop versions call it `C:\Users\<your-username>\AppData\Local\Docker\wsl\data\ext4.vhdx`.
+
+### 4. Check how much space Docker is using
+
+```
+docker system df
+```
+This lists how much space Docker's images, containers and build cache take, and how much of each can be reclaimed. Add `-v` for a per-item breakdown.
+
+### 5. Clean up after rebuilding
+
+Every `docker compose build` (or `up --build`) leaves the previous version of the image behind. Every so often, run:
+```
+docker image prune
+docker builder prune
+```
+The first command deletes old, untagged images; the second deletes Docker's cache of build steps. Neither touches your data. If space is still tight after that, repeat step 3.
 
 ## Connecting a different deployment
 
@@ -102,8 +205,9 @@ In the Cluster Review tab, once a mission is initialized, two buttons in the hea
 
 ## Troubleshooting
 
-- **`Cannot connect to the Docker daemon...`** — Docker Desktop isn't running. Launch it from Applications (or `open -a Docker` in a terminal) and wait ~30–60s for the whale icon in the menu bar to stop animating, then retry.
-- **Code changes don't seem to take effect** — if you're running the app directly (`python application/app.py`, not Docker), the server doesn't auto-reload. Stop it (`Ctrl+C`) and start it again. If you're using Docker, re-run `docker compose build` before `docker compose up`.
+- **`Cannot connect to the Docker daemon...`** — Docker Desktop isn't running. Launch it from Applications on a Mac (or `open -a Docker` in a terminal) or from the Start menu on Windows, and wait ~30–60s for the whale icon to stop animating, then retry.
+- **Code changes don't seem to take effect** — neither setup reloads code automatically. With Docker, the code is copied into the image at build time, so the running container keeps the old code until you rebuild: `docker compose up --build`. If you're running the app directly (`python application/app.py`), stop it (`Ctrl+C`) and start it again.
+- **Docker stopped partway through a run / `C:\` is full** — see [Disk space (Windows)](#disk-space-windows).
 - **A deployment/mission isn't showing up in the dropdowns** — confirm its folder has a `deployment.json` (for deployments) or an `*_embeddings.json` file (for missions to appear in Cluster Review); then restart the app so it picks up the new folder.
 - **A video won't play in Cluster Review** — the app has to download and transcode a low-res proxy from Dropbox the first time you open a video, which can take a few seconds. If it stays stuck on "generating" or shows an error, double check the deployment's Dropbox root and credentials are correct — that download is happening in the background and failing silently if the path is wrong.
 
