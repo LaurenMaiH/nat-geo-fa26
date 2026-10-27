@@ -7,12 +7,16 @@ import os
 import re
 import numpy as np
 import hdbscan as hdbscan_lib
-import dropbox
 import threading
 import subprocess
 import tempfile
 from datetime import datetime
 from dotenv import load_dotenv
+
+from video_sources import (
+    DropboxSource, Video, connect_dropbox, load_manifest, local_video_root,
+    make_source, source_config, video_stem,
+)
 
 app = Flask(__name__)
 
@@ -23,7 +27,8 @@ _DEPLOYMENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
 # ── Deployments ────────────────────────────────────────────────────────────────
-# processed_missions/<deployment_id>/deployment.json  → {"deployment_id", "dropbox_root", ...}
+# processed_missions/<deployment_id>/deployment.json  → {"deployment_id", "source": {"type", "root"}, ...}
+#   (older files have "dropbox_root" instead of "source" — read as a Dropbox source)
 # processed_missions/<deployment_id>/<mission_id>/     → unchanged per-mission data
 
 def _deployments_root() -> Path:
@@ -55,9 +60,9 @@ def _load_deployment(deployment_id):
     return json.loads(path.read_text())
 
 
-def _ensure_deployment(deployment_id: str, dropbox_root: str):
+def _ensure_deployment(deployment_id: str, source: dict):
     """Create (or verify) a deployment folder + config. Called the first time
-    the pipeline targets a given deployment."""
+    the pipeline targets a given deployment. `source` is {"type", "root"}."""
     if not _DEPLOYMENT_ID_RE.match(deployment_id or ""):
         raise ValueError(f"Invalid deployment id: {deployment_id!r}")
     d = _deployment_dir(deployment_id)
@@ -66,7 +71,7 @@ def _ensure_deployment(deployment_id: str, dropbox_root: str):
     if not config_path.exists():
         config_path.write_text(json.dumps({
             "deployment_id": deployment_id,
-            "dropbox_root": dropbox_root,
+            "source": {"type": source["type"], "root": source["root"]},
             "created_at": datetime.now().isoformat(),
         }, indent=2))
     return _load_deployment(deployment_id)
@@ -103,7 +108,7 @@ def _review_paths(mission_id=None):
     return d / f"{m}_embeddings.json", d / "state.json"
 
 
-_dbx_instance = None
+_dbx_instance = None  # only created when a Dropbox deployment needs it
 _proxy_status: dict[str, str] = {}  # video_name → "generating" | "ready" | "error"
 _proxy_lock = threading.Lock()
 
@@ -123,7 +128,7 @@ def _load_deployment_detections(deployment_id):
             continue
         with open(csv_file, newline='') as f:
             for row in csv.DictReader(f):
-                vid = row['media_id'].removesuffix('.mp4')
+                vid = video_stem(row['media_id'])
                 frame = int(row['frame'])
                 cache.setdefault(vid, {}).setdefault(frame, []).append({
                     'track_id': int(row['track_id']),
@@ -288,9 +293,18 @@ def _crops_dir_for_video(video):
     return _deployment_dir(_current_deployment_id) / (_review_mission_id or "") / f"{_review_mission_id}_crops"
 
 
+def _owning_mission_id(video_name: str):
+    """Mission folder holding this clip: parsed from `<mission>_c<NNN>` when that
+    folder exists, else the mission under review (local clips can have any name)."""
+    mission_id = _mission_id_for_video(video_name)
+    if mission_id and (_deployment_dir(_current_deployment_id) / mission_id).is_dir():
+        return mission_id
+    return _review_mission_id
+
+
 def _proxy_dir_for_video(video_name: str) -> Path:
     """Return (and create) the proxy_videos dir for the mission owning this video clip."""
-    mission_id = _mission_id_for_video(video_name) or _review_mission_id
+    mission_id = _owning_mission_id(video_name)
     parent = _deployment_dir(_current_deployment_id) / (mission_id or "")
     parent.mkdir(parents=True, exist_ok=True)
     candidate = parent / "proxy_videos"
@@ -306,7 +320,7 @@ def _dropbox_mission_path_for(video_name: str) -> str:
     """
     mission_id = _mission_id_for_video(video_name) or _review_mission_id
     deployment = _load_deployment(_current_deployment_id) or {}
-    root = deployment.get("dropbox_root", "")
+    root = source_config(deployment)["root"]
     if mission_id:
         segs = mission_id.split('_', 1)
         mission_upper = segs[0].upper() + ('_' + segs[1] if len(segs) > 1 else '')
@@ -440,13 +454,34 @@ def _assign_track(state, track_key, target_cid, affected_cids):
 def get_dbx():
     global _dbx_instance
     if _dbx_instance is None:
-        import os
-        _dbx_instance = dropbox.Dropbox(
-            app_key=os.environ["DROPBOX_APP_KEY"],
-            app_secret=os.environ["DROPBOX_APP_SECRET"],
-            oauth2_refresh_token=os.environ["DROPBOX_REFRESH_TOKEN"],
-        )
+        _dbx_instance = connect_dropbox()
     return _dbx_instance
+
+
+def _proxy_source_video(video_name: str):
+    """(source, Video) to build this clip's proxy from.
+
+    Uses the mission manifest written by the pipeline; the path in it is relative
+    to the source root, so it is resolved against the deployment's *current*
+    source. Missions processed before manifests existed (e.g. the Palau sample)
+    fall back to rebuilding the Dropbox path from the video name.
+    """
+    cfg = source_config(_load_deployment(_current_deployment_id) or {})
+    mission_id = _owning_mission_id(video_name) or "__none__"
+    manifest = load_manifest(_deployment_dir(_current_deployment_id) / mission_id / f"{mission_id}_manifest.json")
+    entry = manifest.get(video_name)
+    if cfg["type"] == "dropbox":
+        source = DropboxSource(cfg["root"], dbx=get_dbx())
+    else:
+        source = make_source(cfg)
+    if entry:
+        return source, Video(entry["filename"], entry["path"])
+    if cfg["type"] != "dropbox":
+        raise FileNotFoundError(f"{video_name} is not in the {mission_id} manifest")
+    # plw_dscm_12_c001 → PLW_dscm_12_c001.mp4
+    parts = video_name.split("_")
+    filename = parts[0].upper() + "_" + "_".join(parts[1:]) + ".mp4"
+    return source, Video(filename, f"{_dropbox_mission_path_for(video_name)}/{filename}")
 
 
 def _generate_proxy(video_name: str):
@@ -456,34 +491,32 @@ def _generate_proxy(video_name: str):
         with _proxy_lock:
             _proxy_status[video_name] = "ready"
         return
-    # plw_dscm_12_c001 → PLW_dscm_12_c001.mp4
-    parts = video_name.split("_")
-    filename = parts[0].upper() + "_" + "_".join(parts[1:]) + ".mp4"
-    dropbox_path = f"{_dropbox_mission_path_for(video_name)}/{filename}"
-    ffmpeg_tmp = proxy_dir / f"{video_name}_proxy.tmp.mp4"
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
+    fd, ffmpeg_tmp = tempfile.mkstemp(prefix=f".{video_name}_proxy_", suffix=".mp4", dir=proxy_dir)
+    os.close(fd)
+    ffmpeg_tmp = Path(ffmpeg_tmp)
     try:
-        get_dbx().files_download_to_file(str(tmp_path), dropbox_path)
-        subprocess.run(
-            [
-                "ffmpeg", "-i", str(tmp_path),
-                "-vf", "scale=-2:480",
-                "-c:v", "libx264", "-crf", "30", "-preset", "ultrafast",
-                "-movflags", "+faststart",
-                "-y", str(ffmpeg_tmp),
-            ],
-            check=True,
-            capture_output=True,
-        )
-        ffmpeg_tmp.rename(proxy_path)
+        source, video = _proxy_source_video(video_name)
+        # Local: ffmpeg reads the source file in place. Dropbox: a temp download.
+        with source.local_copy(video) as src_path:
+            subprocess.run(
+                [
+                    "ffmpeg", "-i", str(src_path),
+                    "-vf", "scale=-2:480",
+                    "-c:v", "libx264", "-crf", "30", "-preset", "ultrafast",
+                    "-movflags", "+faststart",
+                    "-y", str(ffmpeg_tmp),
+                ],
+                check=True,
+                capture_output=True,
+            )
+        ffmpeg_tmp.replace(proxy_path)
         with _proxy_lock:
             _proxy_status[video_name] = "ready"
-    except Exception:
+    except Exception as e:
+        print(f"Proxy generation failed for {video_name}: {e}")
         with _proxy_lock:
             _proxy_status[video_name] = "error"
     finally:
-        tmp_path.unlink(missing_ok=True)
         ffmpeg_tmp.unlink(missing_ok=True)
 
 
@@ -1143,7 +1176,7 @@ def _export_detection_aggregates():
                 conf  = float(row['confidence'])
             except (ValueError, TypeError):
                 continue
-            vid = row['media_id'].removesuffix('.mp4')
+            vid = video_stem(row['media_id'])
             agg = track_aggs[vid].get(tid)
             if agg is None:
                 agg = track_aggs[vid][tid] = {
@@ -1283,14 +1316,28 @@ def api_deployments():
     result = []
     for dep_id in _list_deployments():
         dep = _load_deployment(dep_id) or {}
+        src = source_config(dep)
         n_missions = sum(1 for d in _deployment_dir(dep_id).iterdir() if d.is_dir())
         result.append({
             "deployment_id": dep_id,
-            "dropbox_root":  dep.get("dropbox_root", ""),
+            "source_type":   src["type"],
+            "source_root":   src["root"],
+            "dropbox_root":  src["root"] if src["type"] == "dropbox" else "",
             "n_missions":    n_missions,
             "is_current":    dep_id == _current_deployment_id,
         })
     return jsonify(result)
+
+
+@app.route("/api/video-sources")
+def api_video_sources():
+    """What the New-deployment form needs to explain local paths."""
+    root = local_video_root()
+    return jsonify({
+        "local_video_root":   str(root) if root else None,
+        "dropbox_configured": all(os.environ.get(k) for k in
+                                  ("DROPBOX_APP_KEY", "DROPBOX_APP_SECRET", "DROPBOX_REFRESH_TOKEN")),
+    })
 
 
 @app.route("/api/select-deployment", methods=["POST"])
@@ -1500,6 +1547,15 @@ class _LogCapture(io.TextIOBase):
 
 # ── Thread target ─────────────────────────────────────────────────────────────
 
+def _pipeline_source(source_cfg: dict, config: dict):
+    """(source, mission folder) for a run. The optional mission path overrides
+    the default <root>/<mission_id>/Video — relative to the deployment root
+    (or an absolute Dropbox path)."""
+    source = make_source(source_cfg)
+    folder = (config.get("mission_path") or "").strip() or source.default_mission_folder(config["mission_id"])
+    return source, folder
+
+
 def _run_pipeline(config: dict):
     reporter    = PipelineReporter()
     orig_stdout = sys.stdout
@@ -1524,10 +1580,11 @@ def _run_pipeline(config: dict):
         mod  = importlib.util.module_from_spec(spec)
 
         deployment = _load_deployment(config["deployment_id"]) or {}
+        source, folder = _pipeline_source(source_config(deployment), config)
         overrides = {
             "MISSION_ID":      config["mission_id"],
-            "MISSION_PATH":    config.get("mission_path") or
-                               f"{deployment.get('dropbox_root', '')}/{config['mission_id']}/Video",
+            "SOURCE":          source,
+            "MISSION_PATH":    folder,
             "START_FROM":      config.get("start_from") or None,
             "SELECTED_VIDEOS": config.get("selected_videos") or None,
             "CONF_THRESHOLD":  float(config.get("conf_threshold",  0.15)),
@@ -1550,7 +1607,9 @@ def _run_pipeline(config: dict):
         mod.OUTPUT_CSV_PATH   = mission_dir / f"{config['mission_id']}_detections.csv"
         mod.OUTPUT_CROPS_DIR  = mission_dir / f"{config['mission_id']}_crops"
         mod.OUTPUT_EMBEDDINGS = mission_dir / f"{config['mission_id']}_embeddings.json"
+        mod.OUTPUT_MANIFEST   = mission_dir / f"{config['mission_id']}_manifest.json"
 
+        reporter.log(f"Video source: {source.describe(folder)}")
         reporter.log(f"Output dir: {mission_dir}")
         reporter.log("Calling main()...")
         mod.main(reporter=reporter)
@@ -1593,14 +1652,35 @@ def api_pipeline_start():
     if not deployment_id:
         return jsonify({"error": "deployment_id required"}), 400
 
-    if deployment_id not in _list_deployments():
-        dropbox_root = config.get("dropbox_root")
-        if not dropbox_root:
-            return jsonify({"error": f"New deployment {deployment_id!r} needs a dropbox_root"}), 400
+    is_new = deployment_id not in _list_deployments()
+    if is_new:
+        if not _DEPLOYMENT_ID_RE.match(deployment_id):
+            return jsonify({"error": f"Invalid deployment name {deployment_id!r} (letters, digits, _ and - only)"}), 400
+        source_cfg = {
+            "type": config.get("source_type") or "dropbox",
+            "root": (config.get("source_root") or config.get("dropbox_root") or "").strip(),
+        }
+        if source_cfg["type"] not in ("dropbox", "local"):
+            return jsonify({"error": f"Unknown source type {source_cfg['type']!r}"}), 400
+        if not source_cfg["root"]:
+            label = "folder" if source_cfg["type"] == "local" else "Dropbox root"
+            return jsonify({"error": f"New deployment {deployment_id!r} needs a {label}"}), 400
+    else:
+        source_cfg = source_config(_load_deployment(deployment_id) or {})
+
+    # Local folders are checked up front so the form can show the problem;
+    # Dropbox paths are only checked when the run lists them.
+    if source_cfg["type"] == "local":
         try:
-            _ensure_deployment(deployment_id, dropbox_root)
-        except ValueError as e:
+            source, folder = _pipeline_source(source_cfg, config)
+            if not source.root.is_dir():
+                raise FileNotFoundError(f"Folder not found: {source.root}")
+            source.check_folder(folder)
+        except (ValueError, FileNotFoundError) as e:
             return jsonify({"error": str(e)}), 400
+
+    if is_new:
+        _ensure_deployment(deployment_id, source_cfg)
 
     with _pipeline_lock:
         if _pipeline_state["running"]:

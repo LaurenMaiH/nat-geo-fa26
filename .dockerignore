@@ -9,3 +9,12 @@ misc_and_archive/
 *.pyc
 *.pyo
 .env
+scratch/
+videos/
+model_cache/
+checkpoints/
+crops*/
+overnight_crops/
+three_crop_output*/
+*.mp4
+*.pt

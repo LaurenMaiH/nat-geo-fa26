@@ -1,9 +1,39 @@
 services:
   app:
-    build: .
+    build:
+      context: .
+      args:
+        TORCH_VARIANT: cpu   # docker-compose.gpu.yml switches this to a CUDA build
     ports:
       - "5001:5000"
     env_file:
       - .env
+    environment:
+      # Python's tempfile (video downloads, 1080p re-encodes, review-player proxies)
+      # writes here instead of the container's /tmp, which lives inside Docker's own disk.
+      TMPDIR: /data/scratch
+      # Local copies of mission videos (read-only).
+      LOCAL_VIDEO_ROOT: /data/videos
+      # BioCLIP-2 weights (Hugging Face cache).
+      HF_HOME: /data/models/huggingface
+    # Every large file goes to a host folder, never into Docker's internal disk.
+    # Set SCRATCH_DIR / VIDEO_DIR / MODEL_DIR in .env (see .env.example) to put them on
+    # another drive, e.g. D:/PristineSeas/scratch. Missing folders are created automatically.
     volumes:
       - ./processed_missions:/app/processed_missions
+      - ${SCRATCH_DIR:-./scratch}:/data/scratch
+      - ${VIDEO_DIR:-./videos}:/data/videos:ro
+      - ${MODEL_DIR:-./model_cache}/huggingface:/data/models/huggingface
+      - ${MODEL_DIR:-./model_cache}/ultralytics:/root/.config/ultralytics   # YOLO-World weights
+      - ${MODEL_DIR:-./model_cache}/checkpoints:/app/checkpoints            # fine-tuned BioCLIP (best.pt)
+      # CLIP text encoder used by YOLO-World. ultralytics 8.4+ downloads it to <weights_dir>/clip,
+      # and in a fresh container weights_dir is /app/weights (fixed at import, before the pipeline
+      # changes the setting); older versions use CLIP's default ~/.cache/clip. Cover both.
+      - ${MODEL_DIR:-./model_cache}/ultralytics:/app/weights
+      - ${MODEL_DIR:-./model_cache}/clip:/root/.cache/clip
+    # Cap container logs (tqdm progress bars + pipeline output) at 3 x 10 MB.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
