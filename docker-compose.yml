@@ -1,9 +1,0 @@
-services:
-  app:
-    build: .
-    ports:
-      - "5001:5000"
-    env_file:
-      - .env
-    volumes:
-      - ./processed_missions:/app/processed_missions
