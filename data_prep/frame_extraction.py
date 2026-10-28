@@ -295,9 +295,19 @@ def _xml_el(root, name):
     return None
 
 
-def _clip_from_xml(dbx, xml_path):
-    _, resp = dbx.files_download(xml_path)
-    root = ET.fromstring(resp.content)
+def with_retries(fn, tries=5, base_wait=2):
+    """Call fn(); on a network error wait 2, 4, 8, 16 s and try again. Re-raises the last error."""
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001
+            if attempt == tries - 1:
+                raise
+            time.sleep(base_wait * 2 ** attempt)
+
+
+def _parse_xml(content):
+    root = ET.fromstring(content)
     start = parse_ts(_xml_el(root, "CreationDate").get("value"))
     frames = int(_xml_el(root, "Duration").get("value"))
     ltc = _xml_el(root, "LtcChangeTable")
@@ -305,18 +315,39 @@ def _clip_from_xml(dbx, xml_path):
     return start, frames / fps
 
 
+def _clip_from_xml(dbx, xml_path):
+    _, resp = with_retries(lambda: dbx.files_download(xml_path))
+    return _parse_xml(resp.content)
+
+
+def _xml_for(dep, video_path):
+    p = PurePosixPath(video_path)
+    return dep["xml"].get(str(p.parent), {}).get(p.stem.lower())
+
+
 def build_clip_table(dbx, dep, cache_csv, ffmpeg=None, progress=None):
     """Return clips as dicts: clip, path, start (aware UTC or None), dur (s), bytes, source.
 
     Cached as CSV. Clips with no usable start time are kept with start=None so the
     report can say how many there were.
+
+    Network safety: a clip whose XML sidecar exists but could not be downloaded (after
+    retries) gets source="error", and a table containing any "error" clip is NOT cached,
+    so the next run rebuilds it. A cached table that has a clip missing its time even
+    though an XML exists for it (written by an older version during a network drop) is
+    ignored and rebuilt.
     """
     if cache_csv.exists():
         with open(cache_csv, newline="") as f:
-            return [{"clip": r["clip"], "path": r["path"], "start": parse_ts(r["start_utc"]),
-                     "dur": float(r["dur_s"]) if r["dur_s"] else None, "bytes": int(r["bytes"] or 0),
-                     "source": r.get("source", "xml")}
-                    for r in csv.DictReader(f)]
+            cached = [{"clip": r["clip"], "path": r["path"], "start": parse_ts(r["start_utc"]),
+                       "dur": float(r["dur_s"]) if r["dur_s"] else None, "bytes": int(r["bytes"] or 0),
+                       "source": r.get("source", "xml")}
+                      for r in csv.DictReader(f)]
+        stale = [c for c in cached if c["source"] not in ("xml", "container") and _xml_for(dep, c["path"])]
+        if not stale:
+            return cached
+        print(f"  {dep['name']}: cached clip table has {len(stale)} clip(s) with an XML but no time "
+              f"(likely a past network drop) - rebuilding")
 
     def one(item):
         folder, v = item
@@ -326,27 +357,40 @@ def build_clip_table(dbx, dep, cache_csv, ffmpeg=None, progress=None):
         xml = dep["xml"].get(folder, {}).get(p.stem.lower())
         if xml:
             try:
-                start, dur = _clip_from_xml(dbx, xml)
+                _, resp = with_retries(lambda: dbx.files_download(xml))
+            except Exception as ex:  # noqa: BLE001
+                # network failure: don't fall back to the container clock, mark it so it isn't cached
+                print(f"  ! could not download {PurePosixPath(xml).name} after retries: {ex}")
+                return {"clip": p.stem, "path": v["path"], "start": None, "dur": None,
+                        "bytes": v["bytes"], "source": "error"}
+            try:
+                start, dur = _parse_xml(resp.content)
                 source = "xml"
             except Exception as ex:  # noqa: BLE001
                 print(f"  ! bad XML {PurePosixPath(xml).name}: {ex}")
         if start is None and ffmpeg and p.suffix.lower() in {".mp4", ".mov", ".m4v"}:
             try:
-                start, dur = probe(ffmpeg, dbx.files_get_temporary_link(v["path"]).link)
+                link = with_retries(lambda: dbx.files_get_temporary_link(v["path"]).link)
+                start, dur = probe(ffmpeg, link)
                 source = "container" if start else "none"
             except Exception:  # noqa: BLE001
-                pass
+                source = "error"
         return {"clip": p.stem, "path": v["path"], "start": start, "dur": dur,
                 "bytes": v["bytes"], "source": source}
 
     from concurrent.futures import ThreadPoolExecutor
 
     vids = [(folder, v) for folder, vs in dep["videos"].items() for v in vs]
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:  # 4, not 8: gentler on weak connections
         results = pool.map(one, vids)
         clips = list(progress(results, desc=f"  clip times {dep['name']}", total=len(vids))
                      if progress else results)
     clips.sort(key=lambda c: (c["start"] is None, c["start"] or datetime.min.replace(tzinfo=timezone.utc)))
+    n_err = sum(1 for c in clips if c["source"] == "error")
+    if n_err:
+        print(f"\n  ! {dep['name']}: {n_err} clip(s) could not be read because of network errors. "
+              f"NOT caching this table - re-run the same command to retry them.")
+        return clips
     # don't cache a table that is missing times only because ffmpeg wasn't available to probe
     if not ffmpeg and any(c["source"] == "none" for c in clips):
         return clips
@@ -639,18 +683,22 @@ def main(argv=None):
                     continue
                 ok, err, nudge, bright = False, "", 0.0, None
                 if streaming:
-                    if link is None or time.time() - link_t > 3 * 3600:
-                        link = dbx.files_get_temporary_link(path).link
-                        link_t = time.time()
-                    ok, err, nudge, bright = extract_lit(ffmpeg, link, j["off"], j["clip"]["dur"], p,
-                                                         args.max_width, dark)
+                    for attempt in range(3):  # retry blips with a fresh link before a full download
+                        if link is None or attempt > 0 or time.time() - link_t > 3 * 3600:
+                            link = with_retries(lambda: dbx.files_get_temporary_link(path).link)
+                            link_t = time.time()
+                        ok, err, nudge, bright = extract_lit(ffmpeg, link, j["off"], j["clip"]["dur"], p,
+                                                             args.max_width, dark)
+                        if ok:
+                            break
+                        time.sleep(5 * (attempt + 1))
                     if not ok:
                         streaming = False
                         print(f"\n  streaming failed for {j['clip']['clip']} ({err}); downloading the clip instead")
                 if not ok:
                     if local is None:
                         local = Path(tmp) / PurePosixPath(path).name
-                        dbx.files_download_to_file(str(local), path)
+                        with_retries(lambda: dbx.files_download_to_file(str(local), path))
                     ok, err, nudge, bright = extract_lit(ffmpeg, str(local), j["off"], j["clip"]["dur"], p,
                                                          args.max_width, dark)
                 status = "failed: " + err if not ok else "ok_dark" if bright is not None and bright < dark else "ok"
