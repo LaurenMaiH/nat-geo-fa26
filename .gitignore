@@ -244,3 +244,8 @@ processed_missions/**/*_embeddings.json
 /scratch/
 /videos/
 /model_cache/
+
+
+data_prep/sheets/
+data_prep/output/
+data_prep/cache/
