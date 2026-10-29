@@ -42,3 +42,29 @@ def test_completion_records():
     assert has_completion_records(manifest)
     assert not has_completion_records({"a": {"filename": "a.mp4", "path": "x/a.mp4"}})
     assert not has_completion_records({})
+
+
+def test_replace_file_retries_while_target_is_locked(tmp_path, monkeypatch):
+    import os
+    import video_sources
+    src, dst = tmp_path / "new.tmp", tmp_path / "manifest.json"
+    src.write_text("new")
+    dst.write_text("old")
+    real_replace, calls = os.replace, []
+
+    def flaky(a, b):
+        calls.append(a)
+        if len(calls) < 3:
+            raise PermissionError(5, "Access is denied")   # OneDrive / antivirus holding the file
+        real_replace(a, b)
+
+    monkeypatch.setattr(video_sources.os, "replace", flaky)
+    monkeypatch.setattr(video_sources.time, "sleep", lambda s: None)
+    video_sources.replace_file(src, dst)
+    assert dst.read_text() == "new" and len(calls) == 3
+
+    calls.clear()
+    monkeypatch.setattr(video_sources.os, "replace", lambda a, b: (_ for _ in ()).throw(PermissionError(5, "denied")))
+    src.write_text("again")
+    with pytest.raises(PermissionError):
+        video_sources.replace_file(src, dst, attempts=3)

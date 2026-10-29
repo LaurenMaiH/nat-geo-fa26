@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -244,6 +245,19 @@ def load_manifest(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
+def replace_file(src, dst, attempts=10):
+    """os.replace, retried briefly: on Windows it fails with "Access is denied" while
+    another process (OneDrive, antivirus, the search indexer) has `dst` open."""
+    for attempt in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.2 * (attempt + 1))   # up to ~9 s in total
+
+
 def write_json_atomic(path: Path, data, indent=None):
     """Temp file in the same folder, then rename over the target, so a crash
     mid-write never leaves a truncated file."""
@@ -252,7 +266,7 @@ def write_json_atomic(path: Path, data, indent=None):
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=indent)
-        os.replace(tmp, path)
+        replace_file(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise

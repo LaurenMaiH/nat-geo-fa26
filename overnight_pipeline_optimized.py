@@ -21,14 +21,21 @@ import re
 import sys
 import csv
 import json
+import time
 import shutil
+import platform
 import tempfile
 import subprocess
 import threading
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from collections import Counter, defaultdict
+
+# Apple Silicon (mps): run ops Metal doesn't implement on the CPU instead of failing.
+# Read by PyTorch, so it must be set before torch is imported.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import cv2
 import numpy as np
@@ -43,7 +50,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).parent / "application"))
 from video_sources import (
     DropboxSource, check_stem_collisions, has_completion_records, is_complete,
-    load_manifest, manifest_entry, video_stem, write_json_atomic, write_manifest,
+    load_manifest, manifest_entry, replace_file, video_stem, write_json_atomic, write_manifest,
 )
 
 load_dotenv()
@@ -89,8 +96,41 @@ CUSTOM_VOCABULARY = [
 ]
 
 YOLO_CACHE_DIR   = Path.home() / ".config" / "ultralytics"
-INFERENCE_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# None = the INFERENCE_DEVICE environment variable (cpu | cuda | mps) if set, else the
+# best available: cuda > mps > cpu. Resolved when main() runs.
+INFERENCE_DEVICE = None
 CROP_LABELS      = ["early", "mid", "late"]
+DEFAULT_YOLO_WEIGHTS = "yolov8x-worldv2.pt"
+
+
+@dataclass
+class SpeedOptions:
+    """Speed/accuracy knobs, passed to main(options=...). The defaults are the
+    pipeline's normal behavior; benchmark.py varies them."""
+    detect_every: int = 1            # run YOLO-World + ByteTrack on every Nth frame (motion gate still applies)
+    yolo_weights: str = DEFAULT_YOLO_WEIGHTS   # e.g. yolov8l-worldv2.pt / yolov8m-worldv2.pt (Ultralytics downloads these by name)
+    imgsz: int | None = None         # YOLO inference size; None = the checkpoint's own (640 for yolov8x-worldv2)
+    crop_from_original: bool = False # cut crops from the original-resolution video instead of the resized copy
+
+
+def resolve_device(requested=None) -> str:
+    """The device to run on: `requested` or the INFERENCE_DEVICE env var if either is
+    set (error if it isn't available), else cuda > mps > cpu."""
+    req = (requested or os.environ.get("INFERENCE_DEVICE") or "").strip().lower()
+    mps_ok = getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available()
+    if req:
+        if req not in ("cpu", "cuda", "mps"):
+            raise ValueError(f"INFERENCE_DEVICE={req!r} isn't recognised: use cpu, cuda or mps")
+        if req == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("INFERENCE_DEVICE=cuda, but PyTorch can't see a CUDA GPU (no NVIDIA "
+                               "GPU or driver, or a CPU-only PyTorch build)")
+        if req == "mps" and not mps_ok:
+            raise RuntimeError("INFERENCE_DEVICE=mps, but Apple's Metal (MPS) backend isn't available "
+                               "(it only exists on Apple Silicon Macs, running natively, not in Docker)")
+        return req
+    if torch.cuda.is_available():
+        return "cuda"
+    return "mps" if mps_ok else "cpu"
 
 # ── OUTPUT PATHS ──────────────────────────────────────────────────────────────
 def output_paths() -> SimpleNamespace:
@@ -104,24 +144,41 @@ def output_paths() -> SimpleNamespace:
         crops      = mission_dir / f"{MISSION_ID}_crops",
         embeddings = mission_dir / f"{MISSION_ID}_embeddings.json",
         manifest   = mission_dir / f"{MISSION_ID}_manifest.json",
+        run_log    = mission_dir / f"{MISSION_ID}_run_log.json",
     )
 
 
 # ── MODEL SETUP ───────────────────────────────────────────────────────────────
-_model_cache: dict = {}
+_model_cache: dict = {}   # yolo weights name → (model, tracker config)
+_downloads: list = []     # weight downloads made this run (for the run log's setup costs)
 
 
-def load_model_and_config():
-    if "model" in _model_cache:
-        return _model_cache["model"], _model_cache["tracker"]
+def _record_download(what: str, path: Path, started: float):
+    if path.exists():
+        _downloads.append({"file": what, "seconds": round(time.perf_counter() - started, 1),
+                           "bytes": path.stat().st_size})
+
+
+def load_model_and_config(weights: str = DEFAULT_YOLO_WEIGHTS):
+    if weights in _model_cache:
+        return _model_cache[weights]
 
     YOLO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     settings.update({"weights_dir": str(YOLO_CACHE_DIR), "runs_dir": str(YOLO_CACHE_DIR / "runs")})
 
-    model_path = YOLO_CACHE_DIR / "yolov8x-worldv2.pt"
+    model_path = YOLO_CACHE_DIR / weights
     if not model_path.exists():
-        print(f"Downloading YOLO-World model to {model_path}...")
-        gdown.download(id=YOLO_WORLD_DRIVE_ID, output=str(model_path), quiet=False)
+        started = time.perf_counter()
+        if weights == DEFAULT_YOLO_WEIGHTS:
+            print(f"Downloading YOLO-World model to {model_path}...")
+            gdown.download(id=YOLO_WORLD_DRIVE_ID, output=str(model_path), quiet=False)
+        else:
+            from ultralytics.utils.downloads import attempt_download_asset
+            print(f"Downloading {weights} from the Ultralytics release assets to {model_path}...")
+            attempt_download_asset(model_path)
+            if not model_path.exists():
+                raise FileNotFoundError(f"YOLO-World weights {weights!r} could not be downloaded by name")
+        _record_download(weights, model_path, started)
 
     model = YOLOWorld(str(model_path))
     model.model.eval()
@@ -137,8 +194,7 @@ def load_model_and_config():
         with open(custom_yaml, "w") as f:
             yaml.dump(cfg, f)
 
-    _model_cache["model"]   = model
-    _model_cache["tracker"] = str(custom_yaml)
+    _model_cache[weights] = (model, str(custom_yaml))
     print(f"Model loaded. Device: {INFERENCE_DEVICE}")
     return model, str(custom_yaml)
 
@@ -228,8 +284,10 @@ def _download_checkpoint() -> bool:
     """Fetch the fine-tuned checkpoint to CHECKPOINT_PATH. False on a download failure."""
     print(f"Finetuned weights not found at {CHECKPOINT_PATH}, downloading (~3.6 GB)...")
     CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
     try:
         gdown.download(id=BIOCLIP_CHECKPOINT_DRIVE_ID, output=str(CHECKPOINT_PATH), quiet=False)
+        _record_download(CHECKPOINT_PATH.name, CHECKPOINT_PATH, started)
     except _download_errors() as dl_err:
         print(f"Finetuned checkpoint download failed ({dl_err}).")
         # gdown downloads to <name>XXXX.part and renames on success; drop the leftover
@@ -299,6 +357,90 @@ def get_embeddings_batch(embed_info, images_bgr: list[np.ndarray]) -> np.ndarray
         vecs = np.random.rand(len(images_bgr), 512).astype(np.float32)
         vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
         return vecs
+
+
+# ──────── RUN LOG (timings) ──────────────────────────────────────────────────
+# <mission>_run_log.json: {"runs": [...]}, one entry per pipeline run that processed
+# videos: machine, settings, embedding weights, one-time setup costs, and per-video
+# stage timings. Separate from the manifest; nothing else reads it.
+
+def _cpu_name() -> str:
+    try:
+        if sys.platform == "win32":
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+            return winreg.QueryValueEx(key, "ProcessorNameString")[0].strip()
+        if sys.platform == "darwin":
+            return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                  capture_output=True, text=True).stdout.strip()
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return platform.processor() or platform.machine()
+
+
+def machine_info() -> dict:
+    import psutil   # installed with ultralytics
+    gpu = None
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        gpu = {"name": props.name, "memory_gb": round(props.total_memory / 2**30, 1),
+               "cuda": torch.version.cuda}
+    elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        gpu = {"name": "Apple Silicon GPU (Metal / MPS)"}
+    return {
+        "os":            platform.platform(),
+        "cpu":           _cpu_name(),
+        "cores_physical": psutil.cpu_count(logical=False),
+        "cores_logical": psutil.cpu_count(logical=True),
+        "ram_gb":        round(psutil.virtual_memory().total / 2**30, 1),   # in Docker: what the VM allows
+        "gpu":           gpu,
+        "device":        INFERENCE_DEVICE,
+        "torch":         torch.__version__,
+        "ultralytics":   ultralytics.__version__,
+        "python":        platform.python_version(),
+    }
+
+
+def run_settings(options: "SpeedOptions", model=None) -> dict:
+    overrides = getattr(model, "overrides", None) or {}
+    return {
+        "conf_threshold": CONF_THRESHOLD, "iou_threshold": IOU_THRESHOLD,
+        "min_track_len": MIN_TRACK_LEN, "crops_per_track": CROPS_PER_TRACK, "crop_pad": CROP_PAD,
+        "apply_clahe": APPLY_CLAHE, "trim_black": TRIM_BLACK, "preresize": PRERESIZE,
+        **asdict(options),
+        "imgsz_effective": options.imgsz or overrides.get("imgsz"),
+        "device": INFERENCE_DEVICE,
+    }
+
+
+def _load_run_log(path: Path) -> dict:
+    if not path.exists():
+        return {"runs": []}
+    try:
+        log = json.loads(path.read_text())
+        if isinstance(log, dict) and isinstance(log.get("runs"), list):
+            return log
+    except ValueError:
+        pass
+    backup = path.with_name(path.name + ".unreadable")
+    replace_file(path, backup)
+    print(f"Warning: {path.name} was unreadable; moved it to {backup.name} and started a new one")
+    return {"runs": []}
+
+
+def _video_record(entry, status: str, stats: dict, stages: dict, started: float, **extra) -> dict:
+    total   = stats.get("frames_total") or 0
+    active  = stats.get("frames_motion_active")
+    return {
+        "video": entry.stem, "filename": entry.name, "status": status, **extra,
+        **stats,
+        "motion_gate_hit_rate": round(active / total, 4) if total and active is not None else None,
+        "stages_s": {k: round(v, 2) for k, v in stages.items()},
+        "total_s": round(time.perf_counter() - started, 2),
+    }
 
 
 # ──────── RESUME / COMPLETION RECORDS ─────────────────────────────────────────
@@ -375,7 +517,7 @@ def purge_video_outputs(stems: set, paths: SimpleNamespace, embeddings: dict) ->
                         continue
                     writer.writerow(row)
             if removed:
-                os.replace(tmp, paths.csv)
+                replace_file(tmp, paths.csv)
         finally:
             Path(tmp).unlink(missing_ok=True)
 
@@ -404,28 +546,52 @@ def process_video(
     crops_dir: Path,
     tmpdir: Path,
     reporter=None,
+    options: SpeedOptions = None,
+    stats: dict = None,
+    stages: dict = None,
 ) -> dict:
+    """Detect, track and crop one video. Fills `stats` (frame counts, resolutions,
+    crop sizes) and `stages` (seconds for resize / detect_track / crop) for the run log."""
+    opts   = options or SpeedOptions()
+    stats  = {} if stats is None else stats
+    stages = {} if stages is None else stages
     resized_path = None
     work_path    = video_path
 
+    src = cv2.VideoCapture(str(video_path))
+    src_w, src_h = int(src.get(cv2.CAP_PROP_FRAME_WIDTH)), int(src.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    src_fps, src_frames = src.get(cv2.CAP_PROP_FPS) or 0, int(src.get(cv2.CAP_PROP_FRAME_COUNT))
+    src.release()
+    stats.update({"source_resolution": f"{src_w}x{src_h}", "fps": round(src_fps, 3),
+                  "duration_s": round(src_frames / src_fps, 2) if src_fps else None})
+
     # ── Resize into the same tmpdir as the download (downscale only) ──
+    t0 = time.perf_counter()
     src_height = _get_video_height(video_path) if PRERESIZE else 0
-    if PRERESIZE and 0 < src_height <= PRERESIZE:
+    if not PRERESIZE:
+        stats["resize"] = "off"
+    elif 0 < src_height <= PRERESIZE:
         print(f"  Source is {src_height}p (<= {PRERESIZE}p), skipping resize.")
-    elif PRERESIZE:
+        stats["resize"] = "skipped (source already small enough)"
+    else:
         tmp = tmpdir / f"{video_path.stem}_rs{PRERESIZE}.mp4"
         if resize_video(video_path, tmp, PRERESIZE):
             work_path    = tmp
             resized_path = tmp
+            stats["resize"] = "done"
         else:
             print("  Resize failed, using original resolution.")
+            stats["resize"] = "failed"
+    stages["resize"] = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     cap = cv2.VideoCapture(str(work_path))
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open {work_path}")
 
     width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    stats["processed_resolution"] = f"{width}x{height}"
 
     first_real = 0
     if TRIM_BLACK:
@@ -471,46 +637,56 @@ def process_video(
     cap.set(cv2.CAP_PROP_POS_FRAMES, first_real)
     frame_idx       = 0
     frames_inferred = 0
+    frames_active   = 0
+    n_detections    = 0
+    track_kwargs    = {"imgsz": opts.imgsz} if opts.imgsz else {}
 
     with tqdm(total=total_frames, desc=f"  YOLO {video_name}", unit="frame", leave=True) as pbar:
         while frame_idx < total_frames:
-            ret, frame = cap.read()
-            if not ret:
-                break
+            if opts.detect_every > 1 and frame_idx % opts.detect_every:
+                # Not a detection frame: advance without decoding the image
+                if not cap.grab():
+                    break
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    break
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            diff = cv2.absdiff(gray, median_bg)
-            _, fg = cv2.threshold(diff, BG_THRESH, 255, cv2.THRESH_BINARY)
-            fg    = cv2.morphologyEx(cv2.morphologyEx(fg, cv2.MORPH_OPEN, morph_kernel),
-                                     cv2.MORPH_DILATE, morph_kernel)
-            _, _, stats, _ = cv2.connectedComponentsWithStats(fg)
-            has_activity   = any(s[cv2.CC_STAT_AREA] >= MIN_BLOB for s in stats[1:])
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                diff = cv2.absdiff(gray, median_bg)
+                _, fg = cv2.threshold(diff, BG_THRESH, 255, cv2.THRESH_BINARY)
+                fg    = cv2.morphologyEx(cv2.morphologyEx(fg, cv2.MORPH_OPEN, morph_kernel),
+                                         cv2.MORPH_DILATE, morph_kernel)
+                _, _, blob_stats, _ = cv2.connectedComponentsWithStats(fg)
+                has_activity   = any(s[cv2.CC_STAT_AREA] >= MIN_BLOB for s in blob_stats[1:])
 
-            if has_activity:
-                infer   = clahe_L_median(frame, clahe) if APPLY_CLAHE else frame
-                results = model.track(
-                    infer, persist=True, tracker=tracker_config,
-                    verbose=False, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD,
-                    device=INFERENCE_DEVICE,
-                )
-                frames_inferred += 1
+                if has_activity:
+                    frames_active += 1
+                    infer   = clahe_L_median(frame, clahe) if APPLY_CLAHE else frame
+                    results = model.track(
+                        infer, persist=True, tracker=tracker_config,
+                        verbose=False, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD,
+                        device=INFERENCE_DEVICE, **track_kwargs,
+                    )
+                    frames_inferred += 1
 
-                if results[0].boxes.id is not None:
-                    boxes     = results[0].boxes.xyxy.cpu().numpy()
-                    track_ids = results[0].boxes.id.int().cpu().tolist()
-                    class_ids = results[0].boxes.cls.int().cpu().tolist()
-                    confs     = results[0].boxes.conf.cpu().tolist()
+                    if results[0].boxes.id is not None:
+                        boxes     = results[0].boxes.xyxy.cpu().numpy()
+                        track_ids = results[0].boxes.id.int().cpu().tolist()
+                        class_ids = results[0].boxes.cls.int().cpu().tolist()
+                        confs     = results[0].boxes.conf.cpu().tolist()
 
-                    for box, tid, cid, conf in zip(boxes, track_ids, class_ids, confs):
-                        x1, y1, x2, y2 = map(int, box)
-                        cls_name        = model.names[cid]
-                        csv_writer.writerow([
-                            media_id, frame_idx, tid, cls_name,
-                            f"{x1/width:.4f}", f"{y1/height:.4f}",
-                            f"{(x2-x1)/width:.4f}", f"{(y2-y1)/height:.4f}",
-                            f"{conf:.4f}",
-                        ])
-                        track_detections[tid].append((frame_idx, conf, x1, y1, x2, y2, cls_name))
+                        for box, tid, cid, conf in zip(boxes, track_ids, class_ids, confs):
+                            x1, y1, x2, y2 = map(int, box)
+                            cls_name        = model.names[cid]
+                            csv_writer.writerow([
+                                media_id, frame_idx, tid, cls_name,
+                                f"{x1/width:.4f}", f"{y1/height:.4f}",
+                                f"{(x2-x1)/width:.4f}", f"{(y2-y1)/height:.4f}",
+                                f"{conf:.4f}",
+                            ])
+                            n_detections += 1
+                            track_detections[tid].append((frame_idx, conf, x1, y1, x2, y2, cls_name))
 
             frame_idx += 1
             pbar.update(1)
@@ -529,6 +705,14 @@ def process_video(
                    if len(dets) >= MIN_TRACK_LEN}
     print(f"  Tracks: {len(track_detections)} total, "
           f"{len(long_tracks)} kept (>= {MIN_TRACK_LEN} detections)")
+    stats.update({
+        "frames_total": total_frames, "black_frames_skipped": first_real,
+        "frames_motion_active": frames_active, "frames_inferred": frames_inferred,
+        "n_detections": n_detections, "n_tracks_raw": len(track_detections),
+        "n_tracks_kept": len(long_tracks),
+    })
+    stages["detect_track"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
 
     video_crops_dir = crops_dir / video_name
     video_crops_dir.mkdir(parents=True, exist_ok=True)
@@ -537,6 +721,7 @@ def process_video(
     if not long_tracks:
         if resized_path and resized_path.exists():
             resized_path.unlink()
+        stages["crop"] = time.perf_counter() - t0
         return track_crop_paths
 
     # ── Select best frame per segment per track ───────────────────────────────
@@ -555,7 +740,20 @@ def process_video(
             needed[fi].append((tid, x1, y1, x2, y2, cls_name, label))
 
     # ── Crop extraction with grab()-based forward seek ────────────────────────
-    cap2 = cv2.VideoCapture(str(work_path))
+    # Crops come from the video detection ran on, or (crop_from_original) from the
+    # original file with the boxes scaled back up (frame numbers must line up, so the
+    # frame counts are compared).
+    crop_source, crop_w, crop_h = work_path, width, height
+    if opts.crop_from_original and resized_path:
+        crop_source, crop_w, crop_h = video_path, src_w, src_h
+        if src_frames != total_frames + first_real:
+            stats["frame_count_mismatch"] = [src_frames, total_frames + first_real]
+            print(f"  WARNING: original has {src_frames} frames, resized copy {total_frames + first_real}; "
+                  "crops from the original may be off by a few frames")
+    sx, sy = crop_w / width, crop_h / height
+    crop_sizes = []
+
+    cap2 = cv2.VideoCapture(str(crop_source))
     current_frame = -1
     sorted_frames = sorted(needed.keys())
     n_crop_frames = len(sorted_frames)
@@ -582,9 +780,13 @@ def process_video(
             y1p = max(0, y1 - CROP_PAD)
             x2p = min(width,  x2 + CROP_PAD)
             y2p = min(height, y2 + CROP_PAD)
+            if crop_source is not work_path:
+                x1p, x2p = int(x1p * sx), min(crop_w, round(x2p * sx))
+                y1p, y2p = int(y1p * sy), min(crop_h, round(y2p * sy))
             crop = frame[y1p:y2p, x1p:x2p]
             if crop.size == 0:
                 continue
+            crop_sizes.append(crop.shape[:2])
             cls_slug = cls_name.replace(" ", "_")
             fname    = f"id{tid:04d}_{cls_slug}_f{abs_fi:05d}_{label}.jpg"
             fpath    = video_crops_dir / fname
@@ -599,12 +801,22 @@ def process_video(
     if resized_path and resized_path.exists():
         resized_path.unlink()
 
+    stats["crops_from"] = "original" if crop_source is not work_path else "processed"
+    if crop_sizes:
+        stats["n_crops"] = len(crop_sizes)
+        stats["crop_px_mean"] = [round(float(np.mean([s[1] for s in crop_sizes])), 1),   # width, height
+                                 round(float(np.mean([s[0] for s in crop_sizes])), 1)]
+    stages["crop"] = time.perf_counter() - t0
     return track_crop_paths
 
 
 # ──────── MAIN ───────────────────────────────────────────────────────────────
-def main(reporter=None):
-    print(f"Using device: {INFERENCE_DEVICE}")
+def main(reporter=None, options: SpeedOptions = None):
+    global INFERENCE_DEVICE
+    options = options or SpeedOptions()
+    chosen_by = "INFERENCE_DEVICE" if (INFERENCE_DEVICE or os.environ.get("INFERENCE_DEVICE")) else "auto-detected"
+    INFERENCE_DEVICE = resolve_device(INFERENCE_DEVICE)
+    print(f"Using device: {INFERENCE_DEVICE} ({chosen_by})")
     paths = output_paths()
 
     # List videos first so a bad path / missing credentials fails before model load
@@ -642,8 +854,14 @@ def main(reporter=None):
 
     counter = 0
     if entries:
-        model, tracker = load_model_and_config()
+        # One-time setup, timed apart from the per-video numbers (downloads separately)
+        _downloads.clear()
+        t0 = time.perf_counter()
+        model, tracker = load_model_and_config(options.yolo_weights)
+        yolo_load_s    = time.perf_counter() - t0
+        t0 = time.perf_counter()
         embed_info     = load_embedding_model()
+        embed_load_s   = time.perf_counter() - t0
         weights        = embed_info[0]
         if reporter:
             reporter.embedding_weights(weights)
@@ -660,6 +878,28 @@ def main(reporter=None):
         if purge_video_outputs({e.stem for e in entries}, paths, all_embeddings):
             write_json_atomic(paths.embeddings, all_embeddings)
 
+        downloaded = {d["file"]: d["seconds"] for d in _downloads}
+        run_log = _load_run_log(paths.run_log)
+        run = {
+            "started_at":  datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+            "mission_id":  MISSION_ID,
+            "source":      source.describe(MISSION_PATH),
+            "machine":     machine_info(),
+            "settings":    run_settings(options, model),
+            "embedding_weights": weights,
+            "setup": {
+                # load times exclude download time; the first BioCLIP-2 load also
+                # fetches its base weights from Hugging Face if they aren't cached
+                "yolo_model_load_s":      round(yolo_load_s - downloaded.get(options.yolo_weights, 0), 1),
+                "embedding_model_load_s": round(embed_load_s - downloaded.get(CHECKPOINT_PATH.name, 0), 1),
+                "downloads":              list(_downloads),
+            },
+            "videos": [],
+        }
+        run_log["runs"].append(run)
+        write_json_atomic(paths.run_log, run_log, indent=1)
+
         total = len(entries)
         with tempfile.TemporaryDirectory(prefix="natgeo_") as tmpdir:
             tmpdir = Path(tmpdir)
@@ -675,6 +915,8 @@ def main(reporter=None):
                     reporter.begin_video(video_name, idx + 1, total)
 
                 print(f"\n{'='*60}")
+                video_started = time.perf_counter()
+                stats, stages = {}, {}
                 try:
                     manifest[video_name] = {**manifest_entry(source, entry), "status": "in_progress"}
                     write_manifest(paths.manifest, manifest)
@@ -686,7 +928,9 @@ def main(reporter=None):
                     else:
                         print(f"Reading: {entry.rel_path}")
 
+                    t0 = time.perf_counter()
                     with source.local_copy(entry) as local_path:
+                        stages["open"] = time.perf_counter() - t0   # the download, for Dropbox
                         if reporter:
                             reporter.stage("detecting")
                         track_crops = process_video(
@@ -694,9 +938,11 @@ def main(reporter=None):
                             paths.csv, paths.crops,
                             tmpdir=tmpdir,
                             reporter=reporter,
+                            options=options, stats=stats, stages=stages,
                         )
 
                     # ── Batch embedding per track ─────────────────────────────
+                    t0 = time.perf_counter()
                     total_crops = sum(len(v) for v in track_crops.values())
                     print(f"  Embedding {total_crops} crops across {len(track_crops)} tracks...")
                     if reporter:
@@ -719,6 +965,7 @@ def main(reporter=None):
                             reporter.set_video_pct(2/3 + (emb_i + 1) / n_emb_tracks * (1/3))
 
                     write_json_atomic(paths.embeddings, all_embeddings)
+                    stages["embed"] = time.perf_counter() - t0
 
                     manifest[video_name].update({
                         "status":      "complete",
@@ -727,6 +974,10 @@ def main(reporter=None):
                         "weights":     weights,
                     })
                     write_manifest(paths.manifest, manifest)
+
+                    run["videos"].append(_video_record(entry, "complete", stats, stages, video_started,
+                                                       n_tracks=n_embedded))
+                    write_json_atomic(paths.run_log, run_log, indent=1)
 
                     counter += 1
                     print(f"✓  {entry.name}  ({n_embedded} tracks, "
@@ -744,13 +995,21 @@ def main(reporter=None):
                         write_manifest(paths.manifest, manifest)
                         if purge_video_outputs({video_name}, paths, all_embeddings):
                             write_json_atomic(paths.embeddings, all_embeddings)
+                        run["videos"].append(_video_record(entry, "failed", stats, stages, video_started,
+                                                           error=str(e)))
+                        write_json_atomic(paths.run_log, run_log, indent=1)
                     except Exception as cleanup_err:
                         print(f"  (could not clean up after the failure: {cleanup_err})")
+
+        run["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        write_json_atomic(paths.run_log, run_log, indent=1)
 
     print(f"\nDone! Processed {counter} videos this session.")
     print(f"  Detections CSV : {paths.csv}")
     print(f"  Crops folder   : {paths.crops}/")
     print(f"  Embeddings JSON: {paths.embeddings}  ({len(all_embeddings)} entries)")
+    if entries:
+        print(f"  Run log        : {paths.run_log}")
     if reporter:
         reporter.pipeline_done(counter, len(all_embeddings))
 

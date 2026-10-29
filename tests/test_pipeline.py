@@ -1,3 +1,4 @@
+import csv
 import importlib.util
 import json
 import os
@@ -135,7 +136,7 @@ def fake_run(pipeline, tmp_path, monkeypatch):
     pipeline.MISSION_PATH = "."
     pipeline.START_FROM   = None
     pipeline.SELECTED_VIDEOS = None
-    monkeypatch.setattr(pipeline, "load_model_and_config", lambda: (None, None))
+    monkeypatch.setattr(pipeline, "load_model_and_config", lambda *a, **k: (None, None))
     monkeypatch.setattr(pipeline, "load_embedding_model", lambda: ("finetuned", None, None))
     monkeypatch.setattr(pipeline, "get_embeddings_batch",
                         lambda info, imgs: np.ones((len(imgs), 4), dtype=np.float32))
@@ -301,3 +302,140 @@ def test_yolo_world_downloaded_by_file_id(pipeline, tmp_path, monkeypatch):
     pipeline.load_model_and_config()
     assert calls == [((), {"id": "1hh576zOzpUqgWSjIdSkR4EwgYQ8kH406",
                            "output": str(tmp_path / "ultralytics" / "yolov8x-worldv2.pt"), "quiet": False})]
+
+
+# ── Device selection ──────────────────────────────────────────────────────────
+
+def test_resolve_device(pipeline, monkeypatch):
+    monkeypatch.delenv("INFERENCE_DEVICE", raising=False)
+    monkeypatch.setattr(pipeline.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(pipeline.torch.backends.mps, "is_available", lambda: False)
+    assert pipeline.resolve_device() == "cpu"
+    monkeypatch.setattr(pipeline.torch.backends.mps, "is_available", lambda: True)
+    assert pipeline.resolve_device() == "mps"
+    monkeypatch.setattr(pipeline.torch.cuda, "is_available", lambda: True)
+    assert pipeline.resolve_device() == "cuda"
+    monkeypatch.setenv("INFERENCE_DEVICE", " CPU ")
+    assert pipeline.resolve_device() == "cpu"
+    assert pipeline.resolve_device("mps") == "mps"        # an explicit setting beats the env var
+    monkeypatch.setenv("INFERENCE_DEVICE", "gpu")
+    with pytest.raises(ValueError, match="cpu, cuda or mps"):
+        pipeline.resolve_device()
+    monkeypatch.setattr(pipeline.torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA"):
+        pipeline.resolve_device("cuda")
+
+
+# ── Run log ───────────────────────────────────────────────────────────────────
+
+def test_run_log_records_runs_separately_from_manifest(pipeline, fake_run):
+    pipeline.main()
+    log = json.loads(fake_run.paths.run_log.read_text())
+    (run,) = log["runs"]
+    assert run["embedding_weights"] == "finetuned"
+    assert run["machine"]["device"] == pipeline.INFERENCE_DEVICE and run["machine"]["torch"]
+    assert {"cpu", "cores_logical", "ram_gb", "gpu"} <= set(run["machine"])
+    assert run["settings"]["detect_every"] == 1 and run["settings"]["yolo_weights"] == "yolov8x-worldv2.pt"
+    assert set(run["setup"]) == {"yolo_model_load_s", "embedding_model_load_s", "downloads"}
+    assert [v["filename"] for v in run["videos"]] == ["empty.mp4", "fish.MP4", "zz_empty.mov"]
+    assert all({"open", "embed"} <= set(v["stages_s"]) and v["status"] == "complete" for v in run["videos"])
+    assert run["finished_at"]
+    assert "run_log" not in fake_run.paths.manifest.read_text()
+
+    pipeline.main()                     # nothing left to do: no new run entry
+    assert len(json.loads(fake_run.paths.run_log.read_text())["runs"]) == 1
+
+
+# ── process_video options (real video, fake detector) ─────────────────────────
+
+class _FakeDetector:
+    """Stands in for YOLO-World: one 'fish' box around the bright square."""
+    names = {0: "fish"}
+
+    def __init__(self):
+        self.calls = []
+
+    def track(self, frame, **kwargs):
+        import torch
+        self.calls.append(kwargs)
+        ys, xs = np.where(frame[:, :, 0] > 200)
+        if not len(xs):
+            return [SimpleNamespace(boxes=SimpleNamespace(id=None))]
+        box = torch.tensor([[xs.min(), ys.min(), xs.max() + 1, ys.max() + 1]], dtype=torch.float32)
+        return [SimpleNamespace(boxes=SimpleNamespace(
+            xyxy=box, id=torch.tensor([1]), cls=torch.tensor([0]), conf=torch.tensor([0.9])))]
+
+
+def _moving_square_video(path, w=320, h=240, n=24):
+    out = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 12, (w, h))
+    for i in range(n):
+        frame = np.full((h, w, 3), 100, dtype=np.uint8)
+        x = 10 + i * 10
+        frame[100:140, x:x + 40] = 255
+        out.write(frame)
+    out.release()
+    return path
+
+
+def _run_process_video(pipeline, tmp_path, **opts):
+    video = _moving_square_video(tmp_path / "sq.mp4")
+    model = _FakeDetector()
+    stats, stages = {}, {}
+    work = tmp_path / "work"
+    work.mkdir(exist_ok=True)
+    pipeline.INFERENCE_DEVICE = "cpu"
+    crops = pipeline.process_video(
+        video, "sq.mp4", "sq", model, "tracker.yaml", tmp_path / "det.csv", tmp_path / "crops",
+        tmpdir=work, options=pipeline.SpeedOptions(**opts), stats=stats, stages=stages)
+    with open(tmp_path / "det.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    return model, stats, stages, crops, rows
+
+
+def test_process_video_defaults_record_stats(pipeline, tmp_path):
+    model, stats, stages, crops, rows = _run_process_video(pipeline, tmp_path)
+    assert stats["frames_total"] == 24 and stats["frames_inferred"] == stats["frames_motion_active"] > 0
+    assert stats["source_resolution"] == stats["processed_resolution"] == "320x240"
+    assert stats["resize"].startswith("skipped") and stats["duration_s"] == 2.0
+    assert stats["n_detections"] == len(rows) and stats["n_tracks_kept"] == 1
+    assert set(stages) == {"resize", "detect_track", "crop"}
+    assert all("imgsz" not in c for c in model.calls)          # default: the checkpoint's own size
+    assert stats["crops_from"] == "processed" and len(crops[1]) == 3
+
+
+def test_detect_every_and_imgsz(pipeline, tmp_path):
+    model, stats, _, _, rows = _run_process_video(pipeline, tmp_path, detect_every=3, imgsz=960)
+    assert {int(r["frame"]) % 3 for r in rows} == {0}
+    assert stats["frames_inferred"] <= 8 and stats["frames_total"] == 24
+    assert all(c["imgsz"] == 960 for c in model.calls)
+
+
+def test_crops_from_original_resolution(pipeline, tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "PRERESIZE", 120)            # 240p source → 160x120 working copy
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    _, base_stats, _, _, base_rows = _run_process_video(pipeline, tmp_path / "a")
+    _, orig_stats, _, _, orig_rows = _run_process_video(pipeline, tmp_path / "b", crop_from_original=True)
+    assert base_stats["processed_resolution"] == "160x120" and base_stats["resize"] == "done"
+    assert [r["frame"] for r in orig_rows] == [r["frame"] for r in base_rows]   # same detections
+    assert base_stats["crops_from"] == "processed" and orig_stats["crops_from"] == "original"
+    bw, bh = base_stats["crop_px_mean"]
+    ow, oh = orig_stats["crop_px_mean"]
+    assert 1.8 < ow / bw < 2.2 and 1.8 < oh / bh < 2.2
+    assert "frame_count_mismatch" not in orig_stats
+
+
+# ── benchmark.py matching ─────────────────────────────────────────────────────
+
+def test_benchmark_track_matching():
+    import benchmark
+    assert benchmark.iou((0, 0, 0.5, 0.5), (0, 0, 0.5, 0.5)) == 1.0
+    assert benchmark.iou((0, 0, 0.1, 0.1), (0.5, 0.5, 0.1, 0.1)) == 0.0
+    base = {("v", "1"): {0: (0.1, 0.1, 0.2, 0.2), 1: (0.12, 0.1, 0.2, 0.2)},
+            ("v", "2"): {5: (0.6, 0.6, 0.2, 0.2)},
+            ("w", "1"): {0: (0.1, 0.1, 0.2, 0.2)}}
+    variant = {("v", "7"): {1: (0.13, 0.1, 0.2, 0.2)},           # overlaps v/1 on a shared frame
+               ("v", "8"): {6: (0.6, 0.6, 0.2, 0.2)},            # right place, but no shared frame
+               ("x", "1"): {0: (0.1, 0.1, 0.2, 0.2)}}            # other video
+    assert benchmark.match_fraction(base, variant) == (1, 3)
+    assert benchmark.match_fraction(variant, base) == (1, 3)
