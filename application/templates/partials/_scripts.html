@@ -88,7 +88,7 @@
                     </span>
                     <span className="truncate text-[13px] font-medium" style={{color: isSel ? 'var(--text-primary)' : 'var(--text-secondary)'}}>{v.name}</span>
                   </div>
-                  <div className="ml-[19px] font-mono text-[11px]" style={{color: 'var(--text-faint)'}}>{v.track_count} tracks</div>
+                  <div className="ml-[19px] font-mono text-[11px]" style={{color: 'var(--text-faint)'}}>{v.no_detections ? 'No detections' : `${v.track_count} tracks`}</div>
                 </button>
               );
             })}
@@ -1323,7 +1323,7 @@
               </label>
               <select style={inputStyle} value={seedVideo} onChange={e => setSeed(e.target.value)}>
                 <option value="">Select seed video...</option>
-                {videos.map(v => <option key={v.name} value={v.name}>{v.name} ({v.track_count} tracks)</option>)}
+                {videos.map(v => <option key={v.name} value={v.name} disabled={v.no_detections}>{v.name} ({v.no_detections ? 'no detections' : `${v.track_count} tracks`})</option>)}
               </select>
             </div>
 
@@ -1703,6 +1703,16 @@
               )}
             </div>
 
+            {/* Embedding weights warning (anything but the fine-tuned checkpoint) */}
+            {status?.embedding_weights && status.embedding_weights !== 'finetuned' && (
+              <div className="px-6 py-2.5 flex-shrink-0 border-b text-[12px]"
+                   style={{backgroundColor: 'var(--error-bg)', borderColor: 'var(--error-border)', color: 'var(--error)', lineHeight: 1.5}}>
+                {status.embedding_weights === 'placeholder'
+                  ? '⚠ No embedding model could be loaded, so the run was stopped instead of using random placeholder embeddings. See the log for the cause.'
+                  : '⚠ This run uses pretrained BioCLIP-2 weights, not the fine-tuned checkpoint (best.pt), so embeddings and clusters will differ from the expected results. See the log for why the checkpoint wasn\'t used.'}
+              </div>
+            )}
+
             {/* Current video progress */}
             {status?.current_video && (
               <div className="px-6 py-3 flex-shrink-0 border-b" style={{backgroundColor: C.bg, borderColor: C.border}}>
@@ -2027,6 +2037,7 @@
         setLoading(true);
         try {
           const state = await post('/api/initialize', params);
+          if (state.error) { window.alert(state.error); return; }
           setAppState(state);
           setVideos(await get('/api/videos'));
           setVideo(params.seed_video);
@@ -2213,6 +2224,7 @@
 
       const clusters = Object.values(appState?.clusters || {});
       const videoStatus = appState?.videos?.[video]?.status;
+      const noDetections = !!videos.find(v => v.name === video)?.no_detections;
       const canProcess = appState?.initialized && video && videoStatus === 'pending';
       const trackColorMap = {};
       const trackToCluster = {};
@@ -2313,6 +2325,11 @@
                     {videoStatus}
                   </span>
                 )}
+                {noDetections && (
+                  <span className="font-mono text-[11px] px-2 py-0.5 rounded-full" style={{backgroundColor: 'var(--bg-surface-3)', color: 'var(--text-secondary)', border: '1px solid var(--border-subtle)'}}>
+                    No detections
+                  </span>
+                )}
                 <span className="ml-auto font-mono text-[11px]" style={{color: 'var(--text-faint)'}}>{tracks.length} tracks</span>
                 <button
                   onClick={() => window.location.href = '/api/export/tracks.csv'}
@@ -2379,7 +2396,11 @@
                     </div>
                   : tracks.length === 0
                   ? <div className="flex items-center justify-center h-full">
-                      <span className="text-sm" style={{color: 'var(--text-faint)'}}>No tracks for this video</span>
+                      <span className="text-sm" style={{color: 'var(--text-faint)'}}>
+                        {noDetections
+                          ? 'No detections in this clip. Approve it to record MaxN = 0.'
+                          : 'No tracks for this video'}
+                      </span>
                     </div>
                   : (() => {
                       const real = clusters.filter(c => c.id !== 'noise').sort((a, b) => a.id.localeCompare(b.id));
