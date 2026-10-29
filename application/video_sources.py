@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import tempfile
+from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -46,6 +47,28 @@ class Video:
     @property
     def stem(self) -> str:
         return video_stem(self.name)
+
+
+def stem_collisions(videos) -> list[list[str]]:
+    """Filenames that share a stem, e.g. [["a.MOV", "a.mp4"]]. Outputs are keyed by
+    stem, so these would overwrite each other. Compared case-insensitively because
+    crops folders may live on a case-insensitive drive (Windows/macOS)."""
+    groups = defaultdict(list)
+    for v in videos:
+        groups[v.stem.casefold()].append(v.name)
+    return [sorted(names) for _, names in sorted(groups.items()) if len(names) > 1]
+
+
+def check_stem_collisions(videos):
+    """Raise ValueError naming the files if any two videos share a stem."""
+    collisions = stem_collisions(videos)
+    if collisions:
+        raise ValueError(
+            "Videos with the same name but a different extension can't be processed in one "
+            "mission (their detections, crops and embeddings would overwrite each other): "
+            + "; ".join(" and ".join(group) for group in collisions)
+            + ". Rename or move one file of each pair, then start again."
+        )
 
 
 # ── Deployment config ─────────────────────────────────────────────────────────
@@ -209,7 +232,11 @@ class DropboxSource:
 
 # ── Manifest ──────────────────────────────────────────────────────────────────
 # processed_missions/<deployment>/<mission>/<mission>_manifest.json
-#   {video_stem: {"source": "local"|"dropbox", "path": <rel to source root>, "filename": ...}}
+#   {video_stem: {"source": "local"|"dropbox", "path": <rel to source root>, "filename": ...,
+#                 "status": "in_progress"|"complete"|"failed", ...}}
+# A "complete" entry is the pipeline's completion record for that video:
+#   "n_tracks" (0 = processed, no animals), "finished_at", "weights" (embedding weights used).
+# Entries written before completion records existed have no "status".
 
 def load_manifest(path: Path) -> dict:
     if not path.exists():
@@ -217,18 +244,37 @@ def load_manifest(path: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def write_manifest(path: Path, manifest: dict):
-    """Atomic write: temp file in the same folder, then rename over the target."""
+def write_json_atomic(path: Path, data, indent=None):
+    """Temp file in the same folder, then rename over the target, so a crash
+    mid-write never leaves a truncated file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(manifest, f, indent=2)
+            json.dump(data, f, indent=indent)
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
 
 
+def write_manifest(path: Path, manifest: dict):
+    write_json_atomic(path, manifest, indent=2)
+
+
 def manifest_entry(source, video: Video) -> dict:
     return {"source": source.type, "path": video.rel_path, "filename": video.name}
+
+
+def is_complete(entry) -> bool:
+    return isinstance(entry, dict) and entry.get("status") == "complete"
+
+
+def has_completion_records(manifest: dict) -> bool:
+    """False for manifests written before completion records existed."""
+    return any(isinstance(e, dict) and "status" in e for e in manifest.values())
+
+
+def completed_videos(manifest: dict) -> dict[str, int]:
+    """{video_stem: n_tracks} for every video the pipeline finished."""
+    return {stem: int(e.get("n_tracks") or 0) for stem, e in manifest.items() if is_complete(e)}

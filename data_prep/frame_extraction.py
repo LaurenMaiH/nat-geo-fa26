@@ -113,7 +113,28 @@ def year_shift(dt, years):
 
 
 # ── spreadsheet ───────────────────────────────────────────────────────────────
+KNOWN_COLS = ["deployment", "observationTimestamp", "cameraSeafloorArrival", "tentativeId"] + LINEAGE_COLS
+
+
+def _normalise_headers(rows):
+    """Rename columns to the spelling the script uses, ignoring case, so older sheets with
+    'Deployment' / 'ObservationTimestamp' / 'AphiaID' headers work the same as newer ones."""
+    if not rows:
+        return rows
+    canon_map = {c.lower(): c for c in KNOWN_COLS}
+    rename = {h: canon_map[h.strip().lower()] for h in rows[0]
+              if h and h.strip().lower() in canon_map and h != canon_map[h.strip().lower()]}
+    if not rename:
+        return rows
+    print(f"Renamed sheet columns: {', '.join(f'{a} -> {b}' for a, b in rename.items())}")
+    return [{rename.get(k, k): v for k, v in r.items()} for r in rows]
+
+
 def read_sheet(path):
+    return _normalise_headers(_read_sheet_raw(path))
+
+
+def _read_sheet_raw(path):
     path = Path(path)
     if path.suffix.lower() in (".xlsx", ".xlsm"):
         try:

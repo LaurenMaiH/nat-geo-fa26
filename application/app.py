@@ -5,6 +5,8 @@ import csv
 import json
 import os
 import re
+import shutil
+import time
 import numpy as np
 import hdbscan as hdbscan_lib
 import threading
@@ -14,8 +16,8 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 from video_sources import (
-    DropboxSource, Video, connect_dropbox, load_manifest, local_video_root,
-    make_source, source_config, video_stem,
+    DropboxSource, Video, check_stem_collisions, completed_videos, connect_dropbox,
+    load_manifest, local_video_root, make_source, source_config, video_stem,
 )
 
 app = Flask(__name__)
@@ -23,7 +25,40 @@ app = Flask(__name__)
 BASE_DIR = Path(__file__).parent.parent  # nat-geo/ (clustering-ui lives inside nat-geo/)
 load_dotenv(BASE_DIR / ".env")
 
-_DEPLOYMENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# Deployment and mission ids become folder names under processed_missions/
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _is_safe_name(name) -> bool:
+    """A single file/folder name from the client (a video name): no path separators,
+    '..', drive colons or NULs, so it can't point outside the folder it's joined to."""
+    return (isinstance(name, str) and bool(name) and ".." not in name
+            and not any(c in name for c in "/\\:\0"))
+
+
+def _is_inside(path: Path, base: Path) -> bool:
+    return path.resolve().is_relative_to(base.resolve())
+
+
+def _split_track_key(key):
+    """'<video>__<track_id>' → (video, track_id), or None if it isn't a safe track key."""
+    if not isinstance(key, str):
+        return None
+    video, sep, track_id = key.rpartition("__")
+    if not sep or not _is_safe_name(video) or not _ID_RE.match(track_id):
+        return None
+    return video, track_id
+
+
+@app.before_request
+def _reject_unsafe_path_args():
+    """URL parts that end up in file paths (/api/video/<video_name>/..., /api/crop/<video>/<track_id>)."""
+    args = request.view_args or {}
+    for key in ("video_name", "video"):
+        if key in args and not _is_safe_name(args[key]):
+            return jsonify({"error": f"Invalid video name {args[key]!r}"}), 400
+    if "track_id" in args and not _ID_RE.match(args["track_id"]):
+        return jsonify({"error": f"Invalid track id {args['track_id']!r}"}), 400
 
 
 # ── Deployments ────────────────────────────────────────────────────────────────
@@ -63,7 +98,7 @@ def _load_deployment(deployment_id):
 def _ensure_deployment(deployment_id: str, source: dict):
     """Create (or verify) a deployment folder + config. Called the first time
     the pipeline targets a given deployment. `source` is {"type", "root"}."""
-    if not _DEPLOYMENT_ID_RE.match(deployment_id or ""):
+    if not _ID_RE.match(deployment_id or ""):
         raise ValueError(f"Invalid deployment id: {deployment_id!r}")
     d = _deployment_dir(deployment_id)
     d.mkdir(parents=True, exist_ok=True)
@@ -109,8 +144,35 @@ def _review_paths(mission_id=None):
 
 
 _dbx_instance = None  # only created when a Dropbox deployment needs it
-_proxy_status: dict[str, str] = {}  # video_name → "generating" | "ready" | "error"
+_proxy_status: dict[str, str] = {}  # str(proxy path) → "generating" | "ready" | "error"
 _proxy_lock = threading.Lock()
+
+
+def _iter_detection_rows(csv_file):
+    """Parsed rows of a detections CSV. Malformed rows (e.g. a sentinel row or a
+    half-written last line left by a crashed run) are skipped with one warning."""
+    bad = 0
+    with open(csv_file, newline='') as f:
+        for row in csv.DictReader(f):
+            try:
+                parsed = {
+                    'video':    video_stem(row['media_id']),
+                    'frame':    int(row['frame']),
+                    'track_id': int(row['track_id']),
+                    'class':    row['class'] or '',
+                    'x':        float(row['x']),
+                    'y':        float(row['y']),
+                    'w':        float(row['width']),
+                    'h':        float(row['height']),
+                    'conf':     float(row['confidence']),
+                }
+            except (KeyError, TypeError, ValueError, AttributeError):
+                bad += 1
+                continue
+            yield parsed
+    if bad:
+        print(f"Warning: skipped {bad} unreadable row(s) in {csv_file}")
+
 
 def _load_deployment_detections(deployment_id):
     """Load detections CSVs from every mission under the given deployment."""
@@ -126,19 +188,16 @@ def _load_deployment_detections(deployment_id):
         csv_file = next(mission_dir.glob("*_detections.csv"), None)
         if not csv_file or not csv_file.exists():
             continue
-        with open(csv_file, newline='') as f:
-            for row in csv.DictReader(f):
-                vid = video_stem(row['media_id'])
-                frame = int(row['frame'])
-                cache.setdefault(vid, {}).setdefault(frame, []).append({
-                    'track_id': int(row['track_id']),
-                    'class':    row['class'],
-                    'x':        float(row['x']),
-                    'y':        float(row['y']),
-                    'w':        float(row['width']),
-                    'h':        float(row['height']),
-                    'conf':     round(float(row['confidence']), 3),
-                })
+        for r in _iter_detection_rows(csv_file):
+            cache.setdefault(r['video'], {}).setdefault(r['frame'], []).append({
+                'track_id': r['track_id'],
+                'class':    r['class'],
+                'x':        r['x'],
+                'y':        r['y'],
+                'w':        r['w'],
+                'h':        r['h'],
+                'conf':     round(r['conf'], 3),
+            })
     return cache
 
 
@@ -146,7 +205,7 @@ DETECTIONS_CACHE = _load_deployment_detections(_current_deployment_id)
 
 
 def get_proxy_fps(video_name):
-    proxy = _proxy_dir_for_video(video_name) / f"{video_name.replace('.mp4', '')}_proxy.mp4"
+    proxy = _proxy_path(video_name)
     if proxy.exists():
         try:
             out = subprocess.run(
@@ -164,7 +223,7 @@ def get_proxy_fps(video_name):
 
 
 def get_black_frame_offset(video_name):
-    proxy = _proxy_dir_for_video(video_name) / f"{video_name.replace('.mp4', '')}_proxy.mp4"
+    proxy = _proxy_path(video_name)
     if proxy.exists():
         try:
             out = subprocess.run(
@@ -271,8 +330,29 @@ def prune_empty_clusters(state):
                     state["clusters"]["noise"]["track_keys"].append(k)
 
 
+def _load_mission_manifest(deployment_id, mission_id) -> dict:
+    if not deployment_id or not mission_id:
+        return {}
+    path = _deployment_dir(deployment_id) / mission_id / f"{mission_id}_manifest.json"
+    try:
+        return load_manifest(path)
+    except (OSError, ValueError) as e:
+        print(f"Warning: could not read {path}: {e}")
+        return {}
+
+
+def mission_track_counts(emb_dict):
+    """{video: n_tracks} for the review mission, sorted by video. Includes clips the
+    pipeline finished with zero tracks (from the manifest's completion records); a
+    mission without them (e.g. processed before manifests) lists embeddings only."""
+    counts = Counter(k.rsplit("__", 1)[0] for k in emb_dict)
+    for video in completed_videos(_load_mission_manifest(_current_deployment_id, _review_mission_id)):
+        counts.setdefault(video, 0)
+    return dict(sorted(counts.items()))
+
+
 def sorted_videos(emb_dict):
-    return sorted({k.rsplit("__", 1)[0] for k in emb_dict})
+    return list(mission_track_counts(emb_dict))
 
 
 def _mission_id_for_video(video_name: str):
@@ -297,7 +377,7 @@ def _owning_mission_id(video_name: str):
     """Mission folder holding this clip: parsed from `<mission>_c<NNN>` when that
     folder exists, else the mission under review (local clips can have any name)."""
     mission_id = _mission_id_for_video(video_name)
-    if mission_id and (_deployment_dir(_current_deployment_id) / mission_id).is_dir():
+    if mission_id and _ID_RE.match(mission_id) and (_deployment_dir(_current_deployment_id) / mission_id).is_dir():
         return mission_id
     return _review_mission_id
 
@@ -312,14 +392,21 @@ def _proxy_dir_for_video(video_name: str) -> Path:
     return candidate
 
 
-def _dropbox_mission_path_for(video_name: str) -> str:
+def _proxy_path(video_name: str) -> Path:
+    path = _proxy_dir_for_video(video_name) / f"{video_stem(video_name)}_proxy.mp4"
+    if not _is_inside(path, _deployment_dir(_current_deployment_id)):
+        raise ValueError(f"Invalid video name {video_name!r}")
+    return path
+
+
+def _dropbox_mission_path_for(video_name: str, deployment_id, review_mission_id) -> str:
     """Return the Dropbox folder path for the mission owning this video clip.
 
-    Root comes from the current deployment's config, not a hardcoded string,
+    Root comes from the deployment's config, not a hardcoded string,
     so this works regardless of which Dropbox account/folder a deployment uses.
     """
-    mission_id = _mission_id_for_video(video_name) or _review_mission_id
-    deployment = _load_deployment(_current_deployment_id) or {}
+    mission_id = _mission_id_for_video(video_name) or review_mission_id
+    deployment = _load_deployment(deployment_id) or {}
     root = source_config(deployment)["root"]
     if mission_id:
         segs = mission_id.split('_', 1)
@@ -330,7 +417,7 @@ def _dropbox_mission_path_for(video_name: str) -> str:
 
 def best_crop_path(video, track_id):
     video_dir = _crops_dir_for_video(video) / video
-    if not video_dir.exists():
+    if not video_dir.exists() or not _is_inside(video_dir, _deployment_dir(_current_deployment_id)):
         return None
     try:
         id_prefix = f"id{int(track_id):04d}"
@@ -458,7 +545,7 @@ def get_dbx():
     return _dbx_instance
 
 
-def _proxy_source_video(video_name: str):
+def _proxy_source_video(video_name: str, deployment_id, mission_id, review_mission_id):
     """(source, Video) to build this clip's proxy from.
 
     Uses the mission manifest written by the pipeline; the path in it is relative
@@ -466,9 +553,8 @@ def _proxy_source_video(video_name: str):
     source. Missions processed before manifests existed (e.g. the Palau sample)
     fall back to rebuilding the Dropbox path from the video name.
     """
-    cfg = source_config(_load_deployment(_current_deployment_id) or {})
-    mission_id = _owning_mission_id(video_name) or "__none__"
-    manifest = load_manifest(_deployment_dir(_current_deployment_id) / mission_id / f"{mission_id}_manifest.json")
+    cfg = source_config(_load_deployment(deployment_id) or {})
+    manifest = _load_mission_manifest(deployment_id, mission_id)
     entry = manifest.get(video_name)
     if cfg["type"] == "dropbox":
         source = DropboxSource(cfg["root"], dbx=get_dbx())
@@ -481,21 +567,23 @@ def _proxy_source_video(video_name: str):
     # plw_dscm_12_c001 → PLW_dscm_12_c001.mp4
     parts = video_name.split("_")
     filename = parts[0].upper() + "_" + "_".join(parts[1:]) + ".mp4"
-    return source, Video(filename, f"{_dropbox_mission_path_for(video_name)}/{filename}")
+    folder = _dropbox_mission_path_for(video_name, deployment_id, review_mission_id)
+    return source, Video(filename, f"{folder}/{filename}")
 
 
-def _generate_proxy(video_name: str):
-    proxy_dir = _proxy_dir_for_video(video_name)
-    proxy_path = proxy_dir / f"{video_name}_proxy.mp4"
+def _generate_proxy(video_name: str, proxy_path: Path, deployment_id, mission_id, review_mission_id):
+    """Runs in a thread; everything it needs is resolved by the request that started it,
+    so switching deployment/mission meanwhile doesn't change where it reads or writes."""
+    key = str(proxy_path)
     if proxy_path.exists():
         with _proxy_lock:
-            _proxy_status[video_name] = "ready"
+            _proxy_status[key] = "ready"
         return
-    fd, ffmpeg_tmp = tempfile.mkstemp(prefix=f".{video_name}_proxy_", suffix=".mp4", dir=proxy_dir)
-    os.close(fd)
-    ffmpeg_tmp = Path(ffmpeg_tmp)
+    # One generation per proxy path at a time (see api_proxy_start), so a fixed name is safe;
+    # leftovers from a hard stop are removed at startup (_cleanup_stale_temp_files).
+    ffmpeg_tmp = proxy_path.with_name(f"{video_stem(video_name)}_proxy.tmp.mp4")
     try:
-        source, video = _proxy_source_video(video_name)
+        source, video = _proxy_source_video(video_name, deployment_id, mission_id, review_mission_id)
         # Local: ffmpeg reads the source file in place. Dropbox: a temp download.
         with source.local_copy(video) as src_path:
             subprocess.run(
@@ -511,11 +599,11 @@ def _generate_proxy(video_name: str):
             )
         ffmpeg_tmp.replace(proxy_path)
         with _proxy_lock:
-            _proxy_status[video_name] = "ready"
+            _proxy_status[key] = "ready"
     except Exception as e:
         print(f"Proxy generation failed for {video_name}: {e}")
         with _proxy_lock:
-            _proxy_status[video_name] = "error"
+            _proxy_status[key] = "error"
     finally:
         ffmpeg_tmp.unlink(missing_ok=True)
 
@@ -531,12 +619,10 @@ def index():
 def api_state():
     state = load_state()
     emb = load_embeddings()
-    track_counts = defaultdict(int)
-    for k in emb:
-        track_counts[k.rsplit("__", 1)[0]] += 1
-    for v in sorted(track_counts):
+    for v, n in mission_track_counts(emb).items():
         entry = state["videos"].get(v, {"name": v, "status": "pending"})
-        entry["track_count"] = track_counts[v]
+        entry["track_count"] = n
+        entry["no_detections"] = n == 0
         state["videos"][v] = entry
     return jsonify(state)
 
@@ -545,16 +631,14 @@ def api_state():
 def api_videos():
     state = load_state()
     emb = load_embeddings()
-    track_counts = defaultdict(int)
-    for k in emb:
-        track_counts[k.rsplit("__", 1)[0]] += 1
     return jsonify([
         {
             "name": v,
             "status": state["videos"].get(v, {}).get("status", "pending"),
-            "track_count": track_counts[v],
+            "track_count": n,
+            "no_detections": n == 0,   # processed clip with no tracks (MaxN = 0)
         }
-        for v in sorted(track_counts)
+        for v, n in mission_track_counts(emb).items()
     ])
 
 
@@ -683,12 +767,16 @@ def api_initialize():
     cosine_threshold = float(body.get("cosine_threshold", 0.25))
 
     emb_dict = load_embeddings()
-    all_vids = sorted_videos(emb_dict)
+    track_counts = mission_track_counts(emb_dict)
+    all_vids = list(track_counts)
     if seed_video not in all_vids:
         return jsonify({"error": "Unknown video"}), 400
 
     # ── HDBSCAN on seed video only ────────────────────────────────────────────
     track_keys    = [k for k in emb_dict if k.rsplit("__", 1)[0] == seed_video]
+    if not track_keys:
+        return jsonify({"error": f"{seed_video} has no detections, so it can't seed the clusters. "
+                                 "Pick a seed video that has tracks."}), 400
     local_clusters = hdbscan_video(track_keys, emb_dict, min_cluster_size, min_samples)
 
     clusters    = {
@@ -756,10 +844,6 @@ def api_initialize():
             cluster["representative"] = find_representative(
                 cluster["track_keys"], cluster["centroid"], emb_dict
             )
-
-    track_counts = defaultdict(int)
-    for k in emb_dict:
-        track_counts[k.rsplit("__", 1)[0]] += 1
 
     videos = {
         v: {
@@ -944,12 +1028,18 @@ def api_approve():
     video_name = body["video_name"]
     state = load_state()
 
-    # 1. Update the status of the current video
+    track_counts = mission_track_counts(load_embeddings())
+    all_vids = list(track_counts)
+
+    # 1. Update the status of the current video (a clip the pipeline added after
+    #    initialization, e.g. one with no detections, may not be in the state yet)
     if video_name in state["videos"]:
         state["videos"][video_name]["status"] = "approved"
+    elif video_name in track_counts:
+        state["videos"][video_name] = {
+            "name": video_name, "status": "approved", "track_count": track_counts[video_name],
+        }
 
-    all_vids = sorted_videos(load_embeddings())
-    
     # 2. Sequential Navigation logic
     if video_name in all_vids:
         current_idx = all_vids.index(video_name)
@@ -1115,6 +1205,9 @@ def api_trash_restore():
 def api_trash_delete():
     body = request.get_json()
     track_keys = body["track_keys"]
+    bad = [k for k in track_keys if _split_track_key(k) is None]
+    if bad:
+        return jsonify({"error": f"Invalid track key(s): {', '.join(map(repr, bad))}"}), 400
     state = load_state()
     emb_dict = load_embeddings()
 
@@ -1125,9 +1218,9 @@ def api_trash_delete():
         if key in emb_dict:
             del emb_dict[key]
             modified_emb = True
-        video, track_id = key.rsplit("__", 1)
+        video, track_id = _split_track_key(key)
         video_dir = _crops_dir_for_video(video) / video
-        if video_dir.exists():
+        if video_dir.exists() and _is_inside(video_dir, _deployment_dir(_current_deployment_id)):
             try:
                 id_prefix = f"id{int(track_id):04d}"
             except ValueError:
@@ -1168,28 +1261,24 @@ def _export_detection_aggregates():
     csv_file = next(emb_path.parent.glob("*_detections.csv"), None)
     if not csv_file or not csv_file.exists():
         return track_aggs, frame_tracks
-    with open(csv_file, newline='') as f:
-        for row in csv.DictReader(f):
-            try:
-                tid   = str(int(row['track_id']))
-                frame = int(row['frame'])
-                conf  = float(row['confidence'])
-            except (ValueError, TypeError):
-                continue
-            vid = video_stem(row['media_id'])
-            agg = track_aggs[vid].get(tid)
-            if agg is None:
-                agg = track_aggs[vid][tid] = {
-                    "n": 0, "first": frame, "last": frame,
-                    "classes": Counter(), "max_conf": 0.0, "sum_conf": 0.0,
-                }
-            agg["n"]        += 1
-            agg["first"]     = min(agg["first"], frame)
-            agg["last"]      = max(agg["last"], frame)
-            agg["max_conf"]  = max(agg["max_conf"], conf)
-            agg["sum_conf"] += conf
-            agg["classes"][row['class']] += 1
-            frame_tracks[vid][frame].add(tid)
+    for r in _iter_detection_rows(csv_file):
+        tid   = str(r['track_id'])
+        frame = r['frame']
+        conf  = r['conf']
+        vid   = r['video']
+        agg = track_aggs[vid].get(tid)
+        if agg is None:
+            agg = track_aggs[vid][tid] = {
+                "n": 0, "first": frame, "last": frame,
+                "classes": Counter(), "max_conf": 0.0, "sum_conf": 0.0,
+            }
+        agg["n"]        += 1
+        agg["first"]     = min(agg["first"], frame)
+        agg["last"]      = max(agg["last"], frame)
+        agg["max_conf"]  = max(agg["max_conf"], conf)
+        agg["sum_conf"] += conf
+        agg["classes"][r['class']] += 1
+        frame_tracks[vid][frame].add(tid)
     return track_aggs, frame_tracks
 
 
@@ -1257,6 +1346,14 @@ def api_export_tracks_csv():
     )
 
 
+def zero_track_videos(state, emb):
+    """Videos in the mission with no tracks left: clips the pipeline finished with no
+    detections, or whose tracks were all trashed. Real survey data (MaxN = 0)."""
+    trash_keys = set(state.get("trash", {}).get("track_keys", []))
+    live = Counter(k.rsplit("__", 1)[0] for k in emb if k not in trash_keys)
+    return [v for v in mission_track_counts(emb) if not live[v]]
+
+
 @app.route("/api/export/summary.csv")
 def api_export_summary_csv():
     state = load_state()
@@ -1297,6 +1394,11 @@ def api_export_summary_csv():
         t["n_tracks"]     += entry["n_tracks"]
         t["n_detections"] += entry["n_detections"]
         t["max_n"]         = max(t["max_n"], entry["max_n"])
+
+    # One row per clip with no tracks, so it isn't missing from the survey
+    for video in zero_track_videos(state, load_embeddings()):
+        rows.append([_review_mission_id, video, "none", "", 0, 0, 0])
+    rows.sort(key=lambda r: r[1])   # stable: keeps the cluster order within a video
 
     for cid in sorted(totals, key=lambda c: (c == "noise", c)):
         t = totals[cid]
@@ -1360,6 +1462,8 @@ def api_select_review_mission():
     mission_id = body.get("mission_id")
     if not mission_id:
         return jsonify({"error": "mission_id required"}), 400
+    if not isinstance(mission_id, str) or not _ID_RE.match(mission_id):
+        return jsonify({"error": f"Invalid mission ID {mission_id!r} (letters, digits, _ and - only)"}), 400
     emb_path, _ = _review_paths(mission_id)
     if not emb_path.exists():
         return jsonify({"error": f"No embeddings found for mission {mission_id}"}), 404
@@ -1395,27 +1499,34 @@ def api_crop(video, track_id):
 
 @app.route("/api/video/<video_name>/proxy-status")
 def api_proxy_status(video_name):
-    if (_proxy_dir_for_video(video_name) / f"{video_name}_proxy.mp4").exists():
+    proxy_path = _proxy_path(video_name)
+    if proxy_path.exists():
         return jsonify({"status": "ready"})
     with _proxy_lock:
-        return jsonify({"status": _proxy_status.get(video_name, "missing")})
+        status = _proxy_status.get(str(proxy_path), "missing")
+    # "ready" but the file is gone (deleted by hand): let the player start it again
+    return jsonify({"status": "missing" if status == "ready" else status})
 
 
 @app.route("/api/video/<video_name>/proxy/start", methods=["POST"])
 def api_proxy_start(video_name):
-    if (_proxy_dir_for_video(video_name) / f"{video_name}_proxy.mp4").exists():
+    proxy_path = _proxy_path(video_name)
+    if proxy_path.exists():
         return jsonify({"status": "ready"})
+    key = str(proxy_path)
     with _proxy_lock:
-        if _proxy_status.get(video_name) in ("generating", "ready"):
-            return jsonify({"status": _proxy_status[video_name]})
-        _proxy_status[video_name] = "generating"
-    threading.Thread(target=_generate_proxy, args=(video_name,), daemon=True).start()
+        if _proxy_status.get(key) == "generating":
+            return jsonify({"status": "generating"})
+        _proxy_status[key] = "generating"
+    args = (video_name, proxy_path, _current_deployment_id,
+            _owning_mission_id(video_name), _review_mission_id)
+    threading.Thread(target=_generate_proxy, args=args, daemon=True).start()
     return jsonify({"status": "generating"})
 
 
 @app.route("/api/video/<video_name>/proxy")
 def api_proxy_serve(video_name):
-    proxy_path = _proxy_dir_for_video(video_name) / f"{video_name}_proxy.mp4"
+    proxy_path = _proxy_path(video_name)
     if not proxy_path.exists():
         return "Proxy not ready", 404
     return send_file(proxy_path, mimetype="video/mp4", conditional=True)
@@ -1448,6 +1559,7 @@ _pipeline_state = {
     "videos_total":     0,
     "tracks_found":     0,
     "embeddings_total": 0,
+    "embedding_weights": None,   # "finetuned" | "pretrained" | "placeholder", once loaded
     "errors":           [],
     "started_at":       None,
     "finished_at":      None,
@@ -1500,6 +1612,13 @@ class PipelineReporter:
     def update_embeddings(self, total: int):
         with _pipeline_lock:
             _pipeline_state["embeddings_total"] = total
+
+    def embedding_weights(self, weights: str):
+        """"finetuned" | "pretrained" | "placeholder" — shown as a warning unless finetuned."""
+        with _pipeline_lock:
+            _pipeline_state["embedding_weights"] = weights
+        if weights != "finetuned":
+            self.log(f"⚠ WARNING: embeddings use {weights} weights, not the fine-tuned BioCLIP checkpoint")
 
     def video_done(self, video_name: str, n_tracks: int, n_embeddings: int):
         with _pipeline_lock:
@@ -1581,10 +1700,12 @@ def _run_pipeline(config: dict):
 
         deployment = _load_deployment(config["deployment_id"]) or {}
         source, folder = _pipeline_source(source_config(deployment), config)
+        mission_dir = _deployment_dir(config["deployment_id"]) / config["mission_id"]
         overrides = {
             "MISSION_ID":      config["mission_id"],
             "SOURCE":          source,
             "MISSION_PATH":    folder,
+            "OUTPUT_DIR":      mission_dir,
             "START_FROM":      config.get("start_from") or None,
             "SELECTED_VIDEOS": config.get("selected_videos") or None,
             "CONF_THRESHOLD":  float(config.get("conf_threshold",  0.15)),
@@ -1592,22 +1713,14 @@ def _run_pipeline(config: dict):
             "MIN_TRACK_LEN":   int(config.get("min_track_len",     3)),
             "CROPS_PER_TRACK": int(config.get("crops_per_track",   3)),
         }
-        for k, v in overrides.items():
-            setattr(mod, k, v)
 
-        reporter.log("Executing pipeline module (imports + top-level setup)...")
+        # The module only defines defaults at import; main() reads them when it runs,
+        # so setting them after import is all it takes (and nothing is created here).
+        reporter.log("Importing pipeline module...")
         spec.loader.exec_module(mod)
-        reporter.log("Module loaded. Applying config overrides...")
-
+        reporter.log("Module loaded. Applying config...")
         for k, v in overrides.items():
             setattr(mod, k, v)
-
-        mission_dir = _deployment_dir(config["deployment_id"]) / config["mission_id"]
-        mission_dir.mkdir(parents=True, exist_ok=True)
-        mod.OUTPUT_CSV_PATH   = mission_dir / f"{config['mission_id']}_detections.csv"
-        mod.OUTPUT_CROPS_DIR  = mission_dir / f"{config['mission_id']}_crops"
-        mod.OUTPUT_EMBEDDINGS = mission_dir / f"{config['mission_id']}_embeddings.json"
-        mod.OUTPUT_MANIFEST   = mission_dir / f"{config['mission_id']}_manifest.json"
 
         reporter.log(f"Video source: {source.describe(folder)}")
         reporter.log(f"Output dir: {mission_dir}")
@@ -1644,18 +1757,23 @@ def api_pipeline_log():
 
 @app.route("/api/pipeline/start", methods=["POST"])
 def api_pipeline_start():
-    config = request.get_json()
-    if not config.get("mission_id"):
+    # Everything is validated before anything is written; the deployment folder is
+    # only created once the run is actually starting.
+    config = request.get_json(silent=True) or {}
+    mission_id = config.get("mission_id")
+    if not mission_id:
         return jsonify({"error": "mission_id required"}), 400
+    if not isinstance(mission_id, str) or not _ID_RE.match(mission_id):
+        return jsonify({"error": f"Invalid mission ID {mission_id!r} (letters, digits, _ and - only)"}), 400
 
     deployment_id = config.get("deployment_id")
     if not deployment_id:
         return jsonify({"error": "deployment_id required"}), 400
+    if not isinstance(deployment_id, str) or not _ID_RE.match(deployment_id):
+        return jsonify({"error": f"Invalid deployment name {deployment_id!r} (letters, digits, _ and - only)"}), 400
 
     is_new = deployment_id not in _list_deployments()
     if is_new:
-        if not _DEPLOYMENT_ID_RE.match(deployment_id):
-            return jsonify({"error": f"Invalid deployment name {deployment_id!r} (letters, digits, _ and - only)"}), 400
         source_cfg = {
             "type": config.get("source_type") or "dropbox",
             "root": (config.get("source_root") or config.get("dropbox_root") or "").strip(),
@@ -1676,15 +1794,19 @@ def api_pipeline_start():
             if not source.root.is_dir():
                 raise FileNotFoundError(f"Folder not found: {source.root}")
             source.check_folder(folder)
-        except (ValueError, FileNotFoundError) as e:
+            check_stem_collisions(source.list_videos(folder))
+        except (ValueError, OSError) as e:
             return jsonify({"error": str(e)}), 400
-
-    if is_new:
-        _ensure_deployment(deployment_id, source_cfg)
 
     with _pipeline_lock:
         if _pipeline_state["running"]:
             return jsonify({"error": "Pipeline already running"}), 409
+
+        if is_new:
+            try:
+                _ensure_deployment(deployment_id, source_cfg)
+            except (ValueError, OSError) as e:
+                return jsonify({"error": f"Could not create deployment {deployment_id!r}: {e}"}), 500
 
         _stop_event.clear()
         _log_buffer.clear()
@@ -1698,6 +1820,7 @@ def api_pipeline_start():
             "videos_total":     0,
             "tracks_found":     0,
             "embeddings_total": 0,
+            "embedding_weights": None,
             "errors":           [],
             "started_at":       datetime.now().isoformat(),
             "finished_at":      None,
@@ -1716,6 +1839,8 @@ def api_pipeline_stop():
 @app.route("/api/pipeline/missions")
 def api_pipeline_missions():
     deployment_id = request.args.get("deployment_id") or _current_deployment_id
+    if deployment_id and not _ID_RE.match(deployment_id):
+        return jsonify({"error": f"Invalid deployment name {deployment_id!r}"}), 400
     missions_root = _deployment_dir(deployment_id) if deployment_id else None
     if not missions_root or not missions_root.exists():
         return jsonify([])
@@ -1740,6 +1865,58 @@ def api_pipeline_missions():
     return jsonify(missions)
 
 
+# ── Startup cleanup ───────────────────────────────────────────────────────────
+
+_STALE_TEMP_AGE_S = 10 * 60
+
+
+def _newest_mtime(path: Path) -> float:
+    newest = path.stat().st_mtime
+    if path.is_dir():
+        for dirpath, _, filenames in os.walk(path):
+            for name in filenames:
+                try:
+                    newest = max(newest, os.stat(os.path.join(dirpath, name)).st_mtime)
+                except OSError:
+                    pass
+    return newest
+
+
+def _cleanup_stale_temp_files(min_age_s=_STALE_TEMP_AGE_S):
+    """Remove what a hard stop (container killed mid-run) leaves behind: half-written
+    review proxies in proxy_videos/, and natgeo_* video downloads / pipeline work dirs
+    in the temp folder. Only items untouched for min_age_s, and never during a run."""
+    with _pipeline_lock:
+        if _pipeline_state["running"]:
+            return
+    stale = []
+    root = _deployments_root()
+    if root.exists():
+        # <deployment>/<mission>/proxy_videos, plus older <mission>/proxy_videos;
+        # ".*_proxy_*.mp4" is the temp name used before "_proxy.tmp.mp4"
+        for pattern in ("*_proxy.tmp.mp4", ".*_proxy_*.mp4"):
+            stale += root.glob(f"*/*/proxy_videos/{pattern}")
+            stale += root.glob(f"*/proxy_videos/{pattern}")
+    stale += Path(tempfile.gettempdir()).glob("natgeo_*")
+
+    cutoff = time.time() - min_age_s
+    removed = 0
+    for path in stale:
+        try:
+            if _newest_mtime(path) > cutoff:
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            removed += 1
+        except OSError as e:
+            print(f"Could not remove stale temp item {path}: {e}")
+    if removed:
+        print(f"Removed {removed} stale temp item(s) left by an earlier run")
+
+
 if __name__ == "__main__":
+    _cleanup_stale_temp_files()
     debug = os.environ.get("FLASK_DEBUG") == "1"
     app.run(debug=debug, use_reloader=False, port=int(os.environ.get("PORT", "5000")), host='0.0.0.0')

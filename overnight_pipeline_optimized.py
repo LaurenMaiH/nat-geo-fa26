@@ -17,6 +17,7 @@ Optimizations over previous version:
 """
 
 import os
+import re
 import sys
 import csv
 import json
@@ -24,8 +25,10 @@ import shutil
 import tempfile
 import subprocess
 import threading
+from datetime import datetime
 from pathlib import Path
-from collections import defaultdict
+from types import SimpleNamespace
+from collections import Counter, defaultdict
 
 import cv2
 import numpy as np
@@ -38,11 +41,16 @@ from tqdm import tqdm
 from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).parent / "application"))
-from video_sources import DropboxSource, load_manifest, write_manifest, manifest_entry
+from video_sources import (
+    DropboxSource, check_stem_collisions, has_completion_records, is_complete,
+    load_manifest, manifest_entry, video_stem, write_json_atomic, write_manifest,
+)
 
 load_dotenv()
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
+# Read when main() runs, not at import, so the app can set any of these on the
+# module before calling main(). Importing this file creates no files or folders.
 MISSION_ID   = "PLW_dscm_03"          # ← only line to change between missions
 DEPLOYMENT_ROOT = os.environ.get("DROPBOX_DEPLOYMENT_ROOT", "/DOEX0096_Palau")
 MISSION_PATH = f"{DEPLOYMENT_ROOT}/{MISSION_ID}/Video"   # ← and this one
@@ -51,17 +59,19 @@ MISSION_PATH = f"{DEPLOYMENT_ROOT}/{MISSION_ID}/Video"   # ← and this one
 # None means Dropbox at DEPLOYMENT_ROOT, with MISSION_PATH as the Dropbox folder.
 SOURCE = None
 
+# Mission output folder. The app sets processed_missions/<deployment>/<mission>;
+# None means processed_missions/<MISSION_ID> next to this script.
+OUTPUT_DIR = None
+
 SELECTED_VIDEOS = None  # set to a list of filenames, or None for all
 START_FROM      = "PLW_dscm_03_c011.mp4"  # set to a filename to start from that video (inclusive)
 
 CHECKPOINT_PATH = Path(__file__).parent / "checkpoints" / "best.pt"
+# Google Drive file IDs (download by ID works on gdown 4.x–6.x; 6.0 dropped fuzzy URLs)
+BIOCLIP_CHECKPOINT_DRIVE_ID = "1Qec1Gzxl8zAazuLof8a2LUSrbOR7GmtT"   # fine-tuned BioCLIP best.pt (~3.6 GB)
+YOLO_WORLD_DRIVE_ID         = "1hh576zOzpUqgWSjIdSkR4EwgYQ8kH406"   # yolov8x-worldv2.pt
 
-_MISSION_DIR      = Path(__file__).parent / "processed_missions" / MISSION_ID
-_MISSION_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_CSV_PATH   = _MISSION_DIR / f"{MISSION_ID}_detections.csv"
-OUTPUT_CROPS_DIR  = _MISSION_DIR / f"{MISSION_ID}_crops"
-OUTPUT_EMBEDDINGS = _MISSION_DIR / f"{MISSION_ID}_embeddings.json"
-OUTPUT_MANIFEST   = _MISSION_DIR / f"{MISSION_ID}_manifest.json"
+_MISSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 CONF_THRESHOLD  = 0.15
 IOU_THRESHOLD   = 0.70
@@ -82,10 +92,22 @@ YOLO_CACHE_DIR   = Path.home() / ".config" / "ultralytics"
 INFERENCE_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 CROP_LABELS      = ["early", "mid", "late"]
 
-# ── MODEL SETUP ───────────────────────────────────────────────────────────────
-YOLO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-settings.update({"weights_dir": str(YOLO_CACHE_DIR), "runs_dir": str(YOLO_CACHE_DIR / "runs")})
+# ── OUTPUT PATHS ──────────────────────────────────────────────────────────────
+def output_paths() -> SimpleNamespace:
+    """This run's output files, from MISSION_ID / OUTPUT_DIR as they are when called."""
+    if not _MISSION_ID_RE.match(MISSION_ID or ""):
+        raise ValueError(f"Invalid MISSION_ID {MISSION_ID!r} (letters, digits, _ and - only)")
+    mission_dir = Path(OUTPUT_DIR) if OUTPUT_DIR else Path(__file__).parent / "processed_missions" / MISSION_ID
+    return SimpleNamespace(
+        dir        = mission_dir,
+        csv        = mission_dir / f"{MISSION_ID}_detections.csv",
+        crops      = mission_dir / f"{MISSION_ID}_crops",
+        embeddings = mission_dir / f"{MISSION_ID}_embeddings.json",
+        manifest   = mission_dir / f"{MISSION_ID}_manifest.json",
+    )
 
+
+# ── MODEL SETUP ───────────────────────────────────────────────────────────────
 _model_cache: dict = {}
 
 
@@ -93,13 +115,13 @@ def load_model_and_config():
     if "model" in _model_cache:
         return _model_cache["model"], _model_cache["tracker"]
 
+    YOLO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    settings.update({"weights_dir": str(YOLO_CACHE_DIR), "runs_dir": str(YOLO_CACHE_DIR / "runs")})
+
     model_path = YOLO_CACHE_DIR / "yolov8x-worldv2.pt"
     if not model_path.exists():
         print(f"Downloading YOLO-World model to {model_path}...")
-        gdown.download(
-            "https://drive.google.com/file/d/1hh576zOzpUqgWSjIdSkR4EwgYQ8kH406/view?usp=sharing",
-            str(model_path), quiet=False,
-        )
+        gdown.download(id=YOLO_WORLD_DRIVE_ID, output=str(model_path), quiet=False)
 
     model = YOLOWorld(str(model_path))
     model.model.eval()
@@ -158,6 +180,17 @@ def _get_frame_count(path: Path) -> int:
     return int(val) if val.isdigit() else 0
 
 
+def _get_video_height(path: Path) -> int:
+    """Height of the first video stream in pixels, or 0 if it can't be read."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=height", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True,
+    )
+    val = r.stdout.strip()
+    return int(val) if val.isdigit() else 0
+
+
 def resize_video(input_path: Path, output_path: Path, target_height: int = 1080) -> bool:
     # ── output_path is now in the same tmpdir as the download ──
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,41 +215,67 @@ def resize_video(input_path: Path, output_path: Path, target_height: int = 1080)
 
 
 # ──────── EMBEDDING MODEL ────────────────────────────────────────────────────
+def _download_errors() -> tuple:
+    """Exceptions that mean the Drive download itself failed (network, Drive refused the
+    file, disk). requests' errors subclass OSError. Anything else, e.g. a TypeError
+    from a gdown API change, is a bug and must not be mistaken for a download failure."""
+    exc = getattr(gdown, "exceptions", None)
+    names = ("DownloadError", "FileURLRetrievalError")   # gdown 6.x / 4.7+
+    return (OSError,) + tuple(getattr(exc, n) for n in names if exc is not None and hasattr(exc, n))
+
+
+def _download_checkpoint() -> bool:
+    """Fetch the fine-tuned checkpoint to CHECKPOINT_PATH. False on a download failure."""
+    print(f"Finetuned weights not found at {CHECKPOINT_PATH}, downloading (~3.6 GB)...")
+    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        gdown.download(id=BIOCLIP_CHECKPOINT_DRIVE_ID, output=str(CHECKPOINT_PATH), quiet=False)
+    except _download_errors() as dl_err:
+        print(f"Finetuned checkpoint download failed ({dl_err}).")
+        # gdown downloads to <name>XXXX.part and renames on success; drop the leftover
+        for part in CHECKPOINT_PATH.parent.glob(f"{CHECKPOINT_PATH.name}*.part"):
+            part.unlink(missing_ok=True)
+        return False
+    return CHECKPOINT_PATH.exists()
+
+
 def load_embedding_model():
+    """Returns (weights, model, preprocess); weights is "finetuned", "pretrained"
+    (checkpoint download failed) or "placeholder" (no BioCLIP model at all; main()
+    refuses to run with it)."""
+    if CHECKPOINT_PATH and not Path(CHECKPOINT_PATH).exists():
+        if not _download_checkpoint():
+            print("WARNING: using pretrained BioCLIP-2 weights instead of the fine-tuned "
+                  "checkpoint. Embeddings and clusters will differ from the fine-tuned model's.")
+
     try:
         import open_clip
-
-        if CHECKPOINT_PATH and not Path(CHECKPOINT_PATH).exists():
-            print(f"Finetuned weights not found at {CHECKPOINT_PATH}, downloading...")
-            Path(CHECKPOINT_PATH).parent.mkdir(parents=True, exist_ok=True)
-            try:
-                gdown.download(
-                    "https://drive.google.com/file/d/1Qec1Gzxl8zAazuLof8a2LUSrbOR7GmtT/view?usp=drive_link",
-                    str(CHECKPOINT_PATH), quiet=False, fuzzy=True,
-                )
-            except Exception as dl_err:
-                # A checkpoint-download failure (gdown API change, private/expired link, etc.)
-                # must NOT abort the whole embedding model. Fall through to pretrained
-                # BioCLIP-2 weights, which still produce real embeddings.
-                print(f"Finetuned checkpoint download failed ({dl_err}); using pretrained BioCLIP-2.")
-
         model, _, preprocess = open_clip.create_model_and_transforms(
             "hf-hub:imageomics/bioclip-2", device=INFERENCE_DEVICE
         )
+    except Exception as e:
+        print(f"BioCLIP not available ({e}) -- only placeholder embeddings are possible.")
+        return ("placeholder", None, None)
 
-        if CHECKPOINT_PATH and Path(CHECKPOINT_PATH).exists():
-            print(f"Loading finetuned weights from {CHECKPOINT_PATH}...")
+    weights = "pretrained"
+    if CHECKPOINT_PATH and Path(CHECKPOINT_PATH).exists():
+        print(f"Loading finetuned weights from {CHECKPOINT_PATH}...")
+        try:
             ckpt = torch.load(CHECKPOINT_PATH, map_location=INFERENCE_DEVICE)
             model.visual.load_state_dict(ckpt["model_state"])
-            print("Finetuned weights loaded ✓")
-        else:
-            print("Using pretrained BioCLIP-2 weights")
+        except Exception as e:
+            raise RuntimeError(
+                f"Could not load the fine-tuned checkpoint {CHECKPOINT_PATH} ({type(e).__name__}: {e}). "
+                "The file is probably corrupted or incomplete. Delete it and start the run "
+                "again to download a fresh copy."
+            ) from e
+        print("Finetuned weights loaded ✓")
+        weights = "finetuned"
+    else:
+        print("Using pretrained BioCLIP-2 weights")
 
-        model.eval()
-        return ("bioclip", model, preprocess)
-    except Exception as e:
-        print(f"BioCLIP not available ({e}) -- using placeholder embeddings.")
-        return ("placeholder", None, None)
+    model.eval()
+    return (weights, model, preprocess)
 
 
 def get_embeddings_batch(embed_info, images_bgr: list[np.ndarray]) -> np.ndarray:
@@ -225,7 +284,7 @@ def get_embeddings_batch(embed_info, images_bgr: list[np.ndarray]) -> np.ndarray
     Returns (N, D) float32 array of L2-normalised embeddings.
     """
     kind, model, preprocess = embed_info
-    if kind == "bioclip":
+    if kind != "placeholder":
         from PIL import Image
         tensors = []
         for img in images_bgr:
@@ -242,27 +301,96 @@ def get_embeddings_batch(embed_info, images_bgr: list[np.ndarray]) -> np.ndarray
         return vecs
 
 
-# ──────── CSV HELPERS ────────────────────────────────────────────────────────
-def get_last_processed(csv_path: Path):
+# ──────── RESUME / COMPLETION RECORDS ─────────────────────────────────────────
+# Each finished video (including ones with zero tracks) is marked "complete" in the
+# mission manifest; a rerun skips those and redoes everything else from scratch.
+
+def plan_videos(all_entries, manifest: dict, selected=None, start_from=None) -> SimpleNamespace:
+    """Which videos this run processes: SELECTED_VIDEOS / START_FROM narrow the
+    listing, then videos already marked complete are skipped."""
+    entries = all_entries
+    missing = set()
+    if selected is not None:
+        sel     = set(selected)
+        entries = [e for e in entries if e.name in sel]
+        missing = sel - {e.name for e in entries}
+    start_found = None
+    if start_from:
+        names = [e.name for e in entries]
+        start_found = start_from in names
+        if start_found:
+            entries = entries[names.index(start_from):]
+    done = [e for e in entries if is_complete(manifest.get(e.stem))]
+    return SimpleNamespace(
+        todo=[e for e in entries if not is_complete(manifest.get(e.stem))],
+        done=done, missing=missing, start_found=start_found,
+    )
+
+
+def _last_csv_video(csv_path: Path):
+    """media_id of the CSV's last data row (the old resume point), or None."""
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         return None
+    last = None
     with open(csv_path, newline="") as f:
-        rows = [r for r in csv.reader(f) if r]
-    return rows[-1][0] if len(rows) >= 2 else None
+        for i, row in enumerate(csv.reader(f)):
+            if i > 0 and row:
+                last = row[0]
+    return last
 
 
-def clean_csv(csv_path: Path):
-    if not csv_path.exists() or csv_path.stat().st_size == 0:
-        return
-    with open(csv_path, newline="") as f:
-        rows = list(csv.reader(f))
-    header, data = rows[0], rows[1:]
-    cleaned = [r for r in data if r and r[1] != "-1"]
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(header)
-        writer.writerows(cleaned)
-    print(f"Removed {len(data) - len(cleaned)} sentinel row(s) from {csv_path}")
+def legacy_completion(source, all_entries, manifest: dict, csv_path: Path, embeddings: dict) -> dict:
+    """Completion records for a mission processed before they existed (no manifest,
+    or one without "status"), using the old resume rule: every video up to and
+    including the one in the CSV's last row is done. {} if nothing applies."""
+    if has_completion_records(manifest):
+        return {}
+    last = _last_csv_video(csv_path)
+    names = [e.name for e in all_entries]
+    if last not in names:
+        return {}
+    n_tracks = Counter(k.rsplit("__", 1)[0] for k in embeddings)
+    return {
+        e.stem: {**manifest_entry(source, e), "status": "complete", "n_tracks": n_tracks[e.stem],
+                 "finished_at": None, "inferred_from_csv": True}
+        for e in all_entries[:names.index(last) + 1]
+    }
+
+
+def purge_video_outputs(stems: set, paths: SimpleNamespace, embeddings: dict) -> bool:
+    """Delete what an unfinished run left behind for these videos (detection rows,
+    crops folder, embeddings) so they're redone cleanly. Also drops the sentinel rows
+    older versions wrote ("<video>,-1,,,..."). Edits `embeddings` in place; returns True
+    if it changed (the caller saves it)."""
+    removed = 0
+    if paths.csv.exists() and paths.csv.stat().st_size > 0:
+        fd, tmp = tempfile.mkstemp(prefix=f".{paths.csv.stem}_", suffix=".tmp", dir=paths.csv.parent)
+        try:
+            with open(paths.csv, newline="") as src, os.fdopen(fd, "w", newline="") as dst:
+                writer = csv.writer(dst)
+                for i, row in enumerate(csv.reader(src)):
+                    if i > 0 and (not row or video_stem(row[0]) in stems
+                                  or (len(row) > 1 and row[1] == "-1")):
+                        removed += 1
+                        continue
+                    writer.writerow(row)
+            if removed:
+                os.replace(tmp, paths.csv)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+
+    for stem in stems:
+        crop_dir = paths.crops / stem
+        if crop_dir.is_dir():
+            shutil.rmtree(crop_dir)
+
+    stale = [k for k in embeddings if k.rsplit("__", 1)[0] in stems]
+    for k in stale:
+        del embeddings[k]
+    if removed or stale:
+        print(f"Removed {removed} leftover CSV row(s) and {len(stale)} embedding(s) "
+              f"from unfinished videos")
+    return bool(stale)
 
 
 # ──────── PER-VIDEO PIPELINE ─────────────────────────────────────────────────
@@ -280,8 +408,11 @@ def process_video(
     resized_path = None
     work_path    = video_path
 
-    # ── Resize into the same tmpdir as the download ──
-    if PRERESIZE:
+    # ── Resize into the same tmpdir as the download (downscale only) ──
+    src_height = _get_video_height(video_path) if PRERESIZE else 0
+    if PRERESIZE and 0 < src_height <= PRERESIZE:
+        print(f"  Source is {src_height}p (<= {PRERESIZE}p), skipping resize.")
+    elif PRERESIZE:
         tmp = tmpdir / f"{video_path.stem}_rs{PRERESIZE}.mp4"
         if resize_video(video_path, tmp, PRERESIZE):
             work_path    = tmp
@@ -474,129 +605,152 @@ def process_video(
 # ──────── MAIN ───────────────────────────────────────────────────────────────
 def main(reporter=None):
     print(f"Using device: {INFERENCE_DEVICE}")
+    paths = output_paths()
 
     # List videos first so a bad path / missing credentials fails before model load
     source      = SOURCE or DropboxSource(DEPLOYMENT_ROOT)
     all_entries = source.list_videos(MISSION_PATH)
     print(f"Found {len(all_entries)} videos in {source.describe(MISSION_PATH)}")
-
-    model, tracker = load_model_and_config()
-    embed_info     = load_embedding_model()
-
-    OUTPUT_CROPS_DIR.mkdir(parents=True, exist_ok=True)
+    check_stem_collisions(all_entries)
 
     all_embeddings: dict = {}
-    if OUTPUT_EMBEDDINGS.exists():
-        with open(OUTPUT_EMBEDDINGS) as f:
+    if paths.embeddings.exists():
+        with open(paths.embeddings) as f:
             all_embeddings = json.load(f)
-        print(f"Loaded {len(all_embeddings)} existing embeddings from {OUTPUT_EMBEDDINGS}")
+        print(f"Loaded {len(all_embeddings)} existing embeddings from {paths.embeddings}")
 
-    manifest = load_manifest(OUTPUT_MANIFEST)
+    manifest = load_manifest(paths.manifest)
+    legacy   = legacy_completion(source, all_entries, manifest, paths.csv, all_embeddings)
+    if legacy:
+        manifest.update(legacy)
+        print(f"No completion records yet: treating {len(legacy)} videos up to "
+              f"'{max(e['filename'] for e in legacy.values())}' (last in the detections CSV) as done")
 
+    plan = plan_videos(all_entries, manifest, SELECTED_VIDEOS, START_FROM)
     if SELECTED_VIDEOS is not None:
-        sel     = set(SELECTED_VIDEOS)
-        entries = [e for e in all_entries if e.name in sel]
-        missing = sel - {e.name for e in entries}
-        if missing:
-            print(f"Warning: not found in source folder: {missing}")
-        print(f"Selected {len(entries)}/{len(all_entries)} videos")
-    else:
-        entries = all_entries
-        print(f"Processing all {len(entries)} videos")
+        if plan.missing:
+            print(f"Warning: not found in source folder: {plan.missing}")
+        print(f"Selected {len(plan.todo) + len(plan.done)}/{len(all_entries)} videos")
+    if plan.start_found:
+        print(f"Starting from '{START_FROM}'")
+    elif START_FROM:
+        print(f"Start video '{START_FROM}' not in the list, starting from the beginning")
+    if plan.done:
+        print(f"Skipping {len(plan.done)} video(s) already marked complete")
+    entries = plan.todo
+    print(f"{len(entries)} video(s) to process")
 
-    last_processed = get_last_processed(OUTPUT_CSV_PATH)
-    if last_processed and last_processed in {e.name for e in entries}:
-        idx     = next(i for i, e in enumerate(entries) if e.name == last_processed)
-        entries = entries[idx + 1:]
-        print(f"Resuming after '{last_processed}': {len(entries)} videos remaining")
-    elif START_FROM and START_FROM in {e.name for e in entries}:
-        idx     = next(i for i, e in enumerate(entries) if e.name == START_FROM)
-        entries = entries[idx:]
-        print(f"Starting from '{START_FROM}': {len(entries)} videos remaining")
-    else:
-        print("Starting from the beginning")
-
-    total   = len(entries)
     counter = 0
-    with tempfile.TemporaryDirectory(prefix="natgeo_") as tmpdir:
-        tmpdir = Path(tmpdir)
-        for idx, entry in enumerate(entries):
-            if reporter and reporter.should_stop():
-                print("Stop signal received — exiting after current video.")
-                break
+    if entries:
+        model, tracker = load_model_and_config()
+        embed_info     = load_embedding_model()
+        weights        = embed_info[0]
+        if reporter:
+            reporter.embedding_weights(weights)
+        if weights == "placeholder":
+            raise RuntimeError(
+                "No BioCLIP embedding model could be loaded (see the log above), so embeddings "
+                "would be random placeholders. Stopping instead of producing meaningless clusters."
+            )
 
-            video_name = entry.stem
-            media_id   = entry.name
+        paths.crops.mkdir(parents=True, exist_ok=True)
+        if legacy:
+            write_manifest(paths.manifest, manifest)
+        # Redo unfinished videos from scratch (a run killed mid-video leaves partial rows)
+        if purge_video_outputs({e.stem for e in entries}, paths, all_embeddings):
+            write_json_atomic(paths.embeddings, all_embeddings)
 
-            if reporter:
-                reporter.begin_video(video_name, idx + 1, total)
+        total = len(entries)
+        with tempfile.TemporaryDirectory(prefix="natgeo_") as tmpdir:
+            tmpdir = Path(tmpdir)
+            for idx, entry in enumerate(entries):
+                if reporter and reporter.should_stop():
+                    print("Stop signal received — exiting after current video.")
+                    break
 
-            print(f"\n{'='*60}")
-            try:
-                manifest[video_name] = manifest_entry(source, entry)
-                write_manifest(OUTPUT_MANIFEST, manifest)
+                video_name = entry.stem
+                media_id   = entry.name
 
-                if source.type == "dropbox":
-                    print(f"Downloading: {entry.name}")
+                if reporter:
+                    reporter.begin_video(video_name, idx + 1, total)
+
+                print(f"\n{'='*60}")
+                try:
+                    manifest[video_name] = {**manifest_entry(source, entry), "status": "in_progress"}
+                    write_manifest(paths.manifest, manifest)
+
+                    if source.type == "dropbox":
+                        print(f"Downloading: {entry.name}")
+                        if reporter:
+                            reporter.stage("downloading")
+                    else:
+                        print(f"Reading: {entry.rel_path}")
+
+                    with source.local_copy(entry) as local_path:
+                        if reporter:
+                            reporter.stage("detecting")
+                        track_crops = process_video(
+                            local_path, media_id, video_name, model, tracker,
+                            paths.csv, paths.crops,
+                            tmpdir=tmpdir,
+                            reporter=reporter,
+                        )
+
+                    # ── Batch embedding per track ─────────────────────────────
+                    total_crops = sum(len(v) for v in track_crops.values())
+                    print(f"  Embedding {total_crops} crops across {len(track_crops)} tracks...")
                     if reporter:
-                        reporter.stage("downloading")
-                else:
-                    print(f"Reading: {entry.rel_path}")
+                        reporter.stage("embedding")
+                    track_items  = list(track_crops.items())
+                    n_emb_tracks = len(track_items)
+                    n_embedded   = 0
+                    for emb_i, (tid, crop_paths) in enumerate(track_items):
+                        images = [cv2.imread(p) for p in crop_paths]
+                        images = [img for img in images if img is not None]
+                        if not images:
+                            continue
+                        # All crops for this track embedded in one forward pass
+                        vecs   = get_embeddings_batch(embed_info, images)
+                        mean_v = vecs.mean(axis=0)
+                        mean_v /= (np.linalg.norm(mean_v) + 1e-8)
+                        all_embeddings[f"{video_name}__{tid}"] = mean_v.tolist()
+                        n_embedded += 1
+                        if reporter and n_emb_tracks > 0:
+                            reporter.set_video_pct(2/3 + (emb_i + 1) / n_emb_tracks * (1/3))
 
-                with source.local_copy(entry) as local_path:
+                    write_json_atomic(paths.embeddings, all_embeddings)
+
+                    manifest[video_name].update({
+                        "status":      "complete",
+                        "n_tracks":    n_embedded,
+                        "finished_at": datetime.now().isoformat(timespec="seconds"),
+                        "weights":     weights,
+                    })
+                    write_manifest(paths.manifest, manifest)
+
+                    counter += 1
+                    print(f"✓  {entry.name}  ({n_embedded} tracks, "
+                          f"{len(all_embeddings)} total embeddings so far)")
                     if reporter:
-                        reporter.stage("detecting")
-                    track_crops = process_video(
-                        local_path, media_id, video_name, model, tracker,
-                        OUTPUT_CSV_PATH, OUTPUT_CROPS_DIR,
-                        tmpdir=tmpdir,
-                        reporter=reporter,
-                    )
+                        reporter.video_done(video_name, n_embedded, len(all_embeddings))
 
-                # ── Batch embedding per track ─────────────────────────────────
-                total_crops = sum(len(v) for v in track_crops.values())
-                print(f"  Embedding {total_crops} crops across {len(track_crops)} tracks...")
-                if reporter:
-                    reporter.stage("embedding")
-                track_items  = list(track_crops.items())
-                n_emb_tracks = len(track_items)
-                for emb_i, (tid, crop_paths) in enumerate(track_items):
-                    images = [cv2.imread(p) for p in crop_paths]
-                    images = [img for img in images if img is not None]
-                    if not images:
-                        continue
-                    # All crops for this track embedded in one forward pass
-                    vecs   = get_embeddings_batch(embed_info, images)
-                    mean_v = vecs.mean(axis=0)
-                    mean_v /= (np.linalg.norm(mean_v) + 1e-8)
-                    all_embeddings[f"{video_name}__{tid}"] = mean_v.tolist()
-                    if reporter and n_emb_tracks > 0:
-                        reporter.set_video_pct(2/3 + (emb_i + 1) / n_emb_tracks * (1/3))
+                except Exception as e:
+                    print(f"✗  {entry.name} failed: {e}")
+                    if reporter:
+                        reporter.video_error(video_name, str(e))
+                    try:
+                        manifest[video_name] = {**manifest_entry(source, entry),
+                                                "status": "failed", "error": str(e)}
+                        write_manifest(paths.manifest, manifest)
+                        if purge_video_outputs({video_name}, paths, all_embeddings):
+                            write_json_atomic(paths.embeddings, all_embeddings)
+                    except Exception as cleanup_err:
+                        print(f"  (could not clean up after the failure: {cleanup_err})")
 
-                with open(OUTPUT_EMBEDDINGS, "w") as f:
-                    json.dump(all_embeddings, f)
-
-                last = get_last_processed(OUTPUT_CSV_PATH)
-                if last != entry.name:
-                    with open(OUTPUT_CSV_PATH, "a", newline="") as f:
-                        csv.writer(f).writerow([entry.name, -1] + [None] * 7)
-
-                counter += 1
-                print(f"✓  {entry.name}  ({len(track_crops)} tracks, "
-                      f"{len(all_embeddings)} total embeddings so far)")
-                if reporter:
-                    reporter.video_done(video_name, len(track_crops), len(all_embeddings))
-
-            except Exception as e:
-                print(f"✗  {entry.name} failed: {e}")
-                if reporter:
-                    reporter.video_error(video_name, str(e))
-
-    clean_csv(OUTPUT_CSV_PATH)
     print(f"\nDone! Processed {counter} videos this session.")
-    print(f"  Detections CSV : {OUTPUT_CSV_PATH}")
-    print(f"  Crops folder   : {OUTPUT_CROPS_DIR}/")
-    print(f"  Embeddings JSON: {OUTPUT_EMBEDDINGS}  ({len(all_embeddings)} entries)")
+    print(f"  Detections CSV : {paths.csv}")
+    print(f"  Crops folder   : {paths.crops}/")
+    print(f"  Embeddings JSON: {paths.embeddings}  ({len(all_embeddings)} entries)")
     if reporter:
         reporter.pipeline_done(counter, len(all_embeddings))
 
