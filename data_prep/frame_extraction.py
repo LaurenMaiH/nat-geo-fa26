@@ -690,59 +690,86 @@ def main(argv=None):
     for j in matched:
         by_clip[j["clip"]["path"]].append(j)
     results = {}
-    with tempfile.TemporaryDirectory(prefix="frames_") as tmp:
-        it = by_clip.items()
-        if tqdm:
-            it = tqdm(list(it), desc="clips", unit="clip")
-        for path, js in it:
-            link, link_t, local, streaming = None, 0.0, None, not args.download
-            for j in js:
-                p = out_path(j)
-                p.parent.mkdir(parents=True, exist_ok=True)
-                if p.exists() and p.stat().st_size > 0:
-                    results[id(j)] = (p, "exists", "", "")
+    current = [None]
+    # manifest (written on finish, Ctrl+C, or crash, so partial runs are usable)
+    def write_manifest():
+        with open(out / "frames_manifest.csv", "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["frame_path", "status", "row", "deployment", "observationTimestamp", "target_time_utc",
+                        "offset_s", "clip", "time_source", "offset_in_clip_s", "dark_nudge_s", "brightness"]
+                       + LINEAGE_COLS)
+            for j in jobs:
+                if j["status"] != "matched":
                     continue
-                ok, err, nudge, bright = False, "", 0.0, None
-                if streaming:
-                    for attempt in range(3):  # retry blips with a fresh link before a full download
-                        if link is None or attempt > 0 or time.time() - link_t > 3 * 3600:
-                            link = with_retries(lambda: dbx.files_get_temporary_link(path).link)
-                            link_t = time.time()
-                        ok, err, nudge, bright = extract_lit(ffmpeg, link, j["off"], j["clip"]["dur"], p,
-                                                             args.max_width, dark)
-                        if ok:
-                            break
-                        time.sleep(5 * (attempt + 1))
-                    if not ok:
-                        streaming = False
-                        print(f"\n  streaming failed for {j['clip']['clip']} ({err}); downloading the clip instead")
-                if not ok:
-                    if local is None:
-                        local = Path(tmp) / PurePosixPath(path).name
-                        with_retries(lambda: dbx.files_download_to_file(str(local), path))
-                    ok, err, nudge, bright = extract_lit(ffmpeg, str(local), j["off"], j["clip"]["dur"], p,
-                                                         args.max_width, dark)
-                status = "failed: " + err if not ok else "ok_dark" if bright is not None and bright < dark else "ok"
-                results[id(j)] = (p, status, f"{nudge:g}" if ok else "",
-                                  f"{bright:.0f}" if bright is not None else "")
-            if local is not None:
-                local.unlink(missing_ok=True)
+                res = results.get(id(j))
+                if res is None:  # not reached this run: still list it if an earlier run wrote it
+                    p0 = out_path(j)
+                    res = (p0, "exists", "", "") if p0.exists() and p0.stat().st_size > 0 else ("", "not_run", "", "")
+                p, st, nudge, bright = res
+                src = j["src"]
+                w.writerow([str(p), st, j["row"], j["dep"], src.get("observationTimestamp", ""),
+                            j["t"].strftime("%Y-%m-%d %H:%M:%S"), j["offset_s"], j["clip"]["clip"],
+                            j["clip"]["source"], f"{j['off']:.2f}", nudge, bright]
+                           + [src.get(c, "") for c in LINEAGE_COLS])
 
-    # manifest
-    with open(out / "frames_manifest.csv", "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["frame_path", "status", "row", "deployment", "observationTimestamp", "target_time_utc",
-                    "offset_s", "clip", "time_source", "offset_in_clip_s", "dark_nudge_s", "brightness"]
-                   + LINEAGE_COLS)
-        for j in jobs:
-            if j["status"] != "matched":
-                continue
-            p, st, nudge, bright = results.get(id(j), ("", "not_run", "", ""))
-            src = j["src"]
-            w.writerow([str(p), st, j["row"], j["dep"], src.get("observationTimestamp", ""),
-                        j["t"].strftime("%Y-%m-%d %H:%M:%S"), j["offset_s"], j["clip"]["clip"],
-                        j["clip"]["source"], f"{j['off']:.2f}", nudge, bright]
-                       + [src.get(c, "") for c in LINEAGE_COLS])
+    def drop_partial():
+        # a frame interrupted mid-write (or mid dark-nudge) must not be mistaken for a finished one
+        if current[0] and id(current[0][0]) not in results:
+            current[0][1].unlink(missing_ok=True)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="frames_") as tmp:
+            it = by_clip.items()
+            if tqdm:
+                it = tqdm(list(it), desc="clips", unit="clip")
+            for path, js in it:
+                link, link_t, local, streaming = None, 0.0, None, not args.download
+                for j in js:
+                    p = out_path(j)
+                    current[0] = (j, p)
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    if p.exists() and p.stat().st_size > 0:
+                        results[id(j)] = (p, "exists", "", "")
+                        continue
+                    ok, err, nudge, bright = False, "", 0.0, None
+                    if streaming:
+                        for attempt in range(3):  # retry blips with a fresh link before a full download
+                            if link is None or attempt > 0 or time.time() - link_t > 3 * 3600:
+                                link = with_retries(lambda: dbx.files_get_temporary_link(path).link)
+                                link_t = time.time()
+                            ok, err, nudge, bright = extract_lit(ffmpeg, link, j["off"], j["clip"]["dur"], p,
+                                                                 args.max_width, dark)
+                            if ok:
+                                break
+                            time.sleep(5 * (attempt + 1))
+                        if not ok:
+                            streaming = False
+                            print(f"\n  streaming failed for {j['clip']['clip']} ({err}); downloading the clip instead")
+                    if not ok:
+                        if local is None:
+                            local = Path(tmp) / PurePosixPath(path).name
+                            with_retries(lambda: dbx.files_download_to_file(str(local), path))
+                        ok, err, nudge, bright = extract_lit(ffmpeg, str(local), j["off"], j["clip"]["dur"], p,
+                                                             args.max_width, dark)
+                    status = "failed: " + err if not ok else "ok_dark" if bright is not None and bright < dark else "ok"
+                    results[id(j)] = (p, status, f"{nudge:g}" if ok else "",
+                                      f"{bright:.0f}" if bright is not None else "")
+                if local is not None:
+                    local.unlink(missing_ok=True)
+
+    except KeyboardInterrupt:
+        drop_partial()
+        write_manifest()
+        done = sum(1 for r in results.values() if r[1] in ("ok", "ok_dark", "exists"))
+        print(f"\nStopped after {done} frame(s) this run. Manifest written: {out / 'frames_manifest.csv'} "
+              f"(every frame on disk is listed; rows not done yet show status not_run). "
+              f"Run the same command again to continue.")
+        return jobs
+    except BaseException:
+        drop_partial()
+        write_manifest()
+        raise
+    write_manifest()
     vals = list(results.values())
     ok_n = sum(1 for r in vals if r[1] in ("ok", "ok_dark", "exists"))
     nudged = sum(1 for r in vals if r[2] not in ("", "0"))
