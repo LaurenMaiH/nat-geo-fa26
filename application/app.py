@@ -19,11 +19,19 @@ from video_sources import (
     DropboxSource, Video, check_stem_collisions, completed_videos, connect_dropbox,
     load_manifest, local_video_root, make_source, source_config, video_stem,
 )
+from classifier import load_classifier, suggest_for_tracks
 
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).parent.parent  # nat-geo/ (clustering-ui lives inside nat-geo/)
 load_dotenv(BASE_DIR / ".env")
+
+# Logistic regression on BioCLIP embeddings that suggests a family/genus per cluster
+# (train_cluster_classifier.py). Optional: without the file the app just shows no suggestions.
+CLUSTER_CLASSIFIER_PATH = Path(os.environ.get(
+    "CLUSTER_CLASSIFIER_PATH", BASE_DIR / "checkpoints" / "cluster_classifier.json"))
+CLUSTER_CLASSIFIER_DRIVE_ID = os.environ.get("CLUSTER_CLASSIFIER_DRIVE_ID")  # Google Drive file id, optional
+BIOCLIP_CHECKPOINT_PATH = BASE_DIR / "checkpoints" / "best.pt"
 
 # Deployment and mission ids become folder names under processed_missions/
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -265,6 +273,7 @@ def load_state():
         "seed_video": None,
         "hdbscan_params": {"min_cluster_size": 2, "min_samples": 1},
         "cosine_threshold": 0.25,
+        "classifier_min_prob": None,   # None: use the classifier's own default
         "videos": {},
         "clusters": {
             "noise": {
@@ -328,6 +337,41 @@ def prune_empty_clusters(state):
                 state["track_assignments"][k] = "noise"
                 if k not in state["clusters"]["noise"]["track_keys"]:
                     state["clusters"]["noise"]["track_keys"].append(k)
+
+
+# ── Name suggestions (logistic regression on embeddings) ──────────────────────
+
+def get_cluster_classifier():
+    """The cached classifier bundle, or None. Downloads it once if a Drive id is configured."""
+    if not CLUSTER_CLASSIFIER_PATH.exists() and CLUSTER_CLASSIFIER_DRIVE_ID:
+        try:
+            import gdown
+            CLUSTER_CLASSIFIER_PATH.parent.mkdir(parents=True, exist_ok=True)
+            gdown.download(id=CLUSTER_CLASSIFIER_DRIVE_ID, output=str(CLUSTER_CLASSIFIER_PATH), quiet=True)
+        except Exception as e:
+            print(f"Cluster classifier download failed ({type(e).__name__}: {e})")
+    return load_classifier(CLUSTER_CLASSIFIER_PATH, BIOCLIP_CHECKPOINT_PATH)
+
+
+def refresh_suggestions(state, emb_dict, cids=None):
+    """
+    Recompute the suggested name for the given clusters (all when cids is None).
+    Called after clustering and after every edit that changes a cluster's tracks.
+    Never touches the cluster's name or membership.
+    """
+    bundle = get_cluster_classifier()
+    if cids is None:
+        cids = list(state["clusters"])
+    for cid in cids:
+        cluster = state["clusters"].get(cid)
+        if cid == "noise" or cluster is None:
+            continue
+        suggestion = suggest_for_tracks(
+            cluster.get("track_keys", []), emb_dict, bundle, state.get("classifier_min_prob"))
+        if suggestion is None:
+            cluster.pop("suggestion", None)
+        else:
+            cluster["suggestion"] = suggestion
 
 
 def _load_mission_manifest(deployment_id, mission_id) -> dict:
@@ -860,11 +904,13 @@ def api_initialize():
         "seed_video":     seed_video,
         "hdbscan_params": {"min_cluster_size": min_cluster_size, "min_samples": min_samples},
         "cosine_threshold": cosine_threshold,
+        "classifier_min_prob": body.get("classifier_min_prob"),
         "videos":         videos,
         "clusters":       clusters,
         "track_assignments": assignments,
         "current_video":  current_video,
     }
+    refresh_suggestions(state, emb_dict)
     save_state(state)
     return jsonify(state)
 
@@ -968,6 +1014,7 @@ def api_process_video():
         )
 
     prune_empty_clusters(state)
+    refresh_suggestions(state, emb_dict, affected_cids)
 
     track_count = len(track_keys)
     state["videos"][video_name] = {
@@ -1018,6 +1065,7 @@ def api_reassign():
             state["videos"][video_name]["status"] = "processed"
 
     prune_empty_clusters(state)
+    refresh_suggestions(state, emb_dict, affected)
     save_state(state)
     return jsonify(state)
 
@@ -1123,6 +1171,7 @@ def api_new_cluster():
         state["videos"][video_name]["status"] = "processed"
 
     prune_empty_clusters(state)
+    refresh_suggestions(state, emb_dict, [old_cid, new_cid])
     save_state(state)
     return jsonify(state)
 
@@ -1161,6 +1210,7 @@ def api_trash_add():
         )
 
     prune_empty_clusters(state)
+    refresh_suggestions(state, emb_dict, affected)
     save_state(state)
     return jsonify(state)
 
@@ -1197,6 +1247,29 @@ def api_trash_restore():
             cluster["track_keys"], cluster["centroid"], emb_dict
         )
 
+    refresh_suggestions(state, emb_dict, affected)
+    save_state(state)
+    return jsonify(state)
+
+
+@app.route("/api/suggestions/refresh", methods=["POST"])
+def api_suggestions_refresh():
+    """Recompute every cluster's suggested name, optionally with a new confidence cutoff
+    (body: {"min_prob": 0.6}, or null for the classifier's default). Also fills in
+    suggestions for a state.json made before the classifier existed."""
+    body = request.get_json(silent=True) or {}
+    state = load_state()
+    if "min_prob" in body:
+        mp = body["min_prob"]
+        if mp is not None:
+            try:
+                mp = float(mp)
+            except (TypeError, ValueError):
+                return jsonify({"error": "min_prob must be a number between 0 and 1"}), 400
+            if not 0 <= mp <= 1:
+                return jsonify({"error": "min_prob must be a number between 0 and 1"}), 400
+        state["classifier_min_prob"] = mp
+    refresh_suggestions(state, load_embeddings())
     save_state(state)
     return jsonify(state)
 
@@ -1294,6 +1367,17 @@ def _csv_response(header, rows, filename):
     )
 
 
+SUGGESTION_COLUMNS = ["suggested_label", "suggested_level", "suggested_prob", "suggested_family"]
+
+
+def suggestion_columns(cluster):
+    """The cluster's suggested name as export columns (blank when there's none)."""
+    s = (cluster or {}).get("suggestion")
+    if not s:
+        return ["", "", "", ""]
+    return [s["label"], s["level"] or "", "" if s["prob"] is None else s["prob"], s.get("family_name") or ""]
+
+
 @app.route("/api/export/tracks.csv")
 def api_export_tracks_csv():
     state = load_state()
@@ -1335,12 +1419,14 @@ def api_export_tracks_csv():
             _review_mission_id, video, tid, status, cid, cname,
             n_det, first, last, duration, top_class, max_conf, mean_conf,
             state.get("videos", {}).get(video, {}).get("status", ""),
+            *suggestion_columns(None if status == "trash" else state["clusters"].get(cid)),
         ])
 
     return _csv_response(
         ["mission_id", "video", "track_id", "status", "cluster_id", "cluster_name",
          "n_detections", "first_frame", "last_frame", "duration_frames",
-         "top_class", "max_confidence", "mean_confidence", "video_status"],
+         "top_class", "max_confidence", "mean_confidence", "video_status",
+         *SUGGESTION_COLUMNS],
         rows,
         f"{_review_mission_id}_tracks_{datetime.now().strftime('%Y%m%d')}.csv",
     )
@@ -1389,7 +1475,8 @@ def api_export_summary_csv():
         entry = per[(video, cid)]
         cname = clusters.get(cid, {}).get("name", cid)
         rows.append([_review_mission_id, video, cid, cname,
-                     entry["n_tracks"], entry["n_detections"], entry["max_n"]])
+                     entry["n_tracks"], entry["n_detections"], entry["max_n"],
+                     *suggestion_columns(clusters.get(cid))])
         t = totals[cid]
         t["n_tracks"]     += entry["n_tracks"]
         t["n_detections"] += entry["n_detections"]
@@ -1397,17 +1484,18 @@ def api_export_summary_csv():
 
     # One row per clip with no tracks, so it isn't missing from the survey
     for video in zero_track_videos(state, load_embeddings()):
-        rows.append([_review_mission_id, video, "none", "", 0, 0, 0])
+        rows.append([_review_mission_id, video, "none", "", 0, 0, 0, *suggestion_columns(None)])
     rows.sort(key=lambda r: r[1])   # stable: keeps the cluster order within a video
 
     for cid in sorted(totals, key=lambda c: (c == "noise", c)):
         t = totals[cid]
         rows.append([_review_mission_id, "ALL", cid, clusters.get(cid, {}).get("name", cid),
-                     t["n_tracks"], t["n_detections"], t["max_n"]])
+                     t["n_tracks"], t["n_detections"], t["max_n"],
+                     *suggestion_columns(clusters.get(cid))])
 
     return _csv_response(
         ["mission_id", "video", "cluster_id", "cluster_name",
-         "n_tracks", "n_detections", "max_n"],
+         "n_tracks", "n_detections", "max_n", *SUGGESTION_COLUMNS],
         rows,
         f"{_review_mission_id}_summary_{datetime.now().strftime('%Y%m%d')}.csv",
     )

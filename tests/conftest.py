@@ -44,6 +44,9 @@ def app_env(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "DETECTIONS_CACHE", {})
     monkeypatch.setattr(app_module, "_proxy_status", {})
     monkeypatch.setitem(app_module._pipeline_state, "running", False)
+    # No name-suggestion classifier unless a test sets one up (a real one in checkpoints/ is ignored)
+    monkeypatch.setattr(app_module, "CLUSTER_CLASSIFIER_PATH", tmp_path / "no_classifier.json")
+    monkeypatch.setattr(app_module, "CLUSTER_CLASSIFIER_DRIVE_ID", None)
     app_module.app.config["TESTING"] = True
 
     def make_mission(deployment_id, mission_id, embeddings=None, csv_text=None, manifest=None,

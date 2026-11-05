@@ -276,6 +276,7 @@ In the **Cluster Review** tab, once a mission is initialized, two buttons in the
 | `top_class` | Most common raw detector label for this track (e.g. "fish") |
 | `max_confidence`, `mean_confidence` | Detector confidence for this track |
 | `video_status` | Review status of the video (`pending` / `processed` / `approved`) |
+| `suggested_label`, `suggested_level`, `suggested_prob`, `suggested_family` | The model's suggested name for the track's cluster and that name's family (see [Name suggestions](#name-suggestions)); blank if there's no classifier or the track is trashed |
 
 **Export summary** — one row per video × cluster, plus mission-wide totals as `video=ALL`:
 
@@ -285,6 +286,34 @@ In the **Cluster Review** tab, once a mission is initialized, two buttons in the
 | `n_tracks` | Number of tracks in this cluster for this video (or mission-wide, for `ALL` rows) |
 | `n_detections` | Total detections across those tracks |
 | `max_n` | **MaxN** — the peak number of individuals from this cluster seen simultaneously in a single frame. This is the standard abundance metric used in baited/remote underwater video (BRUV) surveys. |
+| `suggested_label`, `suggested_level`, `suggested_prob`, `suggested_family` | The cluster's suggested name, as above |
+
+## Name suggestions
+
+After clustering, each cluster can show a **suggested genus or family**: on its card ("*Heterocarpus* 91% / Pandalidae [Accept]"), next to its row in the crop strip, and with the top 3 when you open the cluster. Hover over it for the top 3 anywhere.
+
+Two logistic regressions (one for genus, one for family), trained on the team's labeled crops, make the suggestion from the cluster's BioCLIP embeddings: each track is classified and the probabilities are averaged. The first of these that reaches the cutoff (default 0.7) is shown, otherwise "No confident match":
+
+1. the top **genus**, with its family taken from the taxonomy (so a genus and its family never contradict each other);
+2. the top **family when the genus probabilities are added up per family** (*Plesionika* 0.4 + *Heterocarpus* 0.3 → Pandalidae 0.7);
+3. the top family from the **family model**, which covers families that were never labeled to genus. It goes first instead when it's sure about such a family and surer than the genus model, because the genus model can only answer with genera it knows.
+
+**It never changes anything on its own.** Clusters and names stay as they are until a reviewer clicks **Accept**, which just renames the cluster. Suggestions update whenever tracks are moved, split off, trashed or restored.
+
+**Setting it up:** the app looks for `checkpoints/cluster_classifier.json` (in Docker: `model_cache/checkpoints/`). Without it the app works as before, just without suggestions. To make the file:
+
+1. Embed the labeled crops with the fine-tuned BioCLIP (the `labeled_crops_eval` Colab notebook, cells 0–4), which writes `image_labels.csv` and `images_embeddings.json`.
+2. Run
+   ```bash
+   python train_cluster_classifier.py --labels .../image_labels.csv \
+       --embeddings .../images_embeddings.json --checkpoint checkpoints/best.pt
+   ```
+   It prints leave-one-mission-out accuracy and how accuracy changes with the cutoff, then saves the file.
+3. Optional: put the file on Google Drive and set `CLUSTER_CLASSIFIER_DRIVE_ID` in `.env` so the app downloads it. `CLUSTER_CLASSIFIER_PATH` points it somewhere else.
+
+To change the cutoff for a mission: `POST /api/suggestions/refresh` with `{"min_prob": 0.7}` (this also adds suggestions to a mission clustered before the classifier existed).
+
+**Caveats:** it only knows the ~37 families/genera with 5+ labeled crops, so rare animals get "unknown" or a wrong guess. The training crops were hand-placed boxes, not YOLO crops, so expect it to do somewhat worse here than in the notebook (about 0.66 family / 0.59 genus accuracy on a mission it never saw, 83–91% top-3). Retrain whenever `best.pt` changes; the app logs a warning if the checkpoint no longer matches.
 
 ## Troubleshooting
 

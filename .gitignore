@@ -251,3 +251,6 @@ processed_missions/**/*_embeddings.json
 data_prep/sheets/
 data_prep/output/
 data_prep/cache/
+
+# Model files: fine-tuned BioCLIP (best.pt) and the cluster name classifier (train_cluster_classifier.py)
+checkpoints/

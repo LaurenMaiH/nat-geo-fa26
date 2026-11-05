@@ -185,10 +185,11 @@ def test_summary_export_has_none_rows_for_zero_track_clips(app_env):
     c = app_env.client
     c.post("/api/initialize", json={"seed_video": "v1"})
     header, *rows = _csv_rows(c.get("/api/export/summary.csv"))
-    assert header == ["mission_id", "video", "cluster_id", "cluster_name", "n_tracks", "n_detections", "max_n"]
+    assert header == ["mission_id", "video", "cluster_id", "cluster_name", "n_tracks", "n_detections", "max_n",
+                      "suggested_label", "suggested_level", "suggested_prob", "suggested_family"]
     per_video = [r for r in rows if r[1] != "ALL"]
-    assert ["M1", "v0", "none", "", "0", "0", "0"] in per_video
-    assert ["M1", "v2", "none", "", "0", "0", "0"] in per_video
+    assert ["M1", "v0", "none", "", "0", "0", "0", "", "", "", ""] in per_video
+    assert ["M1", "v2", "none", "", "0", "0", "0", "", "", "", ""] in per_video
     assert [r[1] for r in per_video] == sorted(r[1] for r in per_video)
     v1 = [r for r in per_video if r[1] == "v1"]
     assert sum(int(r[4]) for r in v1) == 2 and sum(int(r[5]) for r in v1) == 6
@@ -202,7 +203,7 @@ def test_summary_export_none_row_when_all_tracks_trashed(app_env):
     c.post("/api/initialize", json={"seed_video": "v1"})
     c.post("/api/trash/add", json={"track_keys": ["v1__1", "v1__2"]})
     rows = _csv_rows(c.get("/api/export/summary.csv"))[1:]
-    assert ["M1", "v1", "none", "", "0", "0", "0"] in rows
+    assert ["M1", "v1", "none", "", "0", "0", "0", "", "", "", ""] in rows
 
 
 def test_mission_without_manifest_lists_embeddings_only(app_env):

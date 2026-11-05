@@ -479,7 +479,7 @@
 
     // ── ClusterRow ────────────────────────────────────────────────────────────
 
-    function ClusterRow({ cluster, tracks, onContextMenu, onDrop, selectedKeys, onSelect }) {
+    function ClusterRow({ cluster, tracks, onContextMenu, onDrop, selectedKeys, onSelect, onRename }) {
       const [over, setOver] = useState(false);
       const [expanded, setExpanded] = useState(false);
       const initialized = useRef(false);
@@ -521,6 +521,7 @@
             <div className="w-2 h-2 rounded-full flex-shrink-0" style={{backgroundColor: cluster.color}} />
             <span className="text-[13px] font-semibold" style={{color: 'var(--text-secondary)'}}>{cluster.name}</span>
             <span className="font-mono text-[11px]" style={{color: 'var(--text-faint)'}}>{tracks.length}</span>
+            {onRename && <SuggestionChip cluster={cluster} onRename={onRename} variant="inline" />}
           </div>
           {expanded && (
             <div
@@ -609,6 +610,73 @@
       );
     }
 
+    // ── SuggestionChip ────────────────────────────────────────────────────────
+    // Family/genus suggested by the logistic regression on the cluster's embeddings.
+    // Accept just renames the cluster; nothing changes until the reviewer clicks it.
+    // variant: 'card' (two short lines, fits the 148px grid cards), 'inline' (crop-strip
+    // row header), 'detailed' (cluster modal, with the top-3 lists).
+
+    function SuggestionChip({ cluster, onRename, variant = 'card' }) {
+      const s = cluster.suggestion;
+      if (!s) return null;
+      const pct = p => `${Math.round(p * 100)}%`;
+      const levels = ['genus', 'family'].filter(l => s[l]);
+      const top3 = levels.map(l => `${l}: ` + s[l].map(([n, p]) => `${n} ${pct(p)}`).join(', ')).join('\n');
+      const tip = `Suggested by the model from this cluster's ${s.n_tracks} track(s)\n${top3}`;
+      const unknown = s.label === 'unknown';
+      const accepted = !unknown && cluster.name === s.label;
+      const sub = s.level === 'genus' && s.family_name ? s.family_name : s.level;
+      const stop = e => e.stopPropagation();
+      const accept = e => { e.stopPropagation(); onRename(cluster.id, s.label); };
+      const acceptBtn = (
+        <button className="btn-ghost flex-shrink-0" style={{padding: '0 6px', fontSize: 10, lineHeight: '16px'}}
+          onClick={accept} title={`Rename this cluster to "${s.label}"`}>Accept</button>
+      );
+      const done = <span className="flex-shrink-0 text-[10px]" style={{color: 'var(--text-faint)'}} title="Name matches the suggestion">✓</span>;
+
+      if (variant === 'inline') {
+        if (unknown) return null;   // keep the strip quiet; the card says "no confident match"
+        return (
+          <span className="flex items-center gap-1.5 min-w-0 text-[11px] ml-2" title={tip} onClick={stop}>
+            <span style={{color: 'var(--text-faint)'}}>→</span>
+            <span className="font-semibold truncate" style={{color: 'var(--accent)'}}>{s.label}</span>
+            <span className="font-mono flex-shrink-0" style={{color: 'var(--text-muted)'}}>{pct(s.prob)}</span>
+            {accepted ? done : acceptBtn}
+          </span>
+        );
+      }
+
+      if (unknown) {
+        return (
+          <div className="mb-2 text-[11px] truncate" style={{color: 'var(--text-faint)'}} title={tip} onClick={stop}>
+            No confident match
+          </div>
+        );
+      }
+
+      return (
+        <div className="mb-2 min-w-0" title={tip} onClick={stop}>
+          <div className="flex items-baseline gap-1.5 min-w-0">
+            <span className={`font-semibold truncate ${variant === 'detailed' ? 'text-[13px]' : 'text-[11px]'}`}
+              style={{color: 'var(--accent)'}}>{s.label}</span>
+            <span className="font-mono text-[10px] flex-shrink-0" style={{color: 'var(--text-muted)'}}>{pct(s.prob)}</span>
+          </div>
+          <div className="flex items-center gap-1.5 min-w-0 mt-0.5">
+            <span className="text-[10px] truncate" style={{color: 'var(--text-faint)'}}>
+              {variant === 'detailed' ? `suggested · ${sub}` : sub}
+            </span>
+            <span className="ml-auto flex-shrink-0">{accepted ? done : acceptBtn}</span>
+          </div>
+          {variant === 'detailed' && levels.map(l => (
+            <div key={l} className="font-mono text-[11px] mt-1" style={{color: 'var(--text-muted)'}}>
+              <span style={{color: 'var(--text-faint)'}}>{l} top 3:</span>{' '}
+              {s[l].map(([n, p]) => `${n} ${pct(p)}`).join(' · ')}
+            </div>
+          ))}
+        </div>
+      );
+    }
+
     // ── ClusterCard ───────────────────────────────────────────────────────────
 
     function ClusterCard({ cluster, onClick, onDrop, onRename }) {
@@ -664,6 +732,7 @@
             )}
             <span className="ml-auto font-mono text-[10px] flex-shrink-0 px-1.5 py-0.5 rounded-full" style={{backgroundColor: 'var(--bg-surface-3)', color: 'var(--text-faint)'}}>{cluster.track_keys.length}</span>
           </div>
+          <SuggestionChip cluster={cluster} onRename={onRename} />
           {cluster.representative && (
             <img
               src={cropUrl(cluster.representative)}
@@ -681,6 +750,7 @@
 
     function ClusterModal({ cluster, onClose, onDrop, onRename, onContextMenu, dimmed, selectedKeys, onSelect }) {
       const [name, setName] = useState(cluster.name);
+      useEffect(() => { setName(cluster.name); }, [cluster.name]);   // e.g. after accepting a suggestion
 
       const submitRename = () => { if (name !== cluster.name) onRename(cluster.id, name); };
 
@@ -722,6 +792,7 @@
                 <Icons.X size={16}/>
               </button>
             </div>
+            <SuggestionChip cluster={cluster} onRename={onRename} variant="detailed" />
             {videoNames.map(videoName => (
               <div key={videoName} className="mb-5">
                 <div className="font-mono text-[11px] font-semibold mb-2 pb-1 border-b truncate" style={{color: 'var(--text-muted)', borderColor: C.border}}>
@@ -2409,7 +2480,7 @@
                         <ClusterRow key={`${video}-${c.id}`} cluster={c}
                           tracks={tracks.filter(t => t.cluster_id === c.id)}
                           onContextMenu={openContextMenu} onDrop={handleReassign}
-                          selectedKeys={selectedKeys} onSelect={handleSelect} />
+                          selectedKeys={selectedKeys} onSelect={handleSelect} onRename={handleRename} />
                       );
                       return [
                         ...real.map(row),
