@@ -36,6 +36,16 @@ from classifier import checkpoint_fingerprint, load_classifier, _predict_proba  
 from classifier_training import find_key_col, train_bundle  # noqa: E402
 
 
+
+def _display_path(path):
+    """Path relative to the repo when inside it, else just the file name (no local user paths in the bundle)."""
+    path = Path(path).resolve()
+    try:
+        return str(path.relative_to(Path(__file__).resolve().parent))
+    except ValueError:
+        return path.name
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--labels", required=True, help="image_labels.csv from embed_csv_images.py")
@@ -63,7 +73,7 @@ def main():
     dim = len(next(iter(emb.values())))
     print(f"{len(labels)} labeled embeddings, dim {dim}")
 
-    trained_on = str(Path(args.labels).resolve())
+    trained_on = _display_path(args.labels)
     if args.feedback_dir:
         import feedback
 
@@ -78,7 +88,7 @@ def main():
         if rows:
             labels = pd.concat([labels, pd.DataFrame(rows)], ignore_index=True)
             emb = {**emb, **fb_emb}
-            trained_on += f" + {fb_dir.resolve()}"
+            trained_on += f" + {_display_path(fb_dir)}"
 
     bundle, checks = train_bundle(
         labels, emb, levels=[l.strip() for l in args.levels.split(",") if l.strip()],

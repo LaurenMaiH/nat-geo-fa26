@@ -253,6 +253,9 @@ data_prep/output/
 data_prep/cache/
 
 # Model files: fine-tuned BioCLIP (best.pt), retrained classifiers, reviewer feedback, training data.
-# The base cluster name classifier (train_cluster_classifier.py) is small and committed.
+# The base cluster name classifier and its training data (labeled_crops/, needed to retrain
+# from reviewers' names) are small and committed.
 checkpoints/*
 !checkpoints/cluster_classifier.json
+!checkpoints/labeled_crops/
+!checkpoints/labeled_crops/image_labels.csv
