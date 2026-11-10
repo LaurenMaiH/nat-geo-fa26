@@ -47,6 +47,10 @@ def app_env(tmp_path, monkeypatch):
     # No name-suggestion classifier unless a test sets one up (a real one in checkpoints/ is ignored)
     monkeypatch.setattr(app_module, "CLUSTER_CLASSIFIER_PATH", tmp_path / "no_classifier.json")
     monkeypatch.setattr(app_module, "CLUSTER_CLASSIFIER_DRIVE_ID", None)
+    # Retraining only runs when a test calls run_once(); no background threads, no WoRMS
+    monkeypatch.setattr(app_module, "_retrainer", app_module.Retrainer(app_module._retrain_config, auto=False))
+    monkeypatch.setattr(app_module, "CLASSIFIER_BASE_LABELS", None)
+    monkeypatch.setattr(app_module, "CLASSIFIER_BASE_EMBEDDINGS", None)
     app_module.app.config["TESTING"] = True
 
     def make_mission(deployment_id, mission_id, embeddings=None, csv_text=None, manifest=None,

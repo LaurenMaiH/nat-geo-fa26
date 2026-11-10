@@ -31,6 +31,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY application/ ./application/
 COPY overnight_pipeline_optimized.py .
+COPY worms_taxonomy.py .
 COPY bytetrack_custom.yaml .
 
 EXPOSE 5000

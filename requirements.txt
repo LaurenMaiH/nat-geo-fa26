@@ -22,3 +22,4 @@ Pillow
 flask
 python-dotenv
 dropbox
+requests  # WoRMS lookups for reviewer-named clusters (application/feedback.py)

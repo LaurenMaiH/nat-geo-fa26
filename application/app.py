@@ -19,7 +19,8 @@ from video_sources import (
     DropboxSource, Video, check_stem_collisions, completed_videos, connect_dropbox,
     load_manifest, local_video_root, make_source, source_config, video_stem,
 )
-from classifier import load_classifier, suggest_for_tracks
+from classifier import _cache as _classifier_cache, load_classifier, suggest_for_tracks
+from feedback import Retrainer, sync_feedback
 
 app = Flask(__name__)
 
@@ -32,6 +33,11 @@ CLUSTER_CLASSIFIER_PATH = Path(os.environ.get(
     "CLUSTER_CLASSIFIER_PATH", BASE_DIR / "checkpoints" / "cluster_classifier.json"))
 CLUSTER_CLASSIFIER_DRIVE_ID = os.environ.get("CLUSTER_CLASSIFIER_DRIVE_ID")  # Google Drive file id, optional
 BIOCLIP_CHECKPOINT_PATH = BASE_DIR / "checkpoints" / "best.pt"
+# Names reviewers give clusters are training data (feedback.py). The model retrains on the base
+# labeled crops + those names and is saved next to the base model as *.retrained.json.
+# Base data defaults to checkpoints/labeled_crops/ (files from embed_csv_images.py).
+CLASSIFIER_BASE_LABELS = os.environ.get("CLASSIFIER_BASE_LABELS")
+CLASSIFIER_BASE_EMBEDDINGS = os.environ.get("CLASSIFIER_BASE_EMBEDDINGS")
 
 # Deployment and mission ids become folder names under processed_missions/
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -350,7 +356,48 @@ def get_cluster_classifier():
             gdown.download(id=CLUSTER_CLASSIFIER_DRIVE_ID, output=str(CLUSTER_CLASSIFIER_PATH), quiet=True)
         except Exception as e:
             print(f"Cluster classifier download failed ({type(e).__name__}: {e})")
+    retrained = _retrain_config()["retrained_model"]
+    if retrained.exists():
+        bundle = load_classifier(retrained, BIOCLIP_CHECKPOINT_PATH)
+        if bundle is not None:
+            return bundle
     return load_classifier(CLUSTER_CLASSIFIER_PATH, BIOCLIP_CHECKPOINT_PATH)
+
+
+def _retrain_config():
+    """Paths for the retrainer, read at run time (tests point CLUSTER_CLASSIFIER_PATH elsewhere)."""
+    d = CLUSTER_CLASSIFIER_PATH.parent
+    return {
+        "base_model": CLUSTER_CLASSIFIER_PATH,
+        "retrained_model": CLUSTER_CLASSIFIER_PATH.with_name(CLUSTER_CLASSIFIER_PATH.stem + ".retrained.json"),
+        "feedback_dir": d / "feedback",
+        "base_labels": Path(CLASSIFIER_BASE_LABELS or d / "labeled_crops" / "image_labels.csv"),
+        "base_embeddings": Path(CLASSIFIER_BASE_EMBEDDINGS or d / "labeled_crops" / "images_embeddings.json"),
+        "worms_cache": d / "worms_cache.json",
+    }
+
+
+_retrainer = Retrainer(_retrain_config)
+
+
+def _feedback_path(deployment_id=None, mission_id=None):
+    dep, mission = deployment_id or _current_deployment_id, mission_id or _review_mission_id
+    if not dep or not mission:
+        return None
+    return _retrain_config()["feedback_dir"] / f"{dep}__{mission}.json"
+
+
+def record_training_labels(state, emb_dict):
+    """
+    Snapshot the mission's named clusters as training examples and retrain in the
+    background if anything changed. Called after every edit that can change a
+    named cluster's tracks or name.
+    """
+    path = _feedback_path()
+    if path is None:
+        return
+    if sync_feedback(state, emb_dict, path, _current_deployment_id, _review_mission_id):
+        _retrainer.schedule()
 
 
 def refresh_suggestions(state, emb_dict, cids=None):
@@ -911,6 +958,7 @@ def api_initialize():
         "current_video":  current_video,
     }
     refresh_suggestions(state, emb_dict)
+    record_training_labels(state, emb_dict)
     save_state(state)
     return jsonify(state)
 
@@ -1015,6 +1063,7 @@ def api_process_video():
 
     prune_empty_clusters(state)
     refresh_suggestions(state, emb_dict, affected_cids)
+    record_training_labels(state, emb_dict)
 
     track_count = len(track_keys)
     state["videos"][video_name] = {
@@ -1066,6 +1115,7 @@ def api_reassign():
 
     prune_empty_clusters(state)
     refresh_suggestions(state, emb_dict, affected)
+    record_training_labels(state, emb_dict)
     save_state(state)
     return jsonify(state)
 
@@ -1127,7 +1177,11 @@ def api_rename():
     state = load_state()
     cid = body["cluster_id"]
     if cid in state["clusters"]:
-        state["clusters"][cid]["name"] = body["name"]
+        cluster = state["clusters"][cid]
+        cluster["name"] = body["name"]
+        # The name becomes training data for the suggestion model (feedback.py)
+        cluster["name_via"] = "accept" if body.get("via") == "accept" else "rename"
+        record_training_labels(state, load_embeddings())
     save_state(state)
     return jsonify(state)
 
@@ -1172,6 +1226,7 @@ def api_new_cluster():
 
     prune_empty_clusters(state)
     refresh_suggestions(state, emb_dict, [old_cid, new_cid])
+    record_training_labels(state, emb_dict)
     save_state(state)
     return jsonify(state)
 
@@ -1211,6 +1266,7 @@ def api_trash_add():
 
     prune_empty_clusters(state)
     refresh_suggestions(state, emb_dict, affected)
+    record_training_labels(state, emb_dict)
     save_state(state)
     return jsonify(state)
 
@@ -1248,6 +1304,7 @@ def api_trash_restore():
         )
 
     refresh_suggestions(state, emb_dict, affected)
+    record_training_labels(state, emb_dict)
     save_state(state)
     return jsonify(state)
 
@@ -1259,6 +1316,8 @@ def api_suggestions_refresh():
     suggestions for a state.json made before the classifier existed."""
     body = request.get_json(silent=True) or {}
     state = load_state()
+    if not state.get("initialized"):   # e.g. the UI polling after a retrain, before clustering
+        return jsonify(state)
     if "min_prob" in body:
         mp = body["min_prob"]
         if mp is not None:
@@ -1269,7 +1328,9 @@ def api_suggestions_refresh():
             if not 0 <= mp <= 1:
                 return jsonify({"error": "min_prob must be a number between 0 and 1"}), 400
         state["classifier_min_prob"] = mp
-    refresh_suggestions(state, load_embeddings())
+    emb_dict = load_embeddings()
+    refresh_suggestions(state, emb_dict)
+    record_training_labels(state, emb_dict)   # names given before retraining existed count too
     save_state(state)
     return jsonify(state)
 
@@ -1309,11 +1370,42 @@ def api_trash_delete():
     return jsonify(state)
 
 
+@app.route("/api/classifier/status")
+def api_classifier_status():
+    """Retraining progress. `version` changes when a retrained model is swapped in;
+    `names` maps each reviewer name to the taxon it trains (null: not a taxon)."""
+    return jsonify(_retrainer.status())
+
+
+@app.route("/api/classifier/retrain", methods=["POST"])
+def api_classifier_retrain():
+    """Retrain now (e.g. after copying in base data or regaining internet for WoRMS)."""
+    _retrainer.schedule()
+    return jsonify(_retrainer.status())
+
+
+@app.route("/api/classifier/reset", methods=["POST"])
+def api_classifier_reset():
+    """Go back to the original model. Reviewer labels are kept and used on the next retrain."""
+    retrained = _retrain_config()["retrained_model"]
+    if retrained.exists():
+        retrained.unlink()
+    _classifier_cache.pop(str(retrained), None)
+    _retrainer._set(state="idle", version=None, n_feedback=0, n_clusters=0, new_classes=[],
+                    message="Using the original model.")
+    return jsonify(_retrainer.status())
+
+
 @app.route("/api/reset", methods=["POST"])
 def api_reset():
     _, state_path = _review_paths()
     if state_path.exists():
         state_path.unlink()
+    # The mission's names are gone, so they stop being training data
+    path = _feedback_path()
+    if path is not None and path.exists():
+        path.unlink()
+        _retrainer.schedule()
     return jsonify(load_state())
 
 

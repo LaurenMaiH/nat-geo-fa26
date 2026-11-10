@@ -298,9 +298,9 @@ Two logistic regressions (one for genus, one for family), trained on the team's 
 2. the top **family when the genus probabilities are added up per family** (*Plesionika* 0.4 + *Heterocarpus* 0.3 → Pandalidae 0.7);
 3. the top family from the **family model**, which covers families that were never labeled to genus. It goes first instead when it's sure about such a family and surer than the genus model, because the genus model can only answer with genera it knows.
 
-**It never changes anything on its own.** Clusters and names stay as they are until a reviewer clicks **Accept**, which just renames the cluster. Suggestions update whenever tracks are moved, split off, trashed or restored.
+**It never changes a cluster on its own.** Clusters and names stay as they are until a reviewer clicks **Accept**, which renames the cluster. Suggestions update whenever tracks are moved, split off, trashed or restored.
 
-**Setting it up:** the app looks for `checkpoints/cluster_classifier.json` (in Docker: `model_cache/checkpoints/`). Without it the app works as before, just without suggestions. To make the file:
+**Setting it up:** the app looks for `checkpoints/cluster_classifier.json`, which is in the repo (0.8 MB, trained on the four LABELED_CROPS missions). With Docker, copy it into `model_cache/checkpoints/`, since that folder is mounted over `checkpoints/` in the container. Without it the app works as before, just without suggestions. To retrain it:
 
 1. Embed the labeled crops with the fine-tuned BioCLIP (the `labeled_crops_eval` Colab notebook, cells 0–4), which writes `image_labels.csv` and `images_embeddings.json`.
 2. Run
@@ -314,6 +314,23 @@ Two logistic regressions (one for genus, one for family), trained on the team's 
 To change the cutoff for a mission: `POST /api/suggestions/refresh` with `{"min_prob": 0.7}` (this also adds suggestions to a mission clustered before the classifier existed).
 
 **Caveats:** it only knows the ~37 families/genera with 5+ labeled crops, so rare animals get "unknown" or a wrong guess. The training crops were hand-placed boxes, not YOLO crops, so expect it to do somewhat worse here than in the notebook (about 0.66 family / 0.59 genus accuracy on a mission it never saw, 83–91% top-3). Retrain whenever `best.pt` changes; the app logs a warning if the checkpoint no longer matches.
+
+### Learning from reviewers' names
+
+Every name a reviewer gives a cluster, by clicking **Accept** or typing it, teaches the model, which retrains itself in the background:
+
+1. **The name is checked.** A genus or family the model already knows is used as is. Anything else is looked up in [WoRMS](https://www.marinespecies.org): a genus or species gives its genus and family, and a family gives just the family. Common names ("Shrimp", "Crabs"), "Shadows", and ranks above family ("Decapoda") stay as the cluster's name but aren't used for training. Use scientific names to teach the model. The cluster window says whether its name is being used.
+2. **Up to 20 of the cluster's tracks become examples**, chosen to cover all its looks: tracks far from all the others (likely mis-assigned) are dropped, the rest are split into 20 groups of similar tracks, and the most typical track of each group is kept. The examples are saved in `checkpoints/feedback/<deployment>__<mission>.json`.
+3. **The model retrains** about 5 s after the last change, from scratch on the original labeled crops plus every mission's examples (a few seconds on a laptop). A new genus or family becomes a class once it has 5+ examples. The header shows "Model: retraining…" and then "Model: learned from N names", and every cluster's suggestion refreshes.
+4. **Labels follow the cluster.** Moving tracks out, trashing them, renaming the cluster or restarting the mission updates its examples before the next retrain.
+
+The retrained model is saved as `checkpoints/cluster_classifier.retrained.json`; the original file is never changed. `POST /api/classifier/reset` goes back to the original (names are kept and used again on the next retrain), `POST /api/classifier/retrain` retrains now, and `GET /api/classifier/status` shows progress.
+
+**Setting it up:** retraining needs the original training data next to the model: copy `image_labels.csv` and `images_embeddings.json` into `checkpoints/labeled_crops/` (or set `CLASSIFIER_BASE_LABELS` / `CLASSIFIER_BASE_EMBEDDINGS`). Without them names are still recorded, and the header says the model can't retrain yet. Looking up a new name needs internet the first time; names that couldn't be looked up are retried on the next retrain.
+
+To include reviewers' names in an offline training run (and get leave-one-mission-out accuracy that includes the reviewed missions), add `--feedback-dir checkpoints/feedback` to `train_cluster_classifier.py`.
+
+**Caveats:** accepting a wrong suggestion teaches the model the mistake. Rename the cluster to fix it. Once the model has learned from a mission, the accuracy numbers above no longer describe it; rerun the training script with `--feedback-dir` to measure it again.
 
 ## Troubleshooting
 

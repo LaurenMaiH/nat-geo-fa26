@@ -612,7 +612,8 @@
 
     // ── SuggestionChip ────────────────────────────────────────────────────────
     // Family/genus suggested by the logistic regression on the cluster's embeddings.
-    // Accept just renames the cluster; nothing changes until the reviewer clicks it.
+    // Accept renames the cluster; nothing changes until the reviewer clicks it. The name
+    // (accepted or typed) then becomes training data and the model retrains (feedback.py).
     // variant: 'card' (two short lines, fits the 148px grid cards), 'inline' (crop-strip
     // row header), 'detailed' (cluster modal, with the top-3 lists).
 
@@ -627,7 +628,7 @@
       const accepted = !unknown && cluster.name === s.label;
       const sub = s.level === 'genus' && s.family_name ? s.family_name : s.level;
       const stop = e => e.stopPropagation();
-      const accept = e => { e.stopPropagation(); onRename(cluster.id, s.label); };
+      const accept = e => { e.stopPropagation(); onRename(cluster.id, s.label, 'accept'); };
       const acceptBtn = (
         <button className="btn-ghost flex-shrink-0" style={{padding: '0 6px', fontSize: 10, lineHeight: '16px'}}
           onClick={accept} title={`Rename this cluster to "${s.label}"`}>Accept</button>
@@ -674,6 +675,42 @@
             </div>
           ))}
         </div>
+      );
+    }
+
+    // ── TrainingLabel / ModelStatus ───────────────────────────────────────────
+    // A reviewer's name for a cluster is training data once it resolves to a family/genus
+    // (the model's own classes, else WoRMS). Auto names ("Cluster 3") are never used.
+
+    function TrainingLabel({ cluster, names }) {
+      const name = (cluster.name || '').trim();
+      if (!name || /^(Cluster \d+|Unassigned)$/.test(name) || cluster.id === 'noise') return null;
+      const taxon = names ? names[name] : undefined;
+      let text, color = 'var(--text-faint)';
+      if (taxon) {
+        text = taxon.genus ? `Teaching the model: ${taxon.genus} (${taxon.family})` : `Teaching the model: ${taxon.family} (family)`;
+        color = 'var(--text-muted)';
+      } else if (taxon === null) {
+        text = `"${name}" isn't a genus or family in WoRMS, so it isn't used for training`;
+      } else {
+        text = 'Name will be checked against WoRMS on the next retrain';
+      }
+      return <div className="mb-3 text-[11px]" style={{color}}>{text}</div>;
+    }
+
+    function ModelStatus({ status }) {
+      if (!status) return null;
+      const busy = status.state === 'pending' || status.state === 'training';
+      if (!busy && status.state !== 'error' && !status.n_clusters) return null;
+      const text = busy ? 'Model: retraining…'
+        : status.state === 'error' ? 'Model: not retrained'
+        : `Model: learned from ${status.n_clusters} name${status.n_clusters === 1 ? '' : 's'}`;
+      return (
+        <span className="font-mono text-[11px] px-2 py-0.5 rounded-full" title={status.message || ''}
+          style={{color: status.state === 'error' ? 'var(--error)' : busy ? C.accent : 'var(--text-faint)',
+                  border: `1px solid ${status.state === 'error' ? 'var(--error-border)' : 'var(--border-subtle)'}`}}>
+          {text}
+        </span>
       );
     }
 
@@ -748,7 +785,7 @@
 
     // ── ClusterModal ──────────────────────────────────────────────────────────
 
-    function ClusterModal({ cluster, onClose, onDrop, onRename, onContextMenu, dimmed, selectedKeys, onSelect }) {
+    function ClusterModal({ cluster, onClose, onDrop, onRename, trainingNames, onContextMenu, dimmed, selectedKeys, onSelect }) {
       const [name, setName] = useState(cluster.name);
       useEffect(() => { setName(cluster.name); }, [cluster.name]);   // e.g. after accepting a suggestion
 
@@ -793,6 +830,7 @@
               </button>
             </div>
             <SuggestionChip cluster={cluster} onRename={onRename} variant="detailed" />
+            <TrainingLabel cluster={cluster} names={trainingNames} />
             {videoNames.map(videoName => (
               <div key={videoName} className="mb-5">
                 <div className="font-mono text-[11px] font-semibold mb-2 pb-1 border-b truncate" style={{color: 'var(--text-muted)', borderColor: C.border}}>
@@ -1967,6 +2005,28 @@
         });
       }, [appState?.clusters]);
 
+      // Names given to clusters retrain the suggestion model in the background. When a new
+      // model is swapped in, recompute this mission's suggestions with it.
+      const [clfStatus, setClfStatus] = useState(null);
+      const clfVersion = useRef(undefined);
+      useEffect(() => {
+        let alive = true;
+        const poll = async () => {
+          try {
+            const st = await get('/api/classifier/status');
+            if (!alive) return;
+            setClfStatus(st);
+            if (clfVersion.current !== undefined && st.version !== clfVersion.current) {
+              setAppState(await post('/api/suggestions/refresh', {}));
+            }
+            clfVersion.current = st.version;
+          } catch (e) { /* app restarting; try again next tick */ }
+        };
+        poll();
+        const id = setInterval(poll, 3000);
+        return () => { alive = false; clearInterval(id); };
+      }, [currentDeployment, currentReviewMission]);
+
       const toggleClusterVisibility = useCallback(clusterId => {
         setVisibleClusterIds(prev => {
           const next = new Set(prev);
@@ -2205,8 +2265,8 @@
         }
       };
 
-      const handleRename = async (clusterId, name) => {
-        setAppState(await post('/api/rename', {cluster_id: clusterId, name}));
+      const handleRename = async (clusterId, name, via) => {
+        setAppState(await post('/api/rename', {cluster_id: clusterId, name, via}));
       };
 
       const handleVideoSelect = useCallback(async (videoName) => {
@@ -2402,6 +2462,7 @@
                   </span>
                 )}
                 <span className="ml-auto font-mono text-[11px]" style={{color: 'var(--text-faint)'}}>{tracks.length} tracks</span>
+                <ModelStatus status={clfStatus} />
                 <button
                   onClick={() => window.location.href = '/api/export/tracks.csv'}
                   className="btn-ghost"
@@ -2572,6 +2633,7 @@
               onClose={() => setOpen(null)}
               onDrop={handleReassign}
               onRename={handleRename}
+              trainingNames={clfStatus?.names}
               onContextMenu={openContextMenu}
               dimmed={!!cropViewer}
               selectedKeys={selectedKeys} onSelect={handleSelect}
