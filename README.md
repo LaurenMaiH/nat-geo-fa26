@@ -292,7 +292,7 @@ In the **Cluster Review** tab, once a mission is initialized, two buttons in the
 
 After clustering, each cluster can show a **suggested genus or family**: on its card ("*Heterocarpus* 91% / Pandalidae [Accept]"), next to its row in the crop strip, and with the top 3 when you open the cluster. Hover over it for the top 3 anywhere.
 
-Two logistic regressions (one for genus, one for family), trained on the team's labeled crops, make the suggestion from the cluster's BioCLIP embeddings: each track is classified and the probabilities are averaged. The first of these that reaches the cutoff (default 0.7) is shown, otherwise "No confident match":
+Two logistic regressions (one for genus, one for family), trained on the team's labeled crops, make the suggestion from the cluster's BioCLIP embeddings: each track is classified and the probabilities are averaged. The first of these that reaches the cutoff (default 0.75) is shown, otherwise "No confident match":
 
 1. the top **genus**, with its family taken from the taxonomy (so a genus and its family never contradict each other);
 2. the top **family when the genus probabilities are added up per family** (*Plesionika* 0.4 + *Heterocarpus* 0.3 → Pandalidae 0.7);
@@ -305,15 +305,23 @@ Two logistic regressions (one for genus, one for family), trained on the team's 
 1. Embed the labeled crops with the fine-tuned BioCLIP (the `labeled_crops_eval` Colab notebook, cells 0–4), which writes `image_labels.csv` and `images_embeddings.json`.
 2. Run
    ```bash
-   python train_cluster_classifier.py --labels .../image_labels.csv \
-       --embeddings .../images_embeddings.json --checkpoint checkpoints/best.pt
+   python train_cluster_classifier.py \
+       --labels checkpoints/labeled_crops/image_labels.csv --embeddings checkpoints/labeled_crops/images_embeddings.json \
+       --aug-labels checkpoints/labeled_crops/augmented_labels.csv --aug-embeddings checkpoints/labeled_crops/augmented_embeddings.json \
+       --min-prob 0.75 --checkpoint checkpoints/best.pt
    ```
+   This is how the committed `cluster_classifier.json` was made.
    It prints leave-one-mission-out accuracy and how accuracy changes with the cutoff, then saves the file.
+
+   Every crop counts the same in training (no class weighting), which makes suggestions for common animals, most of what reviewers see, more accurate at a small cost on rare ones. `--class-weight balanced` weights rare classes up instead.
+   **Augmented crops:** `checkpoints/labeled_crops/augmented_*` hold 2 augmented copies of every labeled crop (random rotation ±15°, shift/zoom, horizontal flip, brightness/contrast/saturation, blur, noise), made and embedded by `augment_crops_colab.ipynb` on Colab (`MODE="all"`). They add ~1–2 points of accuracy for common and rare classes alike (genus 0.565 → 0.585 on all test crops). Augmenting only the rare classes made things worse (common classes −3 points), because it tilts training toward them. The app's background retraining uses the augmented files whenever they're in `checkpoints/labeled_crops/`. Augmented crops are training data only: they never count toward the 5-crop minimum or as test crops.
+
+   To see where the model does well or badly (rare vs common classes, per class, at the cutoff), and whether augmentation helps, run `python eval_classifier.py` (add `--aug-labels`/`--aug-embeddings` to compare with and without, `--per-class` for every class).
 3. Optional: put the file on Google Drive and set `CLUSTER_CLASSIFIER_DRIVE_ID` in `.env` so the app downloads it. `CLUSTER_CLASSIFIER_PATH` points it somewhere else.
 
-To change the cutoff for a mission: `POST /api/suggestions/refresh` with `{"min_prob": 0.7}` (this also adds suggestions to a mission clustered before the classifier existed).
+To change the cutoff for a mission: `POST /api/suggestions/refresh` with `{"min_prob": 0.75}` (this also adds suggestions to a mission clustered before the classifier existed).
 
-**Caveats:** it only knows the ~37 families/genera with 5+ labeled crops, so rare animals get "unknown" or a wrong guess. The training crops were hand-placed boxes, not YOLO crops, so expect it to do somewhat worse here than in the notebook (about 0.66 family / 0.59 genus accuracy on a mission it never saw, 83–91% top-3). Retrain whenever `best.pt` changes; the app logs a warning if the checkpoint no longer matches.
+**Caveats:** it only knows the ~37 families/genera with 5+ labeled crops, so rare animals get "unknown" or a wrong guess. The training crops were hand-placed boxes, not YOLO crops, so expect it to do somewhat worse here than in the notebook (about 0.72 family / 0.65 genus accuracy on a mission it never saw, 84–87% top-3; at the 0.75 cutoff a suggestion is shown for ~68–73% of animals and is right 77% (family) / 72% (genus) of the time, counting animals it has no class for as wrong). Accuracy is ~80–90% for animals with 50+ labeled crops and ~40–50% for rarer ones. Retrain whenever `best.pt` changes; the app logs a warning if the checkpoint no longer matches.
 
 ### Learning from reviewers' names
 

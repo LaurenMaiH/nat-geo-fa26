@@ -46,6 +46,16 @@ def _display_path(path):
         return path.name
 
 
+def add_augmented(labels, emb, aug_labels, aug_embeddings):
+    """Append augmented crops (rows with augmented_from) to the labels and embeddings."""
+    aug_emb = json.loads(Path(aug_embeddings).read_text())
+    aug = pd.read_csv(aug_labels)
+    aug = aug[aug[find_key_col(aug, aug_emb, log=None)].astype(str).isin(set(aug_emb))].copy()
+    aug["_key"] = aug[find_key_col(aug, aug_emb, log=None)].astype(str)
+    print(f"+ {len(aug)} augmented crops of {aug['augmented_from'].nunique()} originals")
+    return pd.concat([labels, aug], ignore_index=True), {**emb, **aug_emb}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--labels", required=True, help="image_labels.csv from embed_csv_images.py")
@@ -57,6 +67,11 @@ def main():
     ap.add_argument("--min-prob", type=float, default=0.7, help="default confidence cutoff stored in the bundle")
     ap.add_argument("--key-col", help="labels column holding the embedding keys (auto-detected if omitted)")
     ap.add_argument("--checkpoint", help="the best.pt the embeddings came from; recorded so the app can warn on a mismatch")
+    ap.add_argument("--aug-labels", help="augmented_labels.csv from augment_crops_colab.ipynb")
+    ap.add_argument("--aug-embeddings", help="augmented_embeddings.json from the same notebook")
+    ap.add_argument("--class-weight", choices=["none", "balanced"], default="none",
+                    help="'balanced' weights rare classes up: better on rare animals, worse overall")
+    ap.add_argument("--C", type=float, default=0.3, help="inverse regularisation strength")
     ap.add_argument("--feedback-dir", help="also train on reviewer-named clusters (the app's checkpoints/feedback/)")
     args = ap.parse_args()
 
@@ -74,6 +89,11 @@ def main():
     print(f"{len(labels)} labeled embeddings, dim {dim}")
 
     trained_on = _display_path(args.labels)
+    if bool(args.aug_labels) != bool(args.aug_embeddings):
+        sys.exit("--aug-labels and --aug-embeddings go together.")
+    if args.aug_labels:
+        labels, emb = add_augmented(labels, emb, args.aug_labels, args.aug_embeddings)
+        trained_on += f" + {_display_path(args.aug_labels)}"
     if args.feedback_dir:
         import feedback
 
@@ -92,7 +112,8 @@ def main():
 
     bundle, checks = train_bundle(
         labels, emb, levels=[l.strip() for l in args.levels.split(",") if l.strip()],
-        min_per_class=args.min_per_class, min_prob=args.min_prob, group_col=args.group_col)
+        min_per_class=args.min_per_class, min_prob=args.min_prob, group_col=args.group_col,
+        class_weight=None if args.class_weight == "none" else args.class_weight, C=args.C)
     if not bundle["levels"]:
         sys.exit("Nothing trained.")
 

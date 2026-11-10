@@ -10,8 +10,8 @@ Family and genus are kept consistent through the taxonomy: a confident genus
 brings its own family, and an unsure genus model still gives a family when
 its genera add up within one (Plesionika 0.4 + Heterocarpus 0.3 → Pandalidae 0.7).
 The separate family model is only the last resort, for families without genus
-labels. It's the weaker of the two on pipeline crops (rare families win under
-balanced class weights), so it must never contradict a confident genus.
+labels. It's the weaker of the two on pipeline crops, so it must never contradict
+a confident genus.
 
 The suggestion never changes a cluster; the reviewer accepts it via /api/rename.
 """

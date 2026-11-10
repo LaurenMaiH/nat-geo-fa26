@@ -259,3 +259,4 @@ checkpoints/*
 !checkpoints/cluster_classifier.json
 !checkpoints/labeled_crops/
 !checkpoints/labeled_crops/image_labels.csv
+!checkpoints/labeled_crops/augmented_labels.csv

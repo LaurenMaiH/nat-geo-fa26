@@ -4,15 +4,27 @@ script (train_cluster_classifier.py) and the app's background retrainer (feedbac
 
 A bundle is one logistic regression per level (family, genus) on L2-normalised
 BioCLIP embeddings, exported as plain JSON weights.
+
+Augmented crops (augment_crops_colab.ipynb) are rows with an
+"augmented_from" key. They're extra training data only: they don't count toward
+min_per_class, are never test crops, and stay in their source crop's mission.
 """
 
 import numpy as np
+import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-CUTOFFS = [0.3, 0.5, 0.7]
+CUTOFFS = [0.3, 0.5, 0.7, 0.75]
+
+# Every crop counts the same (no class weighting), so common animals, which are most of what
+# reviewers see, are suggested more accurately; C=0.3 keeps the confidence scores from running
+# too high. Leave-one-mission-out vs class_weight="balanced", C=1: suggestions shown at the 0.7
+# cutoff are right 0.708 vs 0.651 of the time (genus), at the cost of ~3 points on rare classes.
+CLASS_WEIGHT = None
+C = 0.3
 
 
 def _quiet(*_args, **_kwargs):
@@ -41,11 +53,11 @@ def find_key_col(labels, emb: dict, key_col=None, log=print):
     return best
 
 
-def fit(X, y):
-    # Same setup as eval_centroids.py's logreg (reproduces the notebook's numbers). Without
-    # standardising, L2-normalised features are so small that C=1 crushes the weights.
+def fit(X, y, class_weight=CLASS_WEIGHT, C=C):
+    # Standardised first: L2-normalised features are so small that regularisation would
+    # otherwise crush the weights.
     return make_pipeline(StandardScaler(),
-                         LogisticRegression(max_iter=3000, class_weight="balanced")).fit(X, y)
+                         LogisticRegression(C=C, max_iter=3000, class_weight=class_weight)).fit(X, y)
 
 
 def export_linear(clf):
@@ -58,17 +70,26 @@ def export_linear(clf):
             "intercept": intercept.astype(np.float32).tolist()}
 
 
-def leave_one_group_out(X, y, groups, log=print):
-    """Train on all groups but one, test on it. A test animal whose class never
-    appears in the training groups counts as wrong (it can't be predicted)."""
+def is_augmented(labels):
+    if "augmented_from" not in labels:
+        return pd.Series(False, index=labels.index)
+    a = labels["augmented_from"]
+    return a.notna() & (a.astype(str).str.strip() != "")
+
+
+def leave_one_group_out(X, y, groups, log=print, augmented=None, **fit_kw):
+    """Train on all groups but one, test on it (original crops only). A test animal whose
+    class never appears in the training groups counts as wrong (it can't be predicted)."""
+    if augmented is None:
+        augmented = np.zeros(len(y), bool)
     y_true, y_pred, top3_hit, max_p = [], [], [], []
     log(f"  {'held out':<10} {'n':>5} {'acc':>6}")
     for g in sorted(set(groups)):
-        test = groups == g
-        train = ~test
+        test = (groups == g) & ~augmented
+        train = groups != g
         if len(set(y[train])) < 2 or not test.any():
             continue
-        clf = fit(X[train], y[train])
+        clf = fit(X[train], y[train], **fit_kw)
         P = clf.predict_proba(X[test])
         order = np.argsort(P, axis=1)[:, ::-1]
         pred = clf.classes_[order[:, 0]]
@@ -85,11 +106,11 @@ def leave_one_group_out(X, y, groups, log=print):
     for t in CUTOFFS:
         shown = max_p >= t
         acc = correct[shown].mean() if shown.any() else float("nan")
-        log(f"    cutoff {t:.1f}: shown for {shown.mean():5.1%} of animals, correct {acc:.3f} of those")
+        log(f"    cutoff {t:.2f}: shown for {shown.mean():5.1%} of animals, correct {acc:.3f} of those")
 
 
 def train_bundle(labels, emb, levels=("family", "genus"), min_per_class=5, min_prob=0.7,
-                 group_col="mission", evaluate=True, log=print):
+                 group_col="mission", evaluate=True, log=print, class_weight=CLASS_WEIGHT, C=C):
     """
     Train one model per level. `labels` is a DataFrame with a "_key" column (the
     embedding key) plus the level columns; `emb` maps key → vector.
@@ -100,7 +121,7 @@ def train_bundle(labels, emb, levels=("family", "genus"), min_per_class=5, min_p
     log = log or _quiet
     dim = len(emb[labels["_key"].iloc[0]])
     bundle = {"embedding_dim": dim, "min_prob": min_prob, "min_per_class": min_per_class,
-              "n_train": {}, "levels": {}}
+              "class_weight": class_weight, "C": C, "n_train": {}, "levels": {}}
     checks = {}
 
     for level in levels:
@@ -108,28 +129,33 @@ def train_bundle(labels, emb, levels=("family", "genus"), min_per_class=5, min_p
             log(f"\n{level}: no such column, skipped")
             continue
         df = labels[labels[level].notna() & (labels[level].astype(str).str.strip() != "")]
-        counts = df[level].value_counts()
+        aug = is_augmented(df)
+        counts = df.loc[~aug, level].value_counts()      # augmented copies don't make a class
         keep = counts[counts >= min_per_class].index
         df = df[df[level].isin(keep)]
+        aug = is_augmented(df).to_numpy()
         if len(keep) < 2:
             log(f"\n{level}: fewer than 2 classes with {min_per_class}+ examples, skipped")
             continue
 
         X = l2_rows(np.asarray([emb[k] for k in df["_key"]], dtype=np.float32))
         y = df[level].astype(str).to_numpy()
-        log(f"\n{level}: {len(df)} examples, {len(keep)} classes "
-            f"(dropped {len(counts) - len(keep)} classes with < {min_per_class})")
+        log(f"\n{level}: {(~aug).sum()} examples" + (f" + {aug.sum()} augmented" if aug.any() else "") +
+            f", {len(keep)} classes (dropped {len(counts) - len(keep)} classes with < {min_per_class})")
 
         if evaluate:
             if group_col in df and df[group_col].nunique() >= 2:
                 log(f"  leave-one-{group_col}-out:")
-                leave_one_group_out(X, y, df[group_col].astype(str).to_numpy(), log)
+                leave_one_group_out(X, y, df[group_col].astype(str).to_numpy(), log, augmented=aug,
+                                    class_weight=class_weight, C=C)
             else:
                 log(f"  (no '{group_col}' column with 2+ values: skipping the held-out check)")
 
-        clf = fit(X, y)
+        clf = fit(X, y, class_weight=class_weight, C=C)
         bundle["levels"][level] = export_linear(clf)
-        bundle["n_train"][level] = int(len(df))
+        bundle["n_train"][level] = int((~aug).sum())
+        if aug.any():
+            bundle.setdefault("n_augmented", {})[level] = int(aug.sum())
         checks[level] = (X[:20], clf.predict_proba(X[:20]))
 
     # Each genus's family (the most common one in the labels), so the app can keep

@@ -258,7 +258,8 @@ class Retrainer:
     new `version` in status() and asks the app to refresh suggestions.
 
     config() returns the paths to use (read at run time):
-      base_model, retrained_model, feedback_dir, base_labels, base_embeddings, worms_cache
+      base_model, retrained_model, feedback_dir, base_labels, base_embeddings, worms_cache,
+      and optionally aug_labels, aug_embeddings
     """
 
     def __init__(self, config, auto=True, debounce=DEBOUNCE_S):
@@ -322,14 +323,25 @@ class Retrainer:
         labels_p, emb_p = Path(cfg["base_labels"]), Path(cfg["base_embeddings"])
         if not labels_p.exists() or not emb_p.exists():
             return None
-        stamp = (str(labels_p), labels_p.stat().st_mtime, str(emb_p), emb_p.stat().st_mtime)
+        # Augmented crops (augment_crops_colab.ipynb) are used when both files are there
+        aug_ps = [Path(cfg[k]) for k in ("aug_labels", "aug_embeddings") if cfg.get(k)]
+        aug_ps = aug_ps if len(aug_ps) == 2 and all(p.exists() for p in aug_ps) else []
+        stamp = tuple((str(p), p.stat().st_mtime) for p in [labels_p, emb_p, *aug_ps])
         if self._base_cache and self._base_cache[0] == stamp:
             return self._base_cache[1]
-        emb = json.loads(emb_p.read_text())
-        labels = pd.read_csv(labels_p)
-        key_col = find_key_col(labels, emb, log=None)
-        labels = labels[labels[key_col].astype(str).isin(set(emb))].copy()
-        labels["_key"] = labels[key_col].astype(str)
+
+        def read(lp, ep):
+            emb = json.loads(ep.read_text())
+            labels = pd.read_csv(lp)
+            key_col = find_key_col(labels, emb, log=None)
+            labels = labels[labels[key_col].astype(str).isin(set(emb))].copy()
+            labels["_key"] = labels[key_col].astype(str)
+            return labels, emb
+
+        labels, emb = read(labels_p, emb_p)
+        if aug_ps:
+            aug_labels, aug_emb = read(*aug_ps)
+            labels, emb = pd.concat([labels, aug_labels], ignore_index=True), {**emb, **aug_emb}
         self._base_cache = (stamp, (labels, emb))
         return labels, emb
 
@@ -365,7 +377,9 @@ class Retrainer:
         all_labels = pd.concat([labels, pd.DataFrame(rows)], ignore_index=True)
         all_emb = {**emb, **fb_emb}
         min_prob = base_model["min_prob"] if base_model else 0.7
-        bundle, _ = train_bundle(all_labels, all_emb, min_prob=min_prob, evaluate=False, log=None)
+        meta = (base_model or {}).get("meta", {})
+        fit_kw = {k: meta[k] for k in ("class_weight", "C") if k in meta}   # same setup as the base model
+        bundle, _ = train_bundle(all_labels, all_emb, min_prob=min_prob, evaluate=False, log=None, **fit_kw)
 
         base_classes = set()
         if base_model:

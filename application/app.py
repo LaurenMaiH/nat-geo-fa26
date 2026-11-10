@@ -374,6 +374,8 @@ def _retrain_config():
         "base_labels": Path(CLASSIFIER_BASE_LABELS or d / "labeled_crops" / "image_labels.csv"),
         "base_embeddings": Path(CLASSIFIER_BASE_EMBEDDINGS or d / "labeled_crops" / "images_embeddings.json"),
         "worms_cache": d / "worms_cache.json",
+        "aug_labels": d / "labeled_crops" / "augmented_labels.csv",
+        "aug_embeddings": d / "labeled_crops" / "augmented_embeddings.json",
     }
 
 
