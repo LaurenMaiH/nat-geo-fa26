@@ -4,13 +4,16 @@ Reviewer names → training examples → retrained name classifier.
 Every cluster a reviewer has named (by accepting a suggestion or typing a name)
 is snapshotted into a per-mission feedback file: the name plus up to
 MAX_EXAMPLES representative track embeddings. A background Retrainer resolves
-each name to a family/genus (the model's own classes first, then WoRMS), trains
-on the base labeled crops + every feedback file, and writes a separate
-retrained bundle that the app prefers over the base one. The base bundle is
-never overwritten; deleting the retrained file goes back to it.
+each name to a family/genus (the model's own classes first, then WoRMS) and
+trains a new model version on the base labeled crops + every feedback file,
+starting from the current version's weights. Versions are saved in models/
+(ModelStore) and the newest is used; v1 is the base model, which is never
+overwritten.
 
 Feedback files are rebuilt from the current state.json, so labels follow the
-cluster: moving tracks out, trashing them, or renaming the cluster updates them.
+cluster: moving tracks out, trashing them, renaming the cluster, or removing it
+from training (train_excluded) updates them. Every label change is logged in
+_history.jsonl, which the Labels tab shows and undoes from.
 """
 
 import hashlib
@@ -20,6 +23,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -30,7 +34,10 @@ from classifier_training import find_key_col, l2_rows, train_bundle
 
 MAX_EXAMPLES = 20       # tracks per named cluster, so one big cluster can't drown the base data
 NAMES_FILE = "_names.json"
+HISTORY_FILE = "_history.jsonl"
+KEEP_VERSIONS = 20      # saved versions besides v1 (the base model) and the current one
 DEBOUNCE_S = 5.0
+_EMPTY_HASH = hashlib.sha1(b"[]").hexdigest()[:16]   # data_hash of "no reviewer labels" (v1)
 _AUTO_NAME_RE = re.compile(r"^(Cluster \d+|Unassigned)$")
 
 
@@ -114,7 +121,8 @@ def sync_feedback(state, emb_dict, path, deployment=None, mission=None) -> bool:
     prev = _read_json(path, {}).get("clusters", {})
     clusters = {}
     for cid, c in state.get("clusters", {}).items():
-        if cid == "noise" or not is_training_name(c.get("name")) or not c.get("track_keys"):
+        if (cid == "noise" or not is_training_name(c.get("name")) or not c.get("track_keys")
+                or c.get("train_excluded")):
             continue
         sig = _signature(c["track_keys"])
         old = prev.get(cid)
@@ -139,6 +147,144 @@ def sync_feedback(state, emb_dict, path, deployment=None, mission=None) -> bool:
         elif path.exists():
             path.unlink()
     return changed
+
+
+def label_key(deployment, mission, cluster_id):
+    return f"{deployment}/{mission}/{cluster_id}"
+
+
+def feedback_labels(feedback_dir, names):
+    """{label_key: name} for every feedback cluster whose name resolves to a taxon."""
+    out = {}
+    for p in feedback_files(feedback_dir):
+        data = _read_json(p, {})
+        for cid, rec in data.get("clusters", {}).items():
+            if names.get(rec["name"]):
+                out[label_key(data.get("deployment"), data.get("mission"), cid)] = rec["name"]
+    return out
+
+
+# ── History of label changes ──────────────────────────────────────────────────
+
+def append_history(feedback_dir, **entry):
+    """Append one event to _history.jsonl and return it (with its id and time)."""
+    entry = {"id": uuid.uuid4().hex[:12], "at": datetime.now().isoformat(timespec="seconds"),
+             "ts": time.time(), **entry}
+    path = Path(feedback_dir) / HISTORY_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    return entry
+
+
+def read_history(feedback_dir):
+    """All events, oldest first."""
+    path = Path(feedback_dir) / HISTORY_FILE
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text().splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def describe(entry):
+    """One line for a label event, as the Labels tab and model versions show it."""
+    a, frm, to = entry.get("action"), entry.get("from"), entry.get("to")
+    where = entry.get("cluster_id", "")
+    if a in ("confirm", "rename", "unconfirm"):
+        return f"{where}: {frm or '—'} → {to or '—'}"
+    if a == "exclude":
+        return f"{where}: \"{entry.get('name')}\" removed from training"
+    if a == "include":
+        return f"{where}: \"{entry.get('name')}\" used for training again"
+    if a == "undo":
+        return f"undo: {entry.get('summary', '')}"
+    if a == "reset":
+        return "back to the original model"
+    if a == "mission_reset":
+        return f"{entry.get('mission')} restarted: its labels removed"
+    if a == "version":
+        return entry.get("summary") or f"model v{to}"
+    return a or ""
+
+
+# ── Model versions ────────────────────────────────────────────────────────────
+
+class ModelStore:
+    """
+    Saved model versions. v1 is the base model file itself (never copied or
+    changed); retrains add models/v0002.json, v0003.json, ... and models/index.json
+    lists every version and which one is current. Only the last KEEP_VERSIONS
+    retrained files are kept on disk (their index entries stay).
+    """
+
+    def __init__(self, models_dir, base_model):
+        self.dir = Path(models_dir)
+        self.base = Path(base_model)
+        self._lock = threading.Lock()
+
+    def _index(self):
+        idx = _read_json(self.dir / "index.json", None)
+        if not idx:
+            idx = {"current": 1, "versions": [{"version": 1, "parent": None, "file": None,
+                                               "created_at": None, "reason": "original model",
+                                               "changes": [], "n_labels": 0, "new_classes": []}]}
+        return idx
+
+    def _save(self, idx):
+        _write_json_atomic(self.dir / "index.json", idx)
+
+    def versions(self):
+        return self._index()["versions"]
+
+    def current(self):
+        return self._index()["current"]
+
+    def current_entry(self):
+        idx = self._index()
+        return next((v for v in idx["versions"] if v["version"] == idx["current"]), idx["versions"][0])
+
+    def path(self, version=None):
+        """File of a version (the current one by default); v1 is the base model file."""
+        idx = self._index()
+        v = idx["current"] if version is None else version
+        entry = next((e for e in idx["versions"] if e["version"] == v), None)
+        if not entry or not entry.get("file"):
+            return self.base
+        p = self.dir / entry["file"]
+        return p if p.exists() else self.base
+
+    def add(self, bundle, **meta):
+        """Save a new version made from the current one and make it current."""
+        with self._lock:
+            idx = self._index()
+            n = max(e["version"] for e in idx["versions"]) + 1
+            fname = f"v{n:04d}.json"
+            entry = {"version": n, "parent": idx["current"], "file": fname,
+                     "created_at": datetime.now().isoformat(timespec="seconds"), "created_ts": time.time(),
+                     **meta}
+            bundle = {**bundle, "version": n, "parent": idx["current"]}
+            _write_json_atomic(self.dir / fname, bundle)
+            idx["versions"].append(entry)
+            idx["current"] = n
+            # prune old files (never v1, never the current one)
+            files = [e for e in idx["versions"] if e.get("file") and e["version"] != n]
+            for e in files[:-KEEP_VERSIONS] if len(files) > KEEP_VERSIONS else []:
+                (self.dir / e["file"]).unlink(missing_ok=True)
+                e["file"] = None
+                e["pruned"] = True
+            self._save(idx)
+            return n
+
+    def set_current(self, version):
+        with self._lock:
+            idx = self._index()
+            idx["current"] = version
+            self._save(idx)
 
 
 def feedback_files(feedback_dir):
@@ -258,12 +404,16 @@ class Retrainer:
     new `version` in status() and asks the app to refresh suggestions.
 
     config() returns the paths to use (read at run time):
-      base_model, retrained_model, feedback_dir, base_labels, base_embeddings, worms_cache,
+      base_model, models_dir, feedback_dir, base_labels, base_embeddings, worms_cache,
       and optionally aug_labels, aug_embeddings
+
+    Each run trains on ALL current labels, starting from the current version's
+    weights, and saves the result as the next version (unless the labels are
+    exactly those the current version was trained on, e.g. after an undo).
     """
 
     def __init__(self, config, auto=True, debounce=DEBOUNCE_S):
-        self.config = config
+        self.config = config   # see store()
         self.auto = auto
         self.debounce = debounce
         self._lock = threading.Lock()
@@ -274,13 +424,17 @@ class Retrainer:
         self._status = {"state": "idle", "version": None, "message": "", "n_feedback": 0,
                         "n_clusters": 0, "new_classes": [], "pending_names": []}
 
+    def store(self):
+        cfg = self.config()
+        return ModelStore(cfg["models_dir"], cfg["base_model"])
+
     def status(self):
         with self._lock:
             s = dict(self._status)
         cfg = self.config()
-        retrained = classifier.load_classifier(cfg["retrained_model"]) if Path(cfg["retrained_model"]).exists() else None
-        if s["version"] is None and retrained:
-            s["version"] = retrained["meta"].get("version")
+        cur = self.store().current_entry()
+        s.update(version=cur["version"], n_clusters=cur.get("n_labels", 0), new_classes=cur.get("new_classes", []),
+                 n_feedback=cur.get("n_feedback", 0))
         s["names"] = _read_json(Path(cfg["feedback_dir"]) / NAMES_FILE, {})
         return s
 
@@ -350,6 +504,7 @@ class Retrainer:
         import pandas as pd
 
         cfg = self.config()
+        store = self.store()
         self._set(state="training", message="Retraining…")
         base_model = classifier.load_classifier(cfg["base_model"])
         lookup = worms_lookup(cfg["worms_cache"]) if cfg.get("worms_cache") else None
@@ -364,46 +519,68 @@ class Retrainer:
         labels, emb = base
         dim = len(next(iter(emb.values())))
         rows, fb_emb = collect_examples(cfg["feedback_dir"], names, dim)
-        retrained_path = Path(cfg["retrained_model"])
+        current = store.current_entry()
+        data_hash = hashlib.sha1(json.dumps(sorted((r["_key"], r["family"], r["genus"]) for r in rows))
+                                 .encode()).hexdigest()[:16]
+        changes = self._changes_since(cfg["feedback_dir"], current)
 
-        if not rows:
-            if retrained_path.exists():
-                retrained_path.unlink()
-            classifier._cache.pop(str(retrained_path), None)
-            self._set(state="idle", version=None, n_feedback=0, n_clusters=0, new_classes=[],
-                      pending_names=pending, message="No usable labels yet: using the original model.")
+        if current.get("data_hash", _EMPTY_HASH) == data_hash:   # e.g. undone within the debounce
+            self._set(state="idle", pending_names=pending, message=f"Model v{current['version']} is up to date.")
             return None
+        if not rows:   # every label was removed: the original model is exactly right again
+            store.set_current(1)
+            self._log_version(cfg, 1, changes, "No labels left: back to the original model (v1)")
+            self._set(state="idle", pending_names=pending, message="No usable labels: using the original model.")
+            return 1
 
         all_labels = pd.concat([labels, pd.DataFrame(rows)], ignore_index=True)
         all_emb = {**emb, **fb_emb}
         min_prob = base_model["min_prob"] if base_model else 0.7
         meta = (base_model or {}).get("meta", {})
         fit_kw = {k: meta[k] for k in ("class_weight", "C") if k in meta}   # same setup as the base model
-        bundle, _ = train_bundle(all_labels, all_emb, min_prob=min_prob, evaluate=False, log=None, **fit_kw)
+        prev = classifier.load_classifier(store.path())   # build on the current version
+        bundle, _ = train_bundle(all_labels, all_emb, min_prob=min_prob, evaluate=False, log=None,
+                                 init=prev, **fit_kw)
 
         base_classes = set()
         if base_model:
             for m in base_model["levels"].values():
                 base_classes |= set(m["classes"])
         new_classes = sorted({c for m in bundle["levels"].values() for c in m["classes"]} - base_classes)
-        version = f"{time.time_ns()}"
-        n_clusters = len({r["_key"].rsplit("/", 1)[0] for r in rows})
+        trained_labels = feedback_labels(cfg["feedback_dir"], names)
+        n_clusters = len(trained_labels)
         bundle.update({
             "embedding": "BioCLIP-2 + fine-tuned best.pt",
             "trained_on": f"{cfg['base_labels']} + {n_clusters} reviewer-named clusters",
             "trained_at": datetime.now().isoformat(timespec="seconds"),
             "checkpoint_fingerprint": (base_model or {}).get("meta", {}).get("checkpoint_fingerprint"),
-            "version": version, "n_feedback": len(rows), "n_feedback_clusters": n_clusters,
-            "new_classes": new_classes,
+            "n_feedback": len(rows), "n_feedback_clusters": n_clusters, "new_classes": new_classes,
         })
-        _write_json_atomic(retrained_path, bundle)
-        classifier._cache.pop(str(retrained_path), None)
-        msg = f"Model updated from {n_clusters} named cluster(s)"
+        version = store.add(bundle, n_labels=n_clusters, n_feedback=len(rows), new_classes=new_classes,
+                            data_hash=data_hash, labels=trained_labels,
+                            changes=[describe(e) for e in changes], reason=", ".join(describe(e) for e in changes[-3:]))
+        self._log_version(cfg, version, changes,
+                          f"Model v{version} trained on {n_clusters} label{'' if n_clusters == 1 else 's'}")
+        msg = f"Model v{version} learned from {n_clusters} label(s)"
         if new_classes:
             msg += f" · new: {', '.join(new_classes)}"
         if pending:
             msg += f" · couldn't look up yet: {', '.join(pending)}"
-        self._set(state="idle", version=version, n_feedback=len(rows), n_clusters=n_clusters,
-                  new_classes=new_classes, pending_names=pending, message=msg)
+        self._set(state="idle", pending_names=pending, message=msg)
         print(msg)
         return version
+
+    @staticmethod
+    def _changes_since(feedback_dir, version_entry):
+        """Label events after the given version was made (the changes the next version includes)."""
+        since = version_entry.get("created_ts") or 0
+        events = [e for e in read_history(feedback_dir) if e.get("ts", 0) > since and e.get("action") != "version"]
+        # a change undone before this retrain cancels out: leave both out of the description
+        undone = {e.get("undoes") for e in events if e.get("action") == "undo"}
+        cancelled = undone & {e["id"] for e in events}
+        return [e for e in events if e["id"] not in cancelled and e.get("undoes") not in cancelled]
+
+    @staticmethod
+    def _log_version(cfg, version, changes, summary):
+        append_history(cfg["feedback_dir"], action="version", to=version, summary=summary,
+                       includes=[e["id"] for e in changes])

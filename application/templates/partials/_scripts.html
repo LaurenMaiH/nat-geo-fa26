@@ -682,35 +682,281 @@
     // A reviewer's name for a cluster is training data once it resolves to a family/genus
     // (the model's own classes, else WoRMS). Auto names ("Cluster 3") are never used.
 
-    function TrainingLabel({ cluster, names }) {
+    const isAutoName = name => !name || /^(Cluster \d+|Unassigned)$/.test(name.trim());
+    const taxonText = t => t.genus ? `${t.genus} (${t.family})` : `${t.family} (family)`;
+
+    function TrainingLabel({ cluster, names, onExclude }) {
       const name = (cluster.name || '').trim();
-      if (!name || /^(Cluster \d+|Unassigned)$/.test(name) || cluster.id === 'noise') return null;
+      if (isAutoName(name) || cluster.id === 'noise') return null;
       const taxon = names ? names[name] : undefined;
+      const excluded = !!cluster.train_excluded;
       let text, color = 'var(--text-faint)';
-      if (taxon) {
-        text = taxon.genus ? `Teaching the model: ${taxon.genus} (${taxon.family})` : `Teaching the model: ${taxon.family} (family)`;
+      if (excluded) {
+        text = 'Removed from training: this name doesn\'t teach the model';
+      } else if (taxon) {
+        text = `Teaching the model: ${taxonText(taxon)}`;
         color = 'var(--text-muted)';
       } else if (taxon === null) {
         text = `"${name}" isn't a genus or family in WoRMS, so it isn't used for training`;
       } else {
         text = 'Name will be checked against WoRMS on the next retrain';
       }
-      return <div className="mb-3 text-[11px]" style={{color}}>{text}</div>;
+      return (
+        <div className="mb-3 flex items-center gap-2 text-[11px]" style={{color}}>
+          <span>{text}</span>
+          {onExclude && (excluded || taxon) && (
+            <button className="btn-ghost" style={{padding: '0 6px', fontSize: 10, lineHeight: '16px'}}
+              onClick={() => onExclude(cluster.id, !excluded)}>
+              {excluded ? 'Include again' : 'Remove from training'}
+            </button>
+          )}
+        </div>
+      );
     }
 
-    function ModelStatus({ status }) {
-      if (!status) return null;
+    function ModelStatus({ status, onClick }) {
+      if (!status || !status.version) return null;
       const busy = status.state === 'pending' || status.state === 'training';
-      if (!busy && status.state !== 'error' && !status.n_clusters) return null;
-      const text = busy ? 'Model: retraining…'
-        : status.state === 'error' ? 'Model: not retrained'
-        : `Model: learned from ${status.n_clusters} name${status.n_clusters === 1 ? '' : 's'}`;
+      const v = `Model v${status.version}`;
+      const text = busy ? `${v} · retraining…`
+        : status.state === 'error' ? `${v} · not retrained`
+        : status.version === 1 ? `${v} · original`
+        : `${v} · learned from ${status.n_clusters} label${status.n_clusters === 1 ? '' : 's'}`;
       return (
-        <span className="font-mono text-[11px] px-2 py-0.5 rounded-full" title={status.message || ''}
-          style={{color: status.state === 'error' ? 'var(--error)' : busy ? C.accent : 'var(--text-faint)',
+        <button className="font-mono text-[11px] px-2 py-0.5 rounded-full" title={(status.message || '') + '\nOpen the Labels tab'}
+          onClick={onClick}
+          style={{color: status.state === 'error' ? 'var(--error)' : busy ? C.accent : 'var(--text-faint)', cursor: 'pointer',
+                  background: 'transparent',
                   border: `1px solid ${status.state === 'error' ? 'var(--error-border)' : 'var(--border-subtle)'}`}}>
           {text}
-        </span>
+        </button>
+      );
+    }
+
+    // ── Toast: what a label change teaches the model, with Undo ─────────────
+
+    function toastText(info) {
+      if (info.error) return info.error;
+      if (info.text) return info.text;
+      if (info.action === 'unconfirm') return `"${info.from}" no longer teaches the model`;
+      if (info.action === 'exclude') return `"${info.name}" removed from training`;
+      const name = info.action === 'include' ? info.name : info.to;
+      if (info.taxon && typeof info.taxon === 'object') return `Teaching the model: ${taxonText(info.taxon)}`;
+      if (info.taxon === null) return `"${name}" isn't a genus or family, so it won't teach the model`;
+      return `"${name}" will be looked up in WoRMS and used to teach the model`;
+    }
+
+    function Toast({ info, onUndo, onClose }) {
+      useEffect(() => {
+        const id = setTimeout(onClose, 10000);
+        return () => clearTimeout(id);
+      }, [info]);
+      return (
+        <div className="fixed flex items-center gap-3 px-4 py-2.5 rounded-lg text-[13px]"
+          style={{zIndex: 100, bottom: 24, left: '50%', transform: 'translateX(-50%)', maxWidth: '90vw',
+                  backgroundColor: 'var(--bg-surface-2)', border: `1px solid ${info.error ? 'var(--error-border)' : 'var(--border-moderate)'}`,
+                  color: info.error ? 'var(--error)' : 'var(--text-primary)', boxShadow: 'var(--shadow-modal)'}}>
+          <span>{toastText(info)}</span>
+          {info.history_id && (
+            <button className="btn-ghost" style={{padding: '2px 10px'}} onClick={() => onUndo(info.history_id)}>Undo</button>
+          )}
+          <button className="btn-icon" onClick={onClose}><Icons.X size={14}/></button>
+        </div>
+      );
+    }
+
+    // ── LabelsView: every confirmed label, history, model versions ───────────
+
+    const cropUrlIn = (trackKey, dep, mission) => {
+      const i = trackKey.lastIndexOf('__');
+      return `/api/crop/${encodeURIComponent(trackKey.slice(0, i))}/${encodeURIComponent(trackKey.slice(i + 2))}` +
+             `?deployment=${encodeURIComponent(dep)}&mission=${encodeURIComponent(mission)}`;
+    };
+
+    const shortTime = iso => iso ? iso.slice(5, 16).replace('T', ' ') : '—';   // "11-17 14:51"
+
+    const STATUS_TEXT = {
+      not_taxon: 'not a genus or family in WoRMS',
+      excluded: 'removed from training',
+      checking: 'looking up in WoRMS…',
+    };
+
+    function LabelRow({ row, onAction, onGoTo }) {
+      const [open, setOpen] = useState(false);
+      const [editing, setEditing] = useState(false);
+      const [name, setName] = useState(row.name);
+      useEffect(() => { setName(row.name); }, [row.name]);
+      const submit = () => {
+        setEditing(false);
+        const n = name.trim();
+        if (n && n !== row.name) onAction('/api/labels/rename', {name: n}, row);
+        else setName(row.name);
+      };
+      const used = row.status === 'confirmed' || row.status === 'checking';
+      const small = {padding: '0 8px', fontSize: 11, lineHeight: '20px'};
+      const thumbs = row.examples.length ? row.examples : (row.representative ? [row.representative] : []);
+      return (
+        <div className="border-b" style={{borderColor: C.border}}>
+          <div className="flex items-center gap-3 px-3 py-2 text-[12px]">
+            <button className="btn-icon" onClick={() => setOpen(o => !o)} title="Show example crops"
+              style={{transform: open ? 'rotate(90deg)' : 'none', transition: 'transform .15s'}}>
+              <Icons.ChevronRight size={10}/>
+            </button>
+            <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{backgroundColor: row.color || '#6B7280'}} />
+            <div style={{width: 190}} className="min-w-0">
+              {editing ? (
+                <input autoFocus value={name} onChange={e => setName(e.target.value)} onBlur={submit}
+                  onKeyDown={e => { if (e.key === 'Enter') submit(); if (e.key === 'Escape') { setName(row.name); setEditing(false); } }}
+                  className="bg-transparent outline-none border-b w-full" style={{color: 'var(--text-primary)', borderColor: 'var(--border-moderate)'}} />
+              ) : (
+                <span className="font-semibold truncate block" style={{color: 'var(--text-primary)'}} title={row.name}>{row.name}</span>
+              )}
+            </div>
+            <div style={{width: 200}} className="truncate" title={row.taxon ? taxonText(row.taxon) : STATUS_TEXT[row.status]}>
+              {row.taxon && row.status !== 'excluded'
+                ? <span style={{color: 'var(--accent)'}}>{taxonText(row.taxon)}</span>
+                : <span style={{color: 'var(--text-faint)'}}>{STATUS_TEXT[row.status]}</span>}
+            </div>
+            <span className="font-mono truncate" style={{width: 150, color: 'var(--text-muted)'}} title={`${row.deployment} / ${row.mission}`}>
+              {row.mission}{row.is_open_mission ? ' ·open' : ''}
+            </span>
+            <span className="font-mono whitespace-nowrap" style={{width: 150, color: 'var(--text-muted)'}}
+              title={used ? `${row.examples.length} of its tracks are used as examples` : ''}>
+              {row.n_tracks} tracks{used ? ` · ${row.examples.length} ex.` : ''}
+            </span>
+            <span style={{width: 70, color: 'var(--text-faint)'}}>{row.via === 'accept' ? 'Accepted' : 'Typed'}</span>
+            <span className="font-mono whitespace-nowrap" style={{width: 90, color: 'var(--text-faint)'}} title={row.named_at || ''}>{shortTime(row.named_at)}</span>
+            <span style={{width: 90, color: row.in_model ? 'var(--success)' : 'var(--text-faint)'}}>
+              {row.status !== 'confirmed' ? '' : row.in_model ? 'in model ✓' : 'next version'}
+            </span>
+            <div className="ml-auto flex items-center gap-1.5 flex-shrink-0">
+              <button className="btn-ghost" style={small} onClick={() => setEditing(true)}>Edit name</button>
+              {row.status === 'excluded'
+                ? <button className="btn-ghost" style={small} onClick={() => onAction('/api/labels/exclude', {excluded: false}, row)}>Include again</button>
+                : used && <button className="btn-ghost" style={small} onClick={() => onAction('/api/labels/exclude', {excluded: true}, row)}>Remove from training</button>}
+              <button className="btn-ghost" style={small} onClick={() => onGoTo(row.deployment, row.mission, row.cluster_id)}>Go to cluster</button>
+            </div>
+          </div>
+          {open && (
+            <div className="flex flex-wrap gap-2 px-10 pb-3">
+              {thumbs.length === 0 && <span className="text-[11px]" style={{color: 'var(--text-faint)'}}>No crops</span>}
+              {thumbs.map(k => (
+                <img key={k} src={cropUrlIn(k, row.deployment, row.mission)} title={k} className="rounded"
+                  style={{width: 88, height: 66, objectFit: 'cover', backgroundColor: C.bg}}
+                  onError={e => { e.target.style.visibility = 'hidden'; }} />
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    function LabelsView({ clfStatus, reloadKey, onToast, onUndo, onGoTo, onOpenMissionChanged }) {
+      const [data, setData] = useState(null);
+      const [history, setHistory] = useState([]);
+      const [versions, setVersions] = useState(null);
+      const [search, setSearch] = useState('');
+      const [mission, setMission] = useState('');
+
+      const load = useCallback(async () => {
+        const [l, h, v] = await Promise.all([get('/api/labels'), get('/api/labels/history'), get('/api/classifier/versions')]);
+        setData(l); setHistory(h); setVersions(v);
+      }, []);
+      useEffect(() => { load(); }, [load, reloadKey, clfStatus?.version, clfStatus?.state]);
+
+      const act = async (url, extra, row) => {
+        const res = await post(url, {deployment: row.deployment, mission: row.mission, cluster_id: row.cluster_id, ...extra});
+        if (res.error) onToast({error: res.error});
+        else if (res._label_change) onToast(res._label_change);
+        if (res.open_mission_changed) onOpenMissionChanged();
+        load();
+      };
+      const resetModel = async () => {
+        if (!window.confirm('Use the original model (v1)? Saved versions and labels are kept; the next label change trains a new version from all labels.')) return;
+        await post('/api/classifier/reset', {});
+        load();
+      };
+
+      if (!data) return <div className="flex-1 flex items-center justify-center" style={{color: 'var(--text-muted)'}}>Loading…</div>;
+      const missions = [...new Set(data.labels.map(r => r.mission))].sort();
+      const q = search.trim().toLowerCase();
+      const shown = data.labels.filter(r => (!mission || r.mission === mission) &&
+        (!q || [r.name, r.taxon?.genus, r.taxon?.family, r.mission].some(x => (x || '').toLowerCase().includes(q))));
+      const used = shown.filter(r => r.status === 'confirmed' || r.status === 'checking');
+      const notUsed = shown.filter(r => !(r.status === 'confirmed' || r.status === 'checking'));
+      const busy = clfStatus && (clfStatus.state === 'pending' || clfStatus.state === 'training');
+      const section = (title, sub, children) => (
+        <div className="mb-6">
+          <div className="flex items-baseline gap-2 mb-2">
+            <span className="label-caps" style={{color: 'var(--text-muted)'}}>{title}</span>
+            <span className="text-[11px]" style={{color: 'var(--text-faint)'}}>{sub}</span>
+          </div>
+          <div className="rounded-lg border" style={{borderColor: C.border, backgroundColor: C.card}}>{children}</div>
+        </div>
+      );
+      const empty = text => <div className="px-3 py-3 text-[12px]" style={{color: 'var(--text-faint)'}}>{text}</div>;
+
+      return (
+        <div className="flex-1 overflow-y-auto px-6 py-5" style={{backgroundColor: C.bg}}>
+          <div className="flex items-center gap-3 mb-5">
+            <span className="text-[16px] font-semibold" style={{color: 'var(--text-primary)'}}>
+              Model v{versions?.current}{busy ? ' · retraining…' : ''}
+            </span>
+            <span className="text-[12px]" style={{color: 'var(--text-faint)'}}>{clfStatus?.message}</span>
+            <div className="ml-auto flex items-center gap-2">
+              <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search name, genus, family…"
+                className="px-2 py-1 rounded text-[12px] outline-none"
+                style={{backgroundColor: 'var(--bg-surface-3)', border: '1px solid var(--border-moderate)', color: 'var(--text-primary)', width: 220}} />
+              <select value={mission} onChange={e => setMission(e.target.value)} className="px-2 py-1 rounded text-[12px]"
+                style={{backgroundColor: 'var(--bg-surface-3)', border: '1px solid var(--border-moderate)', color: 'var(--text-primary)'}}>
+                <option value="">All missions</option>
+                {missions.map(m => <option key={m} value={m}>{m}</option>)}
+              </select>
+              <button className="btn-ghost" onClick={resetModel} disabled={versions?.current === 1}>Use original model</button>
+            </div>
+          </div>
+
+          {section('Confirmed labels', `${used.length} teaching the model · click ▸ to see the crops it learns from`,
+            used.length ? used.map(r => <LabelRow key={`${r.deployment}/${r.mission}/${r.cluster_id}`} row={r} onAction={act} onGoTo={onGoTo} />)
+                        : empty('No confirmed labels yet. Accept a suggestion or name a cluster with a genus or family.'))}
+
+          {section('Not used for training', `${notUsed.length} named clusters the model doesn't learn from`,
+            notUsed.length ? notUsed.map(r => <LabelRow key={`${r.deployment}/${r.mission}/${r.cluster_id}`} row={r} onAction={act} onGoTo={onGoTo} />)
+                           : empty('None.'))}
+
+          <div className="grid gap-6" style={{gridTemplateColumns: 'minmax(0, 3fr) minmax(0, 2fr)'}}>
+            {section('History', 'every label change, newest first',
+              history.length ? history.slice(0, 200).map(h => (
+                <div key={h.id} className="flex items-center gap-3 px-3 py-1.5 border-b text-[12px]"
+                  style={{borderColor: C.border, opacity: h.undone ? 0.5 : 1,
+                          backgroundColor: h.action === 'version' ? 'var(--bg-surface-3)' : 'transparent'}}>
+                  <span className="font-mono flex-shrink-0 whitespace-nowrap" style={{color: 'var(--text-faint)', width: 90}} title={h.at}>{shortTime(h.at)}</span>
+                  <span className="font-mono flex-shrink-0 truncate" style={{color: 'var(--text-muted)', width: 110}}>{h.mission || ''}</span>
+                  <span className="truncate" style={{color: h.action === 'version' ? C.accent : 'var(--text-primary)',
+                                                     textDecoration: h.undone ? 'line-through' : 'none'}}>{h.text}</span>
+                  <span className="ml-auto flex-shrink-0">
+                    {h.undoable && <button className="btn-ghost" style={{padding: '0 8px', fontSize: 11, lineHeight: '20px'}}
+                                     onClick={async () => { await onUndo(h.id); load(); }}>Undo</button>}
+                    {h.undone && <span className="text-[11px]" style={{color: 'var(--text-faint)'}}>undone</span>}
+                  </span>
+                </div>
+              )) : empty('No label changes yet.'))}
+
+            {section('Model versions', 'each label change trains a new version from the last one',
+              (versions?.versions || []).map(v => (
+                <div key={v.version} className="px-3 py-2 border-b text-[12px]" style={{borderColor: C.border}}>
+                  <div className="flex items-center gap-2">
+                    <span className="font-semibold" style={{color: 'var(--text-primary)'}}>v{v.version}</span>
+                    {v.version === versions.current && <span className="text-[10px] px-1.5 rounded-full" style={{color: 'var(--success)', border: '1px solid var(--success-border)'}}>current</span>}
+                    <span className="font-mono" style={{color: 'var(--text-faint)'}}>{v.created_at ? shortTime(v.created_at) : 'base model'}</span>
+                    <span className="ml-auto" style={{color: 'var(--text-muted)'}}>{v.version === 1 ? 'labeled crops only' : `${v.n_labels} label${v.n_labels === 1 ? '' : 's'}`}</span>
+                  </div>
+                  {v.reason && <div className="truncate mt-0.5" style={{color: 'var(--text-faint)'}} title={(v.changes || []).join('\n')}>{v.reason}</div>}
+                  {v.new_classes?.length > 0 && <div className="mt-0.5" style={{color: C.accent}}>new: {v.new_classes.join(', ')}</div>}
+                </div>
+              )))}
+          </div>
+        </div>
       );
     }
 
@@ -785,7 +1031,7 @@
 
     // ── ClusterModal ──────────────────────────────────────────────────────────
 
-    function ClusterModal({ cluster, onClose, onDrop, onRename, trainingNames, onContextMenu, dimmed, selectedKeys, onSelect }) {
+    function ClusterModal({ cluster, onClose, onDrop, onRename, trainingNames, onExclude, onContextMenu, dimmed, selectedKeys, onSelect }) {
       const [name, setName] = useState(cluster.name);
       useEffect(() => { setName(cluster.name); }, [cluster.name]);   // e.g. after accepting a suggestion
 
@@ -830,7 +1076,7 @@
               </button>
             </div>
             <SuggestionChip cluster={cluster} onRename={onRename} variant="detailed" />
-            <TrainingLabel cluster={cluster} names={trainingNames} />
+            <TrainingLabel cluster={cluster} names={trainingNames} onExclude={onExclude} />
             {videoNames.map(videoName => (
               <div key={videoName} className="mb-5">
                 <div className="font-mono text-[11px] font-semibold mb-2 pb-1 border-b truncate" style={{color: 'var(--text-muted)', borderColor: C.border}}>
@@ -2141,6 +2387,23 @@
         await refresh();
       }, [currentReviewMission, refresh]);
 
+      const handleGoToCluster = useCallback(async (deploymentId, missionId, clusterId) => {
+        if (deploymentId !== currentDeployment) {
+          const res = await post('/api/select-deployment', { deployment_id: deploymentId });
+          if (res.error) { setToast({error: res.error}); return; }
+          setCurrentDeployment(deploymentId);
+        }
+        const res = await post('/api/select-review-mission', { mission_id: missionId });
+        if (res.error) { setToast({error: res.error}); return; }
+        setCurrentReviewMission(missionId);
+        setVideo(null);
+        setTracks([]);
+        await fetchReviewMissions();
+        await refresh();
+        setView('review');
+        setOpen(clusterId);
+      }, [currentDeployment, fetchReviewMissions, refresh]);
+
       const handleGoToReview = useCallback(async (missionId) => {
         if (missionId) {
           try {
@@ -2265,8 +2528,28 @@
         }
       };
 
+      const [toast, setToast] = useState(null);
+      const [labelsReload, setLabelsReload] = useState(0);
+
       const handleRename = async (clusterId, name, via) => {
-        setAppState(await post('/api/rename', {cluster_id: clusterId, name, via}));
+        const { _label_change, ...state } = await post('/api/rename', {cluster_id: clusterId, name, via});
+        setAppState(state);
+        if (_label_change) setToast(_label_change);
+      };
+
+      const handleExclude = async (clusterId, excluded) => {
+        const res = await post('/api/labels/exclude', {deployment: currentDeployment, mission: currentReviewMission,
+                                                       cluster_id: clusterId, excluded});
+        if (res.error) setToast({error: res.error});
+        else if (res._label_change) setToast(res._label_change);
+        await refresh();
+      };
+
+      const handleUndo = async (historyId) => {
+        const res = await post('/api/labels/undo', {history_id: historyId});
+        setToast(res.error ? {error: res.error} : {text: 'Undone: the model will retrain without that change'});
+        if (!res.error && res.open_mission_changed) await refresh();
+        setLabelsReload(n => n + 1);
       };
 
       const handleVideoSelect = useCallback(async (videoName) => {
@@ -2409,7 +2692,7 @@
 
             {/* Pill tab switcher */}
             <div className="flex items-center rounded-full p-1 gap-0.5" style={{backgroundColor: 'var(--bg-surface-3)', border: '1px solid var(--border-subtle)'}}>
-              {['pipeline', 'review'].map(v => (
+              {['pipeline', 'review', 'labels'].map(v => (
                 <button key={v} onClick={() => setView(v)}
                   className="px-4 py-1 rounded-full text-[13px] font-medium transition-all"
                   style={{
@@ -2418,7 +2701,7 @@
                     border: view === v ? '1px solid var(--border-moderate)' : '1px solid transparent',
                     cursor: 'pointer',
                   }}>
-                  {v === 'pipeline' ? 'Pipeline' : 'Cluster Review'}
+                  {v === 'pipeline' ? 'Pipeline' : v === 'review' ? 'Cluster Review' : 'Labels'}
                 </button>
               ))}
             </div>
@@ -2434,6 +2717,9 @@
           {/* ── View content ── */}
           {view === 'pipeline' ? (
             <PipelineView onGoToReview={handleGoToReview} deployments={deployments} currentDeployment={currentDeployment} onDeploymentsChanged={fetchDeployments} />
+          ) : view === 'labels' ? (
+            <LabelsView clfStatus={clfStatus} reloadKey={labelsReload} onToast={setToast} onUndo={handleUndo}
+              onGoTo={handleGoToCluster} onOpenMissionChanged={refresh} />
           ) : (
             <div className="flex flex-1 min-h-0 overflow-hidden" onClick={clearSelection}>
               <VideoList videos={videos} selected={video} onSelect={handleVideoSelect}
@@ -2462,7 +2748,7 @@
                   </span>
                 )}
                 <span className="ml-auto font-mono text-[11px]" style={{color: 'var(--text-faint)'}}>{tracks.length} tracks</span>
-                <ModelStatus status={clfStatus} />
+                <ModelStatus status={clfStatus} onClick={() => setView('labels')} />
                 <button
                   onClick={() => window.location.href = '/api/export/tracks.csv'}
                   className="btn-ghost"
@@ -2627,6 +2913,7 @@
             </div>
           )}
 
+          {toast && <Toast info={toast} onUndo={handleUndo} onClose={() => setToast(null)} />}
           {openCluster && appState?.clusters?.[openCluster] && (
             <ClusterModal
               cluster={appState.clusters[openCluster]}
@@ -2634,6 +2921,7 @@
               onDrop={handleReassign}
               onRename={handleRename}
               trainingNames={clfStatus?.names}
+              onExclude={handleExclude}
               onContextMenu={openContextMenu}
               dimmed={!!cropViewer}
               selectedKeys={selectedKeys} onSelect={handleSelect}

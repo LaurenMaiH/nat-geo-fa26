@@ -19,7 +19,8 @@ from video_sources import (
     DropboxSource, Video, check_stem_collisions, completed_videos, connect_dropbox,
     load_manifest, local_video_root, make_source, source_config, video_stem,
 )
-from classifier import _cache as _classifier_cache, load_classifier, suggest_for_tracks
+from classifier import load_classifier, suggest_for_tracks
+import feedback
 from feedback import Retrainer, sync_feedback
 
 app = Flask(__name__)
@@ -356,9 +357,9 @@ def get_cluster_classifier():
             gdown.download(id=CLUSTER_CLASSIFIER_DRIVE_ID, output=str(CLUSTER_CLASSIFIER_PATH), quiet=True)
         except Exception as e:
             print(f"Cluster classifier download failed ({type(e).__name__}: {e})")
-    retrained = _retrain_config()["retrained_model"]
-    if retrained.exists():
-        bundle = load_classifier(retrained, BIOCLIP_CHECKPOINT_PATH)
+    path = _retrainer.store().path()   # the newest model version (v1 = this base file)
+    if path != CLUSTER_CLASSIFIER_PATH:
+        bundle = load_classifier(path, BIOCLIP_CHECKPOINT_PATH)
         if bundle is not None:
             return bundle
     return load_classifier(CLUSTER_CLASSIFIER_PATH, BIOCLIP_CHECKPOINT_PATH)
@@ -369,7 +370,7 @@ def _retrain_config():
     d = CLUSTER_CLASSIFIER_PATH.parent
     return {
         "base_model": CLUSTER_CLASSIFIER_PATH,
-        "retrained_model": CLUSTER_CLASSIFIER_PATH.with_name(CLUSTER_CLASSIFIER_PATH.stem + ".retrained.json"),
+        "models_dir": d / "models",
         "feedback_dir": d / "feedback",
         "base_labels": Path(CLASSIFIER_BASE_LABELS or d / "labeled_crops" / "image_labels.csv"),
         "base_embeddings": Path(CLASSIFIER_BASE_EMBEDDINGS or d / "labeled_crops" / "images_embeddings.json"),
@@ -382,6 +383,25 @@ def _retrain_config():
 _retrainer = Retrainer(_retrain_config)
 
 
+def _import_legacy_retrained():
+    """Before model versions existed, retrains overwrote cluster_classifier.retrained.json:
+    keep that model as v2 so nothing learned is lost."""
+    legacy = CLUSTER_CLASSIFIER_PATH.with_name(CLUSTER_CLASSIFIER_PATH.stem + ".retrained.json")
+    store = _retrainer.store()
+    if legacy.exists() and len(store.versions()) == 1:
+        try:
+            bundle = json.loads(legacy.read_text())
+            store.add(bundle, n_labels=bundle.get("n_feedback_clusters", 0), n_feedback=bundle.get("n_feedback", 0),
+                      new_classes=bundle.get("new_classes", []), changes=[],
+                      reason="model retrained before versions existed")
+            legacy.unlink()
+        except (OSError, ValueError) as e:
+            print(f"Could not import {legacy} ({type(e).__name__}: {e})")
+
+
+_import_legacy_retrained()
+
+
 def _feedback_path(deployment_id=None, mission_id=None):
     dep, mission = deployment_id or _current_deployment_id, mission_id or _review_mission_id
     if not dep or not mission:
@@ -389,17 +409,106 @@ def _feedback_path(deployment_id=None, mission_id=None):
     return _retrain_config()["feedback_dir"] / f"{dep}__{mission}.json"
 
 
-def record_training_labels(state, emb_dict):
+def record_training_labels(state, emb_dict, deployment_id=None, mission_id=None):
     """
-    Snapshot the mission's named clusters as training examples and retrain in the
-    background if anything changed. Called after every edit that can change a
-    named cluster's tracks or name.
+    Snapshot a mission's named clusters as training examples (the open mission by
+    default) and retrain in the background if anything changed. Called after every
+    edit that can change a named cluster's tracks or name.
     """
-    path = _feedback_path()
+    dep, mission = deployment_id or _current_deployment_id, mission_id or _review_mission_id
+    path = _feedback_path(dep, mission)
     if path is None:
         return
-    if sync_feedback(state, emb_dict, path, _current_deployment_id, _review_mission_id):
+    if sync_feedback(state, emb_dict, path, dep, mission):
         _retrainer.schedule()
+
+
+# ── Confirmed labels: any mission, history, undo ──────────────────────────────
+
+def _mission_paths(deployment_id, mission_id):
+    """(embeddings, state.json) of any mission, or None if the ids aren't safe folder names."""
+    if not (isinstance(deployment_id, str) and isinstance(mission_id, str)
+            and _ID_RE.match(deployment_id) and _ID_RE.match(mission_id)):
+        return None
+    d = _deployment_dir(deployment_id) / mission_id
+    return d / f"{mission_id}_embeddings.json", d / "state.json"
+
+
+def _is_open_mission(deployment_id, mission_id):
+    return deployment_id == _current_deployment_id and mission_id == _review_mission_id
+
+
+def _training_label(cluster):
+    """The name a cluster currently teaches the model with, or None."""
+    name = (cluster.get("name") or "").strip()
+    return name if feedback.is_training_name(name) and not cluster.get("train_excluded") else None
+
+
+def _set_cluster_name(cluster, deployment_id, mission_id, cid, name, via):
+    """Rename a cluster; if that changes what it teaches the model, log it. Returns the
+    history entry (for the undo toast) or None."""
+    old_name, old_label = cluster.get("name"), _training_label(cluster)
+    old_via, old_excluded = cluster.get("name_via"), bool(cluster.get("train_excluded"))
+    cluster["name"] = name
+    if (old_name or "").strip() == (name or "").strip():
+        return None
+    cluster["name_via"] = "accept" if via == "accept" else "rename"
+    cluster["name_at"] = datetime.now().isoformat(timespec="seconds")
+    cluster.pop("train_excluded", None)        # a new name is a new label
+    new_label = _training_label(cluster)
+    if not old_label and not new_label:
+        return None
+    action = "confirm" if not old_label else "unconfirm" if not new_label else "rename"
+    return feedback.append_history(
+        _retrain_config()["feedback_dir"], action=action, deployment=deployment_id, mission=mission_id,
+        cluster_id=cid, **{"from": old_name, "to": name}, via=cluster["name_via"],
+        from_via=old_via, from_excluded=old_excluded)
+
+
+def _label_change_info(entry):
+    """What the undo toast says about a label change."""
+    if entry is None:
+        return None
+    info = {"history_id": entry["id"], "cluster_id": entry["cluster_id"], "action": entry["action"],
+            "from": entry.get("from"), "to": entry.get("to"), "name": entry.get("name")}
+    name = entry.get("name") if entry["action"] in ("exclude", "include") else entry.get("to")
+    info["taxon"] = _resolve_now(name) if entry["action"] != "unconfirm" else None
+    return info
+
+
+def _resolve_now(name):
+    """Taxon for a name without waiting for WoRMS: cached answer or the model's own classes.
+    {"genus", "family"}, None (not a taxon), or "checking" (needs a WoRMS lookup)."""
+    names = feedback._read_json(_retrain_config()["feedback_dir"] / feedback.NAMES_FILE, {})
+    name = (name or "").strip()
+    if name in names:
+        return names[name]
+    try:
+        return feedback.resolve_label(name, load_classifier(CLUSTER_CLASSIFIER_PATH), lookup=None)
+    except feedback.LookupUnavailable:
+        return "checking"
+
+
+def _catch_up_labels():
+    """At startup: names given before retraining existed, or edited by hand, become training
+    data (each mission's feedback file is brought in line with its state.json)."""
+    for dep in _list_deployments():
+        for mdir in sorted(p for p in _deployment_dir(dep).iterdir() if p.is_dir()):
+            paths = _mission_paths(dep, mdir.name)
+            if paths is None or not paths[1].exists() or not paths[0].exists():
+                continue
+            try:
+                record_training_labels(json.loads(paths[1].read_text()), json.loads(paths[0].read_text()),
+                                       dep, mdir.name)
+            except (OSError, ValueError) as e:
+                print(f"Label catch-up skipped {dep}/{mdir.name} ({type(e).__name__}: {e})")
+
+
+def _save_mission_and_sync(state, deployment_id, mission_id):
+    emb_path, state_path = _mission_paths(deployment_id, mission_id)
+    state_path.write_text(json.dumps(state, indent=2))
+    emb = json.loads(emb_path.read_text()) if emb_path.exists() else {}
+    record_training_labels(state, emb, deployment_id, mission_id)
 
 
 def refresh_suggestions(state, emb_dict, cids=None):
@@ -1178,14 +1287,14 @@ def api_rename():
     body = request.get_json()
     state = load_state()
     cid = body["cluster_id"]
+    change = None
     if cid in state["clusters"]:
-        cluster = state["clusters"][cid]
-        cluster["name"] = body["name"]
-        # The name becomes training data for the suggestion model (feedback.py)
-        cluster["name_via"] = "accept" if body.get("via") == "accept" else "rename"
+        # A name that's a genus/family teaches the suggestion model (feedback.py)
+        change = _set_cluster_name(state["clusters"][cid], _current_deployment_id, _review_mission_id,
+                                   cid, body["name"], body.get("via"))
         record_training_labels(state, load_embeddings())
     save_state(state)
-    return jsonify(state)
+    return jsonify({**state, "_label_change": _label_change_info(change)})   # not saved: for the undo toast
 
 
 @app.route("/api/new-cluster", methods=["POST"])
@@ -1388,14 +1497,166 @@ def api_classifier_retrain():
 
 @app.route("/api/classifier/reset", methods=["POST"])
 def api_classifier_reset():
-    """Go back to the original model. Reviewer labels are kept and used on the next retrain."""
-    retrained = _retrain_config()["retrained_model"]
-    if retrained.exists():
-        retrained.unlink()
-    _classifier_cache.pop(str(retrained), None)
-    _retrainer._set(state="idle", version=None, n_feedback=0, n_clusters=0, new_classes=[],
-                    message="Using the original model.")
+    """Go back to the original model (v1). Saved versions and reviewer labels are kept;
+    the next label change trains a new version from all labels again."""
+    _retrainer.store().set_current(1)
+    feedback.append_history(_retrain_config()["feedback_dir"], action="reset")
+    _retrainer._set(state="idle", message="Using the original model (v1).")
     return jsonify(_retrainer.status())
+
+
+@app.route("/api/classifier/versions")
+def api_classifier_versions():
+    store = _retrainer.store()
+    versions = [{k: v for k, v in e.items() if k != "labels"} | {"n_labels": e.get("n_labels", 0)}
+                for e in store.versions()]
+    return jsonify({"current": store.current(), "versions": versions[::-1]})
+
+
+@app.route("/api/labels")
+def api_labels():
+    """Every reviewer-named cluster in every mission: what it teaches the model (or why not)."""
+    cfg = _retrain_config()
+    names = feedback._read_json(cfg["feedback_dir"] / feedback.NAMES_FILE, {})
+    in_model = _retrainer.store().current_entry().get("labels", {})
+    rows = []
+    for dep in _list_deployments():
+        for mdir in sorted(p for p in _deployment_dir(dep).iterdir() if p.is_dir()):
+            state_path = mdir / "state.json"
+            if not state_path.exists():
+                continue
+            try:
+                state = json.loads(state_path.read_text())
+            except ValueError:
+                continue
+            fb = feedback._read_json(_feedback_path(dep, mdir.name), {}).get("clusters", {})
+            for cid, c in state.get("clusters", {}).items():
+                name = (c.get("name") or "").strip()
+                if cid == "noise" or not feedback.is_training_name(name):
+                    continue
+                taxon = names[name] if name in names else _resolve_now(name)
+                if c.get("train_excluded"):
+                    status = "excluded"
+                elif taxon == "checking":
+                    status = "checking"
+                elif taxon:
+                    status = "confirmed"
+                else:
+                    status = "not_taxon"
+                ex = fb.get(cid, {}).get("examples", {})
+                key = feedback.label_key(dep, mdir.name, cid)
+                rows.append({
+                    "deployment": dep, "mission": mdir.name, "cluster_id": cid, "name": name,
+                    "color": c.get("color"), "via": c.get("name_via"), "named_at": c.get("name_at"),
+                    "n_tracks": len(c.get("track_keys", [])), "status": status,
+                    "taxon": taxon if isinstance(taxon, dict) else None,
+                    "in_model": in_model.get(key) == name,
+                    "examples": sorted(ex, key=lambda k: -ex[k].get("weight", 1)),
+                    "representative": c.get("representative"),
+                    "is_open_mission": _is_open_mission(dep, mdir.name),
+                })
+    return jsonify({"labels": rows, "current_version": _retrainer.store().current()})
+
+
+def _find_cluster(body):
+    """(state, cluster, error response) for a {deployment, mission, cluster_id} request."""
+    paths = _mission_paths(body.get("deployment"), body.get("mission"))
+    if paths is None or not paths[1].exists():
+        return None, None, (jsonify({"error": "mission not found"}), 404)
+    state = json.loads(paths[1].read_text())
+    cluster = state["clusters"].get(body.get("cluster_id"))
+    if cluster is None:
+        return state, None, (jsonify({"error": "cluster not found (it may have been merged or emptied)"}), 404)
+    return state, cluster, None
+
+
+@app.route("/api/labels/rename", methods=["POST"])
+def api_labels_rename():
+    body = request.get_json() or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "name required"}), 400
+    state, cluster, err = _find_cluster(body)
+    if err:
+        return err
+    change = _set_cluster_name(cluster, body["deployment"], body["mission"], body["cluster_id"], name, "rename")
+    _save_mission_and_sync(state, body["deployment"], body["mission"])
+    return jsonify({"ok": True, "_label_change": _label_change_info(change),
+                    "open_mission_changed": _is_open_mission(body["deployment"], body["mission"])})
+
+
+@app.route("/api/labels/exclude", methods=["POST"])
+def api_labels_exclude():
+    """Stop (excluded: true) or resume (false) training on a cluster's name; the name stays."""
+    body = request.get_json() or {}
+    state, cluster, err = _find_cluster(body)
+    if err:
+        return err
+    excluded = bool(body.get("excluded", True))
+    change = None
+    if bool(cluster.get("train_excluded")) != excluded:
+        if excluded:
+            cluster["train_excluded"] = True
+        else:
+            cluster.pop("train_excluded", None)
+        change = feedback.append_history(
+            _retrain_config()["feedback_dir"], action="exclude" if excluded else "include",
+            deployment=body["deployment"], mission=body["mission"], cluster_id=body["cluster_id"],
+            name=cluster.get("name"))
+    _save_mission_and_sync(state, body["deployment"], body["mission"])
+    return jsonify({"ok": True, "_label_change": _label_change_info(change),
+                    "open_mission_changed": _is_open_mission(body["deployment"], body["mission"])})
+
+
+@app.route("/api/labels/history")
+def api_labels_history():
+    events = feedback.read_history(_retrain_config()["feedback_dir"])
+    undone = {e.get("undoes") for e in events if e.get("action") == "undo"}
+    out = []
+    for e in events[::-1]:
+        out.append({**e, "text": feedback.describe(e), "undone": e["id"] in undone,
+                    "undoable": e.get("action") in _UNDOABLE and e["id"] not in undone})
+    return jsonify(out)
+
+
+_UNDOABLE = ("confirm", "rename", "unconfirm", "exclude", "include")
+
+
+@app.route("/api/labels/undo", methods=["POST"])
+def api_labels_undo():
+    """Reverse one label change, if the cluster hasn't changed since."""
+    hid = (request.get_json() or {}).get("history_id")
+    fdir = _retrain_config()["feedback_dir"]
+    events = feedback.read_history(fdir)
+    entry = next((e for e in events if e.get("id") == hid), None)
+    if entry is None or entry.get("action") not in _UNDOABLE:
+        return jsonify({"error": "nothing to undo"}), 404
+    if any(e.get("undoes") == hid for e in events):
+        return jsonify({"error": "already undone"}), 409
+    state, cluster, err = _find_cluster(entry)
+    if err:
+        return err
+    if entry["action"] in ("exclude", "include"):
+        if bool(cluster.get("train_excluded")) != (entry["action"] == "exclude"):
+            return jsonify({"error": "this label was changed again since; edit it instead"}), 409
+        if entry["action"] == "exclude":
+            cluster.pop("train_excluded", None)
+        else:
+            cluster["train_excluded"] = True
+    else:
+        if (cluster.get("name") or "").strip() != (entry.get("to") or "").strip():
+            return jsonify({"error": f"cluster was renamed again since (now \"{cluster.get('name')}\"); "
+                                     f"edit it instead"}), 409
+        cluster["name"] = entry.get("from")
+        cluster["name_via"] = entry.get("from_via") or "rename"
+        if entry.get("from_excluded"):
+            cluster["train_excluded"] = True
+        else:
+            cluster.pop("train_excluded", None)
+    feedback.append_history(fdir, action="undo", undoes=hid, summary=feedback.describe(entry),
+                            deployment=entry["deployment"], mission=entry["mission"], cluster_id=entry["cluster_id"])
+    _save_mission_and_sync(state, entry["deployment"], entry["mission"])
+    return jsonify({"ok": True, "open_mission_changed": _is_open_mission(entry["deployment"], entry["mission"])})
 
 
 @app.route("/api/reset", methods=["POST"])
@@ -1407,6 +1668,8 @@ def api_reset():
     path = _feedback_path()
     if path is not None and path.exists():
         path.unlink()
+        feedback.append_history(_retrain_config()["feedback_dir"], action="mission_reset",
+                                deployment=_current_deployment_id, mission=_review_mission_id)
         _retrainer.schedule()
     return jsonify(load_state())
 
@@ -1673,6 +1936,21 @@ def api_review_missions():
 
 @app.route("/api/crop/<video>/<track_id>")
 def api_crop(video, track_id):
+    dep, mission = request.args.get("deployment"), request.args.get("mission")
+    if dep or mission:   # a crop from any mission (the Labels tab)
+        paths = _mission_paths(dep, mission)
+        if paths is None:
+            return "Not found", 404
+        mdir = paths[1].parent
+        video_dir = mdir / f"{mission}_crops" / video
+        if not video_dir.exists() or not _is_inside(video_dir, mdir):
+            return "Not found", 404
+        try:
+            prefix = f"id{int(track_id):04d}"
+        except ValueError:
+            prefix = track_id
+        matches = sorted(video_dir.glob(f"{prefix}_*_mid.jpg")) or sorted(video_dir.glob(f"{prefix}_*.jpg"))
+        return send_file(matches[0], mimetype="image/jpeg") if matches else ("Not found", 404)
     path = best_crop_path(video, track_id)
     if not path:
         return "Not found", 404
@@ -2100,5 +2378,6 @@ def _cleanup_stale_temp_files(min_age_s=_STALE_TEMP_AGE_S):
 
 if __name__ == "__main__":
     _cleanup_stale_temp_files()
+    threading.Thread(target=_catch_up_labels, daemon=True, name="label-catch-up").start()
     debug = os.environ.get("FLASK_DEBUG") == "1"
     app.run(debug=debug, use_reloader=False, port=int(os.environ.get("PORT", "5000")), host='0.0.0.0')

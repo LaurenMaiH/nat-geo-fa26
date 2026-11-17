@@ -53,11 +53,45 @@ def find_key_col(labels, emb: dict, key_col=None, log=print):
     return best
 
 
-def fit(X, y, class_weight=CLASS_WEIGHT, C=C):
-    # Standardised first: L2-normalised features are so small that regularisation would
-    # otherwise crush the weights.
-    return make_pipeline(StandardScaler(),
-                         LogisticRegression(C=C, max_iter=3000, class_weight=class_weight)).fit(X, y)
+def fit(X, y, class_weight=CLASS_WEIGHT, C=C, init=None):
+    """
+    Standardise, then logistic regression. Standardising matters: L2-normalised features
+    are so small that regularisation would otherwise crush the weights.
+
+    init: a previous model's exported level ({"classes", "coef", "intercept"}) to start
+    from. The fit still runs to convergence on all of X, y (the problem is convex, so the
+    result matches a fit from scratch); starting near the answer just makes it faster.
+    """
+    scaler = StandardScaler().fit(X)
+    lr = LogisticRegression(C=C, max_iter=3000, class_weight=class_weight)
+    start = _warm_start(init, np.unique(y), scaler) if init is not None else None
+    if start is not None:
+        lr.set_params(warm_start=True)
+        lr.coef_, lr.intercept_ = start
+    clf = make_pipeline(scaler, lr).fit(X, y)
+    clf.warm_started = start is not None
+    return clf
+
+
+def _warm_start(init, classes, scaler):
+    """A previous level's raw-space weights as starting weights for these classes, in the
+    new scaler's space: W·x + b = (W·σ)·z + (b + W·μ) with z = (x - μ)/σ. Classes the
+    previous model didn't have start at zero. None if it can't be mapped."""
+    prev = {c: i for i, c in enumerate(init["classes"])}
+    W = np.asarray(init["coef"], dtype=np.float64)
+    b = np.asarray(init["intercept"], dtype=np.float64)
+    if W.ndim != 2 or W.shape[1] != len(scaler.mean_) or W.shape[0] != len(prev):
+        return None
+    rows = np.zeros((len(classes), W.shape[1]))
+    bias = np.zeros(len(classes))
+    for i, c in enumerate(classes):
+        if c in prev:
+            rows[i], bias[i] = W[prev[c]], b[prev[c]]
+    coef = rows * scaler.scale_
+    intercept = bias + rows @ scaler.mean_
+    if len(classes) == 2:   # sklearn stores a 2-class model as one row: class 1 vs class 0
+        return (coef[1] - coef[0])[None, :], np.array([intercept[1] - intercept[0]])
+    return coef, intercept
 
 
 def export_linear(clf):
@@ -110,10 +144,13 @@ def leave_one_group_out(X, y, groups, log=print, augmented=None, **fit_kw):
 
 
 def train_bundle(labels, emb, levels=("family", "genus"), min_per_class=5, min_prob=0.7,
-                 group_col="mission", evaluate=True, log=print, class_weight=CLASS_WEIGHT, C=C):
+                 group_col="mission", evaluate=True, log=print, class_weight=CLASS_WEIGHT, C=C,
+                 init=None):
     """
     Train one model per level. `labels` is a DataFrame with a "_key" column (the
     embedding key) plus the level columns; `emb` maps key → vector.
+
+    init: a previous bundle (e.g. the current model version) to start each level from.
 
     Returns (bundle, checks): the JSON-ready bundle, and per level a few training
     rows with sklearn's probabilities so the caller can verify the export.
@@ -151,7 +188,8 @@ def train_bundle(labels, emb, levels=("family", "genus"), min_per_class=5, min_p
             else:
                 log(f"  (no '{group_col}' column with 2+ values: skipping the held-out check)")
 
-        clf = fit(X, y, class_weight=class_weight, C=C)
+        prev = (init or {}).get("levels", {}).get(level) if init else None
+        clf = fit(X, y, class_weight=class_weight, C=C, init=prev)
         bundle["levels"][level] = export_linear(clf)
         bundle["n_train"][level] = int((~aug).sum())
         if aug.any():

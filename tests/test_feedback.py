@@ -77,7 +77,7 @@ def app_fb(app_env, bundle_path, monkeypatch):
     state = app_env.client.post("/api/initialize", json={"seed_video": "v1"}).get_json()
     app_env.big = next(cid for cid, c in state["clusters"].items() if "v1__1" in c["track_keys"])
     app_env.fb_path = tmp / "feedback" / "dep__M1.json"
-    app_env.retrained = tmp / "cluster_classifier.retrained.json"
+    app_env.models = tmp / "models"
     return app_env
 
 
@@ -117,13 +117,13 @@ def test_retrain_learns_new_genus_and_reset_restores(app_fb, bundle_path):
 
     c.post("/api/rename", json={"cluster_id": app_fb.big, "name": "Munida"})
     version = app_fb.app._retrainer.run_once()
-    assert version and app_fb.retrained.exists()
+    assert version == 2 and (app_fb.models / "v0002.json").exists()
     assert bundle_path.read_bytes() == base_bytes   # the original model is never overwritten
 
     status = c.get("/api/classifier/status").get_json()
     assert status["version"] == version and status["new_classes"] == ["Munida"]
     assert status["names"]["Munida"] == {"genus": "Munida", "family": "Munididae", "source": "worms"}
-    bundle = json.loads(app_fb.retrained.read_text())
+    bundle = json.loads((app_fb.models / "v0002.json").read_text())
     assert "Munida" in bundle["levels"]["genus"]["classes"]
     assert bundle["genus_to_family"]["Munida"] == "Munididae"
 
@@ -132,7 +132,7 @@ def test_retrain_learns_new_genus_and_reset_restores(app_fb, bundle_path):
     assert (s["label"], s["family_name"]) == ("Munida", "Munididae")
 
     c.post("/api/classifier/reset")
-    assert not app_fb.retrained.exists()
+    assert c.get("/api/classifier/status").get_json()["version"] == 1
     state = c.post("/api/suggestions/refresh", json={}).get_json()
     assert state["clusters"][app_fb.big]["suggestion"]["label"] != "Munida"
 
@@ -141,7 +141,7 @@ def test_non_taxon_names_are_not_trained_on(app_fb):
     app_fb.client.post("/api/rename", json={"cluster_id": app_fb.big, "name": "Shadows"})
     assert app_fb.fb_path.exists()                 # recorded...
     assert app_fb.app._retrainer.run_once() is None
-    assert not app_fb.retrained.exists()           # ...but nothing to learn
+    assert not app_fb.models.exists()              # ...but nothing to learn
     assert app_fb.app._retrainer.status()["names"]["Shadows"] is None
 
 
@@ -151,7 +151,7 @@ def test_missing_base_data_keeps_labels(app_fb, monkeypatch):
     assert app_fb.app._retrainer.run_once() is None
     status = app_fb.client.get("/api/classifier/status").get_json()
     assert status["state"] == "error" and "base training data not found" in status["message"]
-    assert app_fb.fb_path.exists() and not app_fb.retrained.exists()
+    assert app_fb.fb_path.exists() and not app_fb.models.exists()
 
 
 def test_restart_drops_the_missions_labels(app_fb):
