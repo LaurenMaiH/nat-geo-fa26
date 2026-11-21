@@ -2,6 +2,7 @@ import csv
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -439,3 +440,35 @@ def test_benchmark_track_matching():
                ("x", "1"): {0: (0.1, 0.1, 0.2, 0.2)}}            # other video
     assert benchmark.match_fraction(base, variant) == (1, 3)
     assert benchmark.match_fraction(variant, base) == (1, 3)
+
+
+def test_frame_numbers_count_from_start_of_video(pipeline, tmp_path):
+    """A black intro must not shift frame numbers: every detection's frame is the frame of
+    the original video file that shows the square where the box says."""
+    video = tmp_path / "intro.avi"
+    out = cv2.VideoWriter(str(video), cv2.VideoWriter_fourcc(*"MJPG"), 12, (320, 240))
+    for _ in range(6):
+        out.write(np.zeros((240, 320, 3), dtype=np.uint8))
+    for i in range(24):
+        frame = np.full((240, 320, 3), 100, dtype=np.uint8)
+        frame[100:140, 10 + i * 10:50 + i * 10] = 255
+        out.write(frame)
+    out.release()
+    (tmp_path / "work").mkdir()
+    pipeline.INFERENCE_DEVICE = "cpu"
+    stats = {}
+    crops = pipeline.process_video(
+        video, "intro.avi", "intro", _FakeDetector(), "tracker.yaml", tmp_path / "det.csv",
+        tmp_path / "crops", tmpdir=tmp_path / "work", options=pipeline.SpeedOptions(), stats=stats, stages={})
+    with open(tmp_path / "det.csv", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert stats["black_frames_skipped"] == 6
+    assert min(int(r["frame"]) for r in rows) == 6
+    cap = cv2.VideoCapture(str(video))
+    for r in rows:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(r["frame"]))
+        _, frame = cap.read()
+        assert abs(np.where(frame[:, :, 0] > 200)[1].min() - float(r["x"]) * 320) <= 2
+    cap.release()
+    crop_frames = {int(re.search(r"_f(\d+)_", Path(p).name).group(1)) for p in crops[1]}
+    assert crop_frames <= {int(r["frame"]) for r in rows}

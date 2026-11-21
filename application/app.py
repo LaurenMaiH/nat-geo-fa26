@@ -642,11 +642,23 @@ def api_videos():
     ])
 
 
+def frames_count_from_video_start(video_name) -> bool:
+    """True when this clip's detection frame numbers count from frame 0 of the video file
+    (pipeline runs that record "frame_origin": "video_start" in the manifest, or CSVs
+    converted by scripts/convert_frame_numbers.py). Older runs counted from the first
+    non-black frame, so the player has to skip the black intro to line boxes up."""
+    mission_id = _owning_mission_id(video_name)
+    entry = _load_mission_manifest(_current_deployment_id, mission_id).get(video_stem(video_name)) \
+        if mission_id else None
+    return isinstance(entry, dict) and entry.get("frame_origin") == "video_start"
+
+
 @app.route("/api/video/<video_name>/detections")
 def api_video_detections(video_name):
     return jsonify({
         "fps":            get_proxy_fps(video_name),
-        "black_duration": get_black_frame_offset(video_name),
+        "black_duration": 0.0 if frames_count_from_video_start(video_name)
+                          else get_black_frame_offset(video_name),
         "detections":     DETECTIONS_CACHE.get(video_name, {}),
     })
 

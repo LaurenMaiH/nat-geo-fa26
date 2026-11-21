@@ -321,3 +321,17 @@ def test_cleanup_stale_temp_files(app_env, tmp_path, monkeypatch):
     app_env.app._cleanup_stale_temp_files()
     assert not any(p.exists() for p in stale)
     assert all(p.exists() for p in keep)
+
+
+def test_detections_skip_black_intro_only_for_old_frame_numbers(app_env, monkeypatch):
+    """Clips the pipeline numbered from frame 0 of the file need no black-intro offset in
+    the player; clips from older runs (counted from the first non-black frame) still do."""
+    monkeypatch.setattr(app_env.app, "get_black_frame_offset", lambda v: 2.5)
+    app_env.make_mission("dep", "M1", csv_text="new.mp4,40,1,fish,0,0,0.1,0.1,0.9\nold.mp4,4,1,fish,0,0,0.1,0.1,0.9\n",
+                         manifest={"new": {"status": "complete", "frame_origin": "video_start"},
+                                   "old": {"status": "complete"}})
+    app_env.select("dep", "M1")
+    new = app_env.client.get("/api/video/new/detections").get_json()
+    old = app_env.client.get("/api/video/old/detections").get_json()
+    assert new["black_duration"] == 0 and "40" in new["detections"]
+    assert old["black_duration"] == 2.5
