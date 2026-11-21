@@ -63,6 +63,7 @@ def test_trash_delete_valid_key_still_works(app_env):
     crop.parent.mkdir()
     crop.write_bytes(b"jpg")
     app_env.select("dep", "M1")
+    app_env.client.post("/api/trash/add", json={"track_keys": ["vid__1"]})
     resp = app_env.client.post("/api/trash/delete", json={"track_keys": ["vid__1"]})
     assert resp.status_code == 200
     assert not crop.exists()
@@ -321,3 +322,45 @@ def test_cleanup_stale_temp_files(app_env, tmp_path, monkeypatch):
     app_env.app._cleanup_stale_temp_files()
     assert not any(p.exists() for p in stale)
     assert all(p.exists() for p in keep)
+
+
+def _initialized_mission_with_crop(app_env):
+    m = app_env.make_mission("dep", "M1", embeddings={"vid__1": VEC_A, "vid__2": VEC_A, "vid__3": VEC_B})
+    crop = m / "M1_crops" / "vid" / "id0001_fish_f00010_mid.jpg"
+    crop.parent.mkdir()
+    crop.write_bytes(b"jpg")
+    app_env.select("dep", "M1")
+    app_env.client.post("/api/initialize", json={"seed_video": "vid", "min_cluster_size": 2})
+    return m, crop
+
+
+def test_trash_delete_rejects_live_track(app_env):
+    """A track that was never trashed (or was restored in another tab) must not be erased."""
+    m, crop = _initialized_mission_with_crop(app_env)
+    before = app_env.client.get("/api/state").get_json()
+    resp = app_env.client.post("/api/trash/delete", json={"track_keys": ["vid__1"]})
+    assert resp.status_code == 409
+    assert "vid__1" in resp.get_json()["error"]
+    assert crop.exists()
+    assert "vid__1" in json.loads((m / "M1_embeddings.json").read_text())
+    after = app_env.client.get("/api/state").get_json()
+    assert after["track_assignments"] == before["track_assignments"]
+
+
+def test_trash_delete_mixed_keys_deletes_nothing(app_env):
+    m, crop = _initialized_mission_with_crop(app_env)
+    app_env.client.post("/api/trash/add", json={"track_keys": ["vid__2"]})
+    resp = app_env.client.post("/api/trash/delete", json={"track_keys": ["vid__2", "vid__1"]})
+    assert resp.status_code == 409
+    assert {"vid__1", "vid__2"} <= set(json.loads((m / "M1_embeddings.json").read_text()))
+    assert "vid__2" in app_env.client.get("/api/state").get_json()["trash"]["track_keys"]
+
+
+def test_trash_delete_removes_trashed_track(app_env):
+    m, crop = _initialized_mission_with_crop(app_env)
+    app_env.client.post("/api/trash/add", json={"track_keys": ["vid__1"]})
+    resp = app_env.client.post("/api/trash/delete", json={"track_keys": ["vid__1"]})
+    assert resp.status_code == 200
+    assert not crop.exists()
+    assert "vid__1" not in json.loads((m / "M1_embeddings.json").read_text())
+    assert "vid__1" not in resp.get_json()["trash"]["track_keys"]
