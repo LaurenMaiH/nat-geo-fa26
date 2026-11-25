@@ -30,6 +30,21 @@
       body: JSON.stringify(body),
     }).then(r => r.json());
 
+    class ApiError extends Error {}
+    const postState = async (url, body) => {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      let data = null;
+      try { data = await r.json(); } catch (_) { /* HTML error page */ }
+      if (!r.ok || !data || !data.clusters) {
+        throw new ApiError(data?.error || `The server couldn't do that (error ${r.status}).`);
+      }
+      return data;
+    };
+
     const cropUrl = trackKey => {
       const [video, tid] = trackKey.split('__');
       return `/api/crop/${video}/${tid}`;
@@ -1962,6 +1977,18 @@
         return state;
       }, []);
 
+      const [actionError, setActionError] = useState(null);
+      useEffect(() => {
+        const onFail = (e) => {
+          if (!(e.reason instanceof ApiError)) return;
+          e.preventDefault();
+          setActionError(e.reason.message);
+          refresh().catch(() => {});
+        };
+        window.addEventListener('unhandledrejection', onFail);
+        return () => window.removeEventListener('unhandledrejection', onFail);
+      }, [refresh]);
+
       const fetchReviewMissions = useCallback(async () => {
         try {
           const ms = await get('/api/review/missions');
@@ -2036,8 +2063,7 @@
       const handleInitialize = async params => {
         setLoading(true);
         try {
-          const state = await post('/api/initialize', params);
-          if (state.error) { window.alert(state.error); return; }
+          const state = await postState('/api/initialize', params);
           setAppState(state);
           setVideos(await get('/api/videos'));
           setVideo(params.seed_video);
@@ -2055,7 +2081,7 @@
           setTracks([]);
           setVideo(cv);
           try {
-            const nextState = await post('/api/process-video', {
+            const nextState = await postState('/api/process-video', {
               video_name: cv,
               threshold: state.cosine_threshold ?? 0.25,
             });
@@ -2073,7 +2099,7 @@
         const dropped = Array.isArray(trackKeyOrKeys) ? trackKeyOrKeys : [trackKeyOrKeys];
         const keys = [...new Set([...dropped, ...selectedKeys])];
         setTracks(prev => prev.map(t => keys.includes(t.track_key) ? {...t, cluster_id: targetClusterId} : t));
-        const state = await post('/api/reassign', {track_keys: keys, target_cluster_id: targetClusterId});
+        const state = await postState('/api/reassign', {track_keys: keys, target_cluster_id: targetClusterId});
         setAppState(state);
         setVideos(await get('/api/videos'));
         setSelectedKeys(new Set());
@@ -2082,7 +2108,7 @@
       const handleProcess = async () => {
         setLoading(true);
         try {
-          setAppState(await post('/api/process-video', {video_name: video, threshold}));
+          setAppState(await postState('/api/process-video', {video_name: video, threshold}));
           setVideos(await get('/api/videos'));
         } finally { setLoading(false); }
       };
@@ -2091,7 +2117,7 @@
         if (!video) return;
         setLoading(true);
         try {
-          const state = await post('/api/previous', {video_name: video});
+          const state = await postState('/api/previous', {video_name: video});
           setAppState(state);
           setVideos(await get('/api/videos'));
           const prevVideo = state.current_video;
@@ -2105,7 +2131,7 @@
       };
 
       const handleApprove = async () => {
-        const state = await post('/api/approve', {video_name: video});
+        const state = await postState('/api/approve', {video_name: video});
         setAppState(state);
 
         const currentVideos = await get('/api/videos');
@@ -2122,7 +2148,7 @@
 
           if (isPending) {
             try {
-              const nextState = await post('/api/process-video', {video_name: nextVideoName, threshold});
+              const nextState = await postState('/api/process-video', {video_name: nextVideoName, threshold});
               setAppState(nextState);
               setVideos(await get('/api/videos'));
             } finally {
@@ -2135,7 +2161,7 @@
       };
 
       const handleRename = async (clusterId, name) => {
-        setAppState(await post('/api/rename', {cluster_id: clusterId, name}));
+        setAppState(await postState('/api/rename', {cluster_id: clusterId, name}));
       };
 
       const handleVideoSelect = useCallback(async (videoName) => {
@@ -2145,7 +2171,7 @@
           setTracks([]);
           setVideo(videoName);
           try {
-            const nextState = await post('/api/process-video', { video_name: videoName, threshold });
+            const nextState = await postState('/api/process-video', { video_name: videoName, threshold });
             setAppState(nextState);
             setVideos(await get('/api/videos'));
           } finally {
@@ -2158,7 +2184,7 @@
 
       const handleReset = async () => {
         if (!window.confirm('Reset all clustering? This cannot be undone.')) return;
-        const state = await post('/api/reset', {});
+        const state = await postState('/api/reset', {});
         setAppState(state);
         setVideos(await get('/api/videos'));
         setVideo(null);
@@ -2169,7 +2195,7 @@
       const handleTrashAdd = async (trackKeyOrKeys) => {
         const keys = Array.isArray(trackKeyOrKeys) ? trackKeyOrKeys : [trackKeyOrKeys];
         const allKeys = [...new Set([...keys, ...(selectedKeys.has(keys[0]) ? [...selectedKeys] : [])])];
-        const state = await post('/api/trash/add', { track_keys: allKeys });
+        const state = await postState('/api/trash/add', { track_keys: allKeys });
         setAppState(state);
         setVideos(await get('/api/videos'));
         setTracks(prev => prev.filter(t => !allKeys.includes(t.track_key)));
@@ -2177,7 +2203,7 @@
       };
 
       const handleTrashRestore = async (trackKeys) => {
-        const state = await post('/api/trash/restore', { track_keys: trackKeys });
+        const state = await postState('/api/trash/restore', { track_keys: trackKeys });
         setAppState(state);
         setVideos(await get('/api/videos'));
         if (video) {
@@ -2187,7 +2213,7 @@
       };
 
       const handleTrashDelete = async (trackKeys) => {
-        const state = await post('/api/trash/delete', { track_keys: trackKeys });
+        const state = await postState('/api/trash/delete', { track_keys: trackKeys });
         setAppState(state);
         setVideos(await get('/api/videos'));
       };
@@ -2205,10 +2231,10 @@
       const handleNewCluster = async trackKeyOrKeys => {
         setContextMenu(null);
         const keys = Array.isArray(trackKeyOrKeys) ? trackKeyOrKeys : [trackKeyOrKeys];
-        let state = await post('/api/new-cluster', {track_key: keys[0]});
+        let state = await postState('/api/new-cluster', {track_key: keys[0]});
         if (keys.length > 1) {
           const newCid = state.track_assignments[keys[0]];
-          state = await post('/api/reassign', {track_keys: keys.slice(1), target_cluster_id: newCid});
+          state = await postState('/api/reassign', {track_keys: keys.slice(1), target_cluster_id: newCid});
         }
         setAppState(state);
         setVideos(await get('/api/videos'));
@@ -2309,6 +2335,14 @@
                 missions={reviewMissions} currentMission={currentReviewMission} onMissionChange={handleSwitchMission} />
 
               <div className="flex flex-col flex-1 min-w-0">
+                                {actionError && (
+                  <div role="alert" className="flex items-center gap-3 px-4 py-2 text-[13px] border-b"
+                       style={{backgroundColor: 'var(--bg-surface-3)', borderColor: C.border, color: 'var(--text-primary)'}}>
+                    <span><b>Not saved:</b> {actionError}</span>
+                    <span style={{color: 'var(--text-secondary)'}}>Refreshed from the server.</span>
+                    <button className="ml-auto underline" onClick={() => setActionError(null)}>Dismiss</button>
+                  </div>
+                )}
                 {!appState?.initialized ? (
                   <InitPanel videos={videos} onInitialize={handleInitialize} />
                 ) : (<>

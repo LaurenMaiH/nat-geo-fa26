@@ -1209,6 +1209,14 @@ def api_trash_delete():
     if bad:
         return jsonify({"error": f"Invalid track key(s): {', '.join(map(repr, bad))}"}), 400
     state = load_state()
+    # Only tracks that are actually in the trash may be deleted. A stale tab (or a script)
+    # could send a key that was restored, or never trashed; deleting it would erase a live
+    # track's crops and embedding while it stays in its cluster. Refuse the whole request.
+    in_trash = set(state["trash"]["track_keys"])
+    not_in_trash = [k for k in track_keys if k not in in_trash]
+    if not_in_trash:
+        return jsonify({"error": "Not in the trash (maybe restored in another tab), so nothing "
+                                 f"was deleted: {', '.join(not_in_trash)}"}), 409
     emb_dict = load_embeddings()
 
     modified_emb = False
