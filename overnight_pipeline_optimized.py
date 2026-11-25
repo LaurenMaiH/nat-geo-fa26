@@ -676,17 +676,21 @@ def process_video(
                         class_ids = results[0].boxes.cls.int().cpu().tolist()
                         confs     = results[0].boxes.conf.cpu().tolist()
 
+                        # Frame numbers are counted from the start of the video file
+                        # (frame_idx counts from the first non-black frame), so they line
+                        # up with the original video, the crop file names and Tator.
+                        abs_frame = first_real + frame_idx
                         for box, tid, cid, conf in zip(boxes, track_ids, class_ids, confs):
                             x1, y1, x2, y2 = map(int, box)
                             cls_name        = model.names[cid]
                             csv_writer.writerow([
-                                media_id, frame_idx, tid, cls_name,
+                                media_id, abs_frame, tid, cls_name,
                                 f"{x1/width:.4f}", f"{y1/height:.4f}",
                                 f"{(x2-x1)/width:.4f}", f"{(y2-y1)/height:.4f}",
                                 f"{conf:.4f}",
                             ])
                             n_detections += 1
-                            track_detections[tid].append((frame_idx, conf, x1, y1, x2, y2, cls_name))
+                            track_detections[tid].append((abs_frame, conf, x1, y1, x2, y2, cls_name))
 
             frame_idx += 1
             pbar.update(1)
@@ -725,7 +729,7 @@ def process_video(
         return track_crop_paths
 
     # ── Select best frame per segment per track ───────────────────────────────
-    # needed maps frame_idx -> [(tid, x1,y1,x2,y2,cls,label)]
+    # needed maps absolute frame number -> [(tid, x1,y1,x2,y2,cls,label)]
     needed: dict = defaultdict(list)
     k = CROPS_PER_TRACK
     for tid, dets in long_tracks.items():
@@ -759,7 +763,7 @@ def process_video(
     n_crop_frames = len(sorted_frames)
 
     for crop_fi, fi in enumerate(tqdm(sorted_frames, desc=f"  Cropping {video_name}", unit="frame", leave=False)):
-        abs_fi = first_real + fi
+        abs_fi = fi   # already counted from the start of the video
 
         # Forward-seek with grab() when close; random seek when far or going back
         if current_frame < 0 or abs_fi < current_frame or (abs_fi - current_frame) > 300:
@@ -969,6 +973,7 @@ def main(reporter=None, options: SpeedOptions = None):
 
                     manifest[video_name].update({
                         "status":      "complete",
+                        "frame_origin": "video_start",   # detections CSV frames count from frame 0 of the file
                         "n_tracks":    n_embedded,
                         "finished_at": datetime.now().isoformat(timespec="seconds"),
                         "weights":     weights,
